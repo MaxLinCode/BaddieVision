@@ -1,0 +1,71 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Virtual environments and local configuration
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+.python-version
+
+# Editors and operating systems
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.ipynb_checkpoints/
+*:Zone.Identifier
+
+# Raw videos and extracted clips
+videos/
+clips/
+scratch/
+InPlay/videos/
+
+# Generated features and training arrays
+features/
+clip_features/
+outputs/
+InPlay/features/
+InPlay/clip_features/
+InPlay/data/
+InPlay/outputs/
+*.npy
+*.npz
+*.cache
+
+# Model weights and training artifacts
+models/
+InPlay/models/
+src/TrackNetV3/ckpts/
+src/TrackNetV3/prediction/
+src/TrackNetV3/exp/
+*.pt
+*.pth
+*.onnx
+*.torchscript
+*.tflite
+
+# YOLO generated/downloaded artifacts. The small curated images and labels
+# under images/ and labels/ remain versioned.
+yolov8/shuttle-yolo-dataset/export/
+yolov8/shuttle-yolo-dataset/inference/
+yolov8/shuttle-yolo-dataset/runs/
+yolov8/shuttle-yolo-dataset/*.pt
+yolov8/shuttle_test/
+
+# Logs and local plots
+*.log
+runs/
+
+# Portable data packages for Colab/Kaggle/Drive
+data_packages/*.zip
