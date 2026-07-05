@@ -6,6 +6,7 @@ Computer-vision experiments for analyzing badminton video:
 - shuttle tracking with TrackNetV3 and YOLO;
 - badminton-shot classification from pose and shuttle features;
 - in-play/rally detection with frame-level and LSTM classifiers.
+- metric court projection for static-camera footage.
 
 ## Repository layout
 
@@ -116,6 +117,61 @@ batch-prediction helpers and CUDA/MPS/CPU device support.
 TrackNetV3 checkpoints are not included. See
 [`src/TrackNetV3/README.md`](src/TrackNetV3/README.md) for the upstream checkpoint
 download and its detailed training/inference instructions.
+
+## Court projection
+
+Calibrate a static camera with draggable court-line guides. The browser workflow
+also works in headless WSL environments without OpenCV's Qt/X11 window support:
+
+```bash
+python src/calibrate_court.py videos/example.mp4 \
+  features/court/example.json --frame 0 \
+  --preview outputs/example_court_overlay.jpg
+```
+
+The command prints a localhost URL; paste it into a browser. Add
+`--open-browser` only if WSL supports launching your host browser. The browser
+has previous/next, ±10, and direct frame-number controls; changing frames clears
+the calibration. Zoom with the mouse wheel or the Zoom ± buttons, pan with the
+scrollbars, and use Fit to restore the full-frame view. A crosshair magnifier
+follows the pointer.
+
+For each cyan guide named in the header, click two points along the corresponding
+painted court line. After four guides are placed, the full projected court
+appears in green. Drag the orange handles until the green model aligns with the
+video. Guide intersections may lie outside the frame, so cropped outer corners
+are supported.
+
+The defaults use the left and right doubles sidelines plus the near and far
+short-service lines. Choose other visible floor markings with `--court-lines`:
+
+```bash
+python src/calibrate_court.py videos/example.mp4 features/court/example.json \
+  --frame 120 --preview outputs/example_court_overlay.jpg \
+  --court-lines left_singles_sideline right_singles_sideline \
+                near_doubles_long_service far_short_service
+```
+
+At least two longitudinal and two cross-court lines are required. Extra visible
+lines improve robustness. The older intersection-click workflow remains
+available with `--mode points`. The saved homography maps image pixels to court
+coordinates in metres, with the origin at court centre, x running left-to-right,
+and y running near-to-far.
+
+```python
+from src.court_projection import CourtHomography
+
+calibration = CourtHomography.load("features/court/example.json")
+feet_xy_metres = calibration.project_to_court([[player_foot_x, player_foot_y]])
+# MediaPipe coordinates are normalized, so also pass the source image size:
+feet_xy_metres = calibration.project_normalized_to_court(
+    [[landmark.x, landmark.y]], (frame_width, frame_height)
+)
+```
+
+A planar homography is valid for points on the floor (player foot positions and
+shuttle landing/contact points). Projecting an airborne shuttle gives only its
+vertical image-ray intersection with the court plane, not its true 3D position.
 
 ## Publish to GitHub
 
