@@ -86,14 +86,47 @@ Extract pose features from videos:
 
 ```bash
 python src/extract_features.py
+mkdir -p features/court
+cp config/court_calibrations.example.json features/court/calibrations.json
+# Edit the registry and calibrate each static source video before continuing.
 python src/extract_clip_features.py
 ```
+
+Shot features include a normalized court-space player anchor. The extractor
+resolves each clip to a shared source-video calibration through
+`features/court/calibrations.json`. Modern clip names can contain a source ID
+such as `img_3214`; clips without one need an explicit `clip_overrides` entry.
+Calibration paths are relative to the registry:
+
+```json
+{
+  "version": 1,
+  "sources": {
+    "img_3214": {"calibration": "img_3214.json"}
+  },
+  "clip_overrides": {
+    "clear_001": "img_3214"
+  }
+}
+```
+
+Each source ID must identify one static camera segment. Create a new source and
+calibration after any camera movement. Calibration files must include
+`image_size`, which the calibration command records automatically. Missing or
+ambiguous mappings and unusable foot tracks stop feature generation instead of
+silently producing invalid training data.
 
 Train the shot classifier:
 
 ```bash
 python src/train_shot_classifier.py
 ```
+
+The generated feature shape is `(36, 76)`: 66 pose coordinates, 7 shuttle
+features, and `[court_x, court_y, observed]`. Existing 73-input classifier
+checkpoints must be retrained. Training now groups validation by source video,
+so at least two calibrated sources are required and no recording appears in
+both splits.
 
 Extract and train in-play features:
 
