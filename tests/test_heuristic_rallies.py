@@ -348,18 +348,20 @@ import torch
 from predict import predict
 from utils.general import write_pred_csv
 indices = torch.tensor([[[0, 0], [0, 1]]])
-heat = torch.zeros((1, 2, 288, 512))
-heat[0, 0, 10, 20] = 0.9
-heat[0, 1, 20, 30] = 0.8
-result = predict(indices, y_pred=heat)
+y_pred = torch.zeros((1, 2, 288, 512), dtype=torch.float32)
+y_pred[0, 0, 10, 20] = 0.9
+y_pred[0, 1, 12, 22] = 0.8
+result = predict(indices, y_pred=y_pred, img_scaler=(1, 1))
 assert len(result["Frame"]) == len(result["PeakValue"]) == 2
-write_pred_csv(result, r"%s")
-""" % str(tmp_path / "tracknet.csv")
+write_pred_csv(result, save_file="out.csv")
+"""
     subprocess.run(
         [sys.executable, "-c", script],
-        cwd=Path(__file__).parents[1] / "src" / "TrackNetV3",
         check=True,
+        cwd=Path(__file__).parents[1] / "src" / "TrackNetV3",
     )
-    rows = list(csv.DictReader((tmp_path / "tracknet.csv").open()))
-    assert len(rows) == 2
+    rows = list(csv.DictReader((Path(__file__).parents[1] / "src" / "TrackNetV3" / "out.csv").open()))
+    assert [int(row["Frame"]) for row in rows] == [0, 1]
+    assert [int(row["Visibility"]) for row in rows] == [1, 1]
     assert [round(float(row["PeakValue"]), 1) for row in rows] == [0.9, 0.8]
+    (Path(__file__).parents[1] / "src" / "TrackNetV3" / "out.csv").unlink()
