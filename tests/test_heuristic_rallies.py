@@ -6,15 +6,24 @@ import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from InPlay.heuristic.config import HeuristicConfig
 from InPlay.heuristic.corrections import finalize, validate_rows
 from InPlay.heuristic.court import add_court_signal
 from InPlay.heuristic.evaluate import Interval, evaluate, interval_iou
-from InPlay.heuristic.players import crop_point_to_image, select_on_court_tracks
+from InPlay.heuristic.players import (
+    build_player_rows,
+    crop_point_to_image,
+    detector_class_name,
+    ensure_person_detector,
+    select_on_court_tracks,
+    write_player_csv,
+)
 from InPlay.heuristic.segment import CANONICAL_FIELDS, segment_tracks
 from InPlay.heuristic.tracks import preprocess_tracks, read_track_csv
+from src.court_projection import CourtHomography
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -209,6 +218,87 @@ def test_player_geometry_and_spectator_rejection() -> None:
         8: [(0, (300, 100, 350, 300))],
     }
     assert set(select_on_court_tracks(observations, (800, 600))) == {1, 2}
+
+
+def test_player_selection_uses_homography_when_available() -> None:
+    calibration = CourtHomography(np.eye(3))
+    observations = {
+        1: [(i, (-0.5, -2.0, 0.5, -1.0)) for i in range(20)],
+        2: [(i, (1.5, 1.0, 2.5, 2.0)) for i in range(18)],
+        9: [(i, (7.5, 0.0, 8.5, 1.0)) for i in range(100)],
+    }
+    assert set(select_on_court_tracks(observations, (800, 600), calibration)) == {1, 2}
+
+
+def test_player_detector_must_map_class_zero_to_person() -> None:
+    class Detector:
+        def __init__(self, names: object) -> None:
+            self.names = names
+
+    assert detector_class_name(Detector({0: "person"})) == "person"
+    assert detector_class_name(Detector(["person", "bicycle"])) == "person"
+    ensure_person_detector(Detector({0: "person"}), "yolov8n.pt")
+    with pytest.raises(ValueError, match="not a COCO person detector"):
+        ensure_person_detector(Detector({0: "shuttle"}), "best.pt")
+
+
+def test_raw_player_artifact_builds_heuristic_csv(tmp_path: Path) -> None:
+    raw_data = {
+        "schema_version": 1,
+        "frame_size": [640, 360],
+        "selected_track_ids": [11, 22],
+        "frames": [
+            {
+                "frame": 0,
+                "detections": [
+                    {
+                        "track_id": 11,
+                        "selected": True,
+                        "crop_valid": True,
+                        "foot": [100.0, 200.0],
+                        "activity": 0.02,
+                        "pose_landmarks": [{"x": 0.1, "y": 0.2, "z": 0.0, "visibility": 1.0}],
+                    },
+                    {"track_id": 99, "selected": False, "crop_valid": False, "pose_landmarks": None},
+                ],
+            },
+            {
+                "frame": 1,
+                "detections": [
+                    {
+                        "track_id": 11,
+                        "selected": True,
+                        "crop_valid": True,
+                        "foot": [104.0, 201.0],
+                        "activity": 0.01,
+                        "pose_landmarks": [{"x": 0.11, "y": 0.2, "z": 0.0, "visibility": 1.0}],
+                    },
+                    {
+                        "track_id": 22,
+                        "selected": True,
+                        "crop_valid": True,
+                        "foot": [504.0, 210.0],
+                        "activity": 0.03,
+                        "pose_landmarks": [{"x": 0.6, "y": 0.3, "z": 0.0, "visibility": 1.0}],
+                    },
+                ],
+            },
+        ],
+    }
+    rows = build_player_rows(raw_data)
+    assert rows[0]["Frame"] == 0
+    assert rows[0]["player1_track_id"] == 11
+    assert rows[0]["player2_track_id"] == 22
+    assert rows[0]["player2_valid"] == 0
+    assert rows[0]["player_activity"] == pytest.approx(0.4)
+    assert rows[1]["player_activity"] == pytest.approx(0.8)
+    assert rows[1]["activity_window"] == pytest.approx(0.6)
+
+    output = tmp_path / "players.csv"
+    write_player_csv(rows, output)
+    saved = list(csv.DictReader(output.open()))
+    assert saved[0]["Frame"] == "0"
+    assert saved[1]["player2_track_id"] == "22"
 
 
 def test_cli_segment_evaluate_and_corrections(tmp_path: Path) -> None:
