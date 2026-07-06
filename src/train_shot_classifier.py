@@ -1,7 +1,7 @@
 import os
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader, Subset
 from torch.nn.utils.rnn import pad_sequence
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,23 +10,40 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, f1_score
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+from sklearn.model_selection import GroupShuffleSplit
+
+try:
+    from .court_features import CalibrationRegistry
+except ImportError:
+    from court_features import CalibrationRegistry
 
 # Config
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 FEATURE_DIR = PROJECT_ROOT / "clip_features"
 MODEL_DIR = PROJECT_ROOT / "models"
-LABELS = sorted(list(set(f.split("_")[0] for f in os.listdir(FEATURE_DIR) if f.endswith(".npy"))))
+LABELS = sorted(
+    {
+        path.name.split("_")[0]
+        for path in FEATURE_DIR.glob("*.npy")
+    }
+)
 LABEL_TO_IDX = {label: i for i, label in enumerate(LABELS)}
 IDX_TO_LABEL = {i: label for label, i in LABEL_TO_IDX.items()}
 EPOCHS = 200
+CALIBRATION_REGISTRY = PROJECT_ROOT / "features" / "court" / "calibrations.json"
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 class ShotDataset(Dataset):
-    def __init__(self, feature_dir):
+    def __init__(self, feature_dir, calibration_registry=CALIBRATION_REGISTRY):
         self.feature_paths = [os.path.join(feature_dir, f) for f in os.listdir(feature_dir) if f.endswith(".npy")]
         self.labels = [LABEL_TO_IDX[os.path.basename(f).split("_")[0]] for f in self.feature_paths]
+        registry = CalibrationRegistry(calibration_registry)
+        self.source_groups = [
+            registry.source_for_clip(os.path.basename(path))
+            for path in self.feature_paths
+        ]
 
     def __len__(self):
         return len(self.feature_paths)
@@ -42,6 +59,22 @@ def collate_fn(batch):
     lengths = torch.tensor([seq.size(0) for seq in sequences])
     labels = torch.stack(labels)
     return padded, lengths, labels
+
+
+def grouped_train_val_split(dataset, val_size=0.2, random_state=42):
+    groups = np.asarray(dataset.source_groups)
+    if len(set(groups)) < 2:
+        raise ValueError("grouped validation requires at least two source videos")
+    indices = np.arange(len(dataset))
+    splitter = GroupShuffleSplit(
+        n_splits=1, test_size=val_size, random_state=random_state
+    )
+    train_indices, val_indices = next(
+        splitter.split(indices, np.asarray(dataset.labels), groups)
+    )
+    if set(groups[train_indices]) & set(groups[val_indices]):
+        raise RuntimeError("source-video leakage detected in grouped split")
+    return Subset(dataset, train_indices), Subset(dataset, val_indices)
 
 class ShotClassifier(nn.Module):
     def __init__(self, input_dim, hidden_dim, num_classes, dropout_prob=0.3):
@@ -61,6 +94,11 @@ class ShotClassifier(nn.Module):
         return self.fc(last)
 
 if __name__ == "__main__":
+    if not LABELS:
+        raise FileNotFoundError(
+            f"no generated clip features found in {FEATURE_DIR}; "
+            "run src/extract_clip_features.py first"
+        )
     if torch.cuda.is_available():
         device = torch.device("cuda")
     elif torch.backends.mps.is_available():
@@ -70,9 +108,7 @@ if __name__ == "__main__":
     logging.info("Using device: %s", device)
 
     dataset = ShotDataset(FEATURE_DIR)
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_ds, val_ds = random_split(dataset, [train_size, val_size])
+    train_ds, val_ds = grouped_train_val_split(dataset)
 
     train_loader = DataLoader(train_ds, batch_size=16, shuffle=True, collate_fn=collate_fn)
     val_loader = DataLoader(val_ds, batch_size=16, shuffle=False, collate_fn=collate_fn)

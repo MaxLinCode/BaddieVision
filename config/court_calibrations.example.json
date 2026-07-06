@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "sources": {
+    "img_3214": {
+      "calibration": "img_3214.json"
+    },
+    "img_3212": {
+      "calibration": "img_3212.json"
+    }
+  },
+  "clip_overrides": {
+    "clear_001": "img_3214"
+  }
+}

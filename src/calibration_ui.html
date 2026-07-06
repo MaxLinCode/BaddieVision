@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Court calibration</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #171717; color: white; font: 15px system-ui; }
+    header {
+      position: sticky; top: 0; display: flex; align-items: center; gap: 6px;
+      min-height: 58px; padding: 8px 12px; background: #242424; z-index: 3;
+    }
+    #status { flex: 1; min-width: 310px; }
+    button, input { padding: 6px 9px; }
+    input { width: 78px; }
+    #viewport {
+      position: relative; width: calc(100vw - 24px); height: calc(100vh - 70px);
+      margin: 6px auto; overflow: auto; background: #0d0d0d;
+    }
+    #canvas { display: block; max-width: none; height: auto; cursor: crosshair; }
+    #magnifier {
+      display: none; position: fixed; width: 200px; height: 200px;
+      border: 2px solid white; border-radius: 4px; pointer-events: none;
+      background: black; box-shadow: 0 3px 14px #000; z-index: 4;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <span id="status"></span>
+    <button data-jump="-10">−10</button><button data-jump="-1">Previous</button>
+    <label>Frame <input id="frame" type="number"></label>
+    <button data-jump="1">Next</button><button data-jump="10">+10</button>
+    <button id="zoom-out">Zoom −</button><button id="zoom-in">Zoom +</button>
+    <button id="zoom-fit">Fit</button>
+    <button id="undo">Undo</button><button id="save" disabled>Save</button>
+  </header>
+  <div id="viewport"><canvas id="canvas"></canvas></div>
+  <canvas id="magnifier" width="200" height="200"></canvas>
+  <script>
+    const config = __CALIBRATION_CONFIG__;
+    const {mode, landmarkNames, lineNames, totalFrames} = config;
+    let frameIndex = config.initialFrame;
+    const points = [];
+    const linePoints = Object.fromEntries(lineNames.map(name => [name, []]));
+    let projectedCourt = [];
+    let draggedHandle = null;
+    let suppressClick = false;
+    let previewTimer = null;
+    let image = new Image();
+    let zoom = 1;
+
+    const canvas = document.querySelector("#canvas");
+    const ctx = canvas.getContext("2d");
+    const viewport = document.querySelector("#viewport");
+    const magnifier = document.querySelector("#magnifier");
+    const magnifierCtx = magnifier.getContext("2d");
+    const status = document.querySelector("#status");
+    const save = document.querySelector("#save");
+    const frameInput = document.querySelector("#frame");
+    frameInput.min = 0;
+    frameInput.max = totalFrames - 1;
+    frameInput.value = frameIndex;
+
+    function pretty(name) {
+      return name.replaceAll("_", " ");
+    }
+
+    function linesComplete() {
+      return lineNames.every(name => linePoints[name].length === 2);
+    }
+
+    function eventPoint(event) {
+      const box = canvas.getBoundingClientRect();
+      return [
+        (event.clientX - box.left) * canvas.width / box.width,
+        (event.clientY - box.top) * canvas.height / box.height
+      ];
+    }
+
+    function draw() {
+      ctx.drawImage(image, 0, 0);
+      ctx.font = `${16 / zoom}px system-ui`;
+
+      if (mode === "lines") {
+        ctx.strokeStyle = "#5cff79";
+        ctx.lineWidth = 2 / zoom;
+        projectedCourt.forEach(segment => {
+          ctx.beginPath();
+          ctx.moveTo(segment[0][0], segment[0][1]);
+          ctx.lineTo(segment[1][0], segment[1][1]);
+          ctx.stroke();
+        });
+
+        lineNames.forEach(name => {
+          const endpoints = linePoints[name];
+          if (endpoints.length === 2) {
+            const dx = endpoints[1][0] - endpoints[0][0];
+            const dy = endpoints[1][1] - endpoints[0][1];
+            ctx.strokeStyle = "#00ffff";
+            ctx.lineWidth = 3 / zoom;
+            ctx.beginPath();
+            ctx.moveTo(endpoints[0][0] - dx * 100, endpoints[0][1] - dy * 100);
+            ctx.lineTo(endpoints[1][0] + dx * 100, endpoints[1][1] + dy * 100);
+            ctx.stroke();
+          }
+          endpoints.forEach((point, index) => {
+            ctx.beginPath();
+            ctx.arc(point[0], point[1], 8 / zoom, 0, Math.PI * 2);
+            ctx.fillStyle = "#ffb000";
+            ctx.fill();
+            if (index === 0) {
+              ctx.lineWidth = 3 / zoom;
+              ctx.strokeStyle = "#111";
+              ctx.fillStyle = "#00ffff";
+              ctx.strokeText(pretty(name), point[0] + 11 / zoom, point[1] - 9 / zoom);
+              ctx.fillText(pretty(name), point[0] + 11 / zoom, point[1] - 9 / zoom);
+            }
+          });
+        });
+
+        const incomplete = lineNames.find(name => linePoints[name].length < 2);
+        status.textContent = incomplete
+          ? `Frame ${frameIndex}/${totalFrames - 1} · ${pretty(incomplete)}: click point ${linePoints[incomplete].length + 1}/2`
+          : `Frame ${frameIndex}/${totalFrames - 1} · Drag orange handles until green court lines align`;
+        save.disabled = !linesComplete();
+      } else {
+        points.forEach((point, index) => {
+          ctx.beginPath();
+          ctx.arc(point[0], point[1], 7 / zoom, 0, Math.PI * 2);
+          ctx.fillStyle = "#00ffff";
+          ctx.fill();
+          ctx.fillText(landmarkNames[index], point[0] + 10 / zoom, point[1] - 10 / zoom);
+        });
+        status.textContent = points.length < landmarkNames.length
+          ? `Frame ${frameIndex}/${totalFrames - 1} · Click ${landmarkNames[points.length]}`
+          : `Frame ${frameIndex}/${totalFrames - 1} · All points selected`;
+        save.disabled = points.length !== landmarkNames.length;
+      }
+    }
+
+    function requestPreview() {
+      if (mode !== "lines" || !linesComplete()) return;
+      clearTimeout(previewTimer);
+      previewTimer = setTimeout(async () => {
+        const response = await fetch("/preview", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({lines: linePoints})
+        });
+        if (response.ok) {
+          projectedCourt = (await response.json()).segments;
+          draw();
+        }
+      }, 60);
+    }
+
+    function fitZoom() {
+      return Math.min(
+        1,
+        (viewport.clientWidth - 4) / image.naturalWidth,
+        (viewport.clientHeight - 4) / image.naturalHeight
+      );
+    }
+
+    function applyZoom(nextZoom, clientX = null, clientY = null) {
+      if (!image.naturalWidth) return;
+      nextZoom = Math.min(Math.max(nextZoom, 0.1), 8);
+      const oldRect = canvas.getBoundingClientRect();
+      const viewportRect = viewport.getBoundingClientRect();
+      const anchorX = clientX ?? viewportRect.left + viewport.clientWidth / 2;
+      const anchorY = clientY ?? viewportRect.top + viewport.clientHeight / 2;
+      const sourceX = (anchorX - oldRect.left) / oldRect.width;
+      const sourceY = (anchorY - oldRect.top) / oldRect.height;
+      zoom = nextZoom;
+      canvas.style.width = `${image.naturalWidth * zoom}px`;
+      canvas.style.height = `${image.naturalHeight * zoom}px`;
+      viewport.scrollLeft = sourceX * image.naturalWidth * zoom - (anchorX - viewportRect.left);
+      viewport.scrollTop = sourceY * image.naturalHeight * zoom - (anchorY - viewportRect.top);
+      draw();
+    }
+
+    function positionMagnifier(event) {
+      const [sourceX, sourceY] = eventPoint(event);
+      const cropSize = 36;
+      magnifierCtx.clearRect(0, 0, 200, 200);
+      magnifierCtx.imageSmoothingEnabled = false;
+      magnifierCtx.drawImage(
+        image, sourceX - cropSize / 2, sourceY - cropSize / 2,
+        cropSize, cropSize, 0, 0, 200, 200
+      );
+      magnifierCtx.strokeStyle = "#00ffff";
+      magnifierCtx.lineWidth = 1;
+      magnifierCtx.beginPath();
+      magnifierCtx.moveTo(100, 0); magnifierCtx.lineTo(100, 200);
+      magnifierCtx.moveTo(0, 100); magnifierCtx.lineTo(200, 100);
+      magnifierCtx.stroke();
+      magnifier.style.left = `${Math.max(8, Math.min(event.clientX + 18, innerWidth - 218))}px`;
+      magnifier.style.top = `${Math.max(8, Math.min(event.clientY + 18, innerHeight - 218))}px`;
+      magnifier.style.display = "block";
+    }
+
+    function clearSelection() {
+      points.length = 0;
+      lineNames.forEach(name => linePoints[name].length = 0);
+      projectedCourt = [];
+    }
+
+    function loadFrame(requestedIndex) {
+      const target = Math.min(Math.max(Number(requestedIndex) || 0, 0), totalFrames - 1);
+      frameIndex = target;
+      frameInput.value = frameIndex;
+      clearSelection();
+      status.textContent = `Loading frame ${frameIndex}…`;
+      const nextImage = new Image();
+      nextImage.onload = () => {
+        if (target !== frameIndex) return;
+        image = nextImage;
+        canvas.width = image.naturalWidth;
+        canvas.height = image.naturalHeight;
+        canvas.style.width = `${image.naturalWidth}px`;
+        canvas.style.height = `${image.naturalHeight}px`;
+        applyZoom(fitZoom());
+      };
+      nextImage.src = `/frame.jpg?index=${target}&cache=${Date.now()}`;
+    }
+
+    document.querySelectorAll("[data-jump]").forEach(button => {
+      button.disabled = totalFrames === 1;
+      button.onclick = () => loadFrame(frameIndex + Number(button.dataset.jump));
+    });
+    frameInput.disabled = totalFrames === 1;
+    frameInput.onchange = () => loadFrame(frameInput.value);
+    document.querySelector("#zoom-in").onclick = () => applyZoom(zoom * 1.5);
+    document.querySelector("#zoom-out").onclick = () => applyZoom(zoom / 1.5);
+    document.querySelector("#zoom-fit").onclick = () => applyZoom(fitZoom());
+
+    canvas.addEventListener("wheel", event => {
+      event.preventDefault();
+      applyZoom(zoom * (event.deltaY < 0 ? 1.2 : 1 / 1.2), event.clientX, event.clientY);
+    }, {passive: false});
+    canvas.addEventListener("pointerdown", event => {
+      if (mode !== "lines") return;
+      const point = eventPoint(event);
+      const radius = 14 / zoom;
+      for (const name of lineNames) {
+        for (let index = 0; index < linePoints[name].length; index++) {
+          const handle = linePoints[name][index];
+          if (Math.hypot(point[0] - handle[0], point[1] - handle[1]) <= radius) {
+            draggedHandle = {name, index};
+            suppressClick = true;
+            canvas.setPointerCapture(event.pointerId);
+            return;
+          }
+        }
+      }
+    });
+    canvas.addEventListener("pointermove", event => {
+      positionMagnifier(event);
+      if (!draggedHandle) return;
+      linePoints[draggedHandle.name][draggedHandle.index] = eventPoint(event);
+      draw();
+      requestPreview();
+    });
+    canvas.addEventListener("pointerup", event => {
+      if (!draggedHandle) return;
+      draggedHandle = null;
+      canvas.releasePointerCapture(event.pointerId);
+      requestPreview();
+      setTimeout(() => suppressClick = false, 0);
+    });
+    canvas.addEventListener("mouseleave", () => magnifier.style.display = "none");
+    canvas.addEventListener("click", event => {
+      if (suppressClick) return;
+      const point = eventPoint(event);
+      if (mode === "lines") {
+        const name = lineNames.find(candidate => linePoints[candidate].length < 2);
+        if (!name) return;
+        linePoints[name].push(point);
+        requestPreview();
+      } else {
+        if (points.length >= landmarkNames.length) return;
+        points.push(point);
+      }
+      draw();
+    });
+
+    document.querySelector("#undo").onclick = () => {
+      if (mode === "lines") {
+        projectedCourt = [];
+        for (const name of [...lineNames].reverse()) {
+          if (linePoints[name].length) {
+            linePoints[name].pop();
+            break;
+          }
+        }
+      } else {
+        points.pop();
+      }
+      draw();
+      requestPreview();
+    };
+
+    save.onclick = async () => {
+      save.disabled = true;
+      const response = await fetch("/submit", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          frame_index: frameIndex,
+          mode,
+          lines: mode === "lines" ? linePoints : undefined,
+          points: mode === "points"
+            ? Object.fromEntries(landmarkNames.map((name, index) => [name, points[index]]))
+            : undefined
+        })
+      });
+      if (response.ok) {
+        status.textContent = "Calibration saved. You may close this tab.";
+      } else {
+        const data = await response.json();
+        status.textContent = `Could not save: ${data.error}`;
+        save.disabled = false;
+      }
+    };
+
+    loadFrame(frameIndex);
+  </script>
+</body>
+</html>

@@ -5,6 +5,11 @@ import pandas as pd
 from pathlib import Path
 from tqdm import tqdm
 
+try:
+    from .court_features import CalibrationRegistry, build_court_anchor_features
+except ImportError:
+    from court_features import CalibrationRegistry, build_court_anchor_features
+
 # Constants
 FRAMES_WINDOW_SIZE = 36  # Maximum number of frames to process per clip
 POSE_NUM_KEYPOINTS = 33  # Number of keypoints in MediaPipe Pose
@@ -16,7 +21,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 POSE_DIR = PROJECT_ROOT / "features" / "pose"
 SHUTTLE_DIR = PROJECT_ROOT / "features" / "shuttle"
 OUTPUT_DIR = PROJECT_ROOT / "clip_features"
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+CALIBRATION_REGISTRY = PROJECT_ROOT / "features" / "court" / "calibrations.json"
 
 def load_shuttle_positions(folder_path, base_name, num_frames=FRAMES_WINDOW_SIZE, frame_width=FRAME_WIDTH, frame_height=FRAME_HEIGHT):
     """Load shuttle positions from CSV and calculate velocities and acceleration."""
@@ -83,8 +88,16 @@ def load_pose_data(pose_path, num_frames, num_keypoints=POSE_NUM_KEYPOINTS):
 
     return pose_array
 
-def process_clip_features(pose_dir, shuttle_dir, output_dir):
+def process_clip_features(
+    pose_dir,
+    shuttle_dir,
+    output_dir,
+    calibration_registry=CALIBRATION_REGISTRY,
+):
     """Main processing loop to extract clip features."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    registry = CalibrationRegistry(calibration_registry)
     for fname in tqdm(os.listdir(pose_dir), desc="Processing clips"):
         if not fname.endswith("_pose.json"):
             continue
@@ -93,20 +106,29 @@ def process_clip_features(pose_dir, shuttle_dir, output_dir):
         pose_path = os.path.join(pose_dir, fname)
 
         # Load pose data
+        with open(pose_path, "r", encoding="utf-8") as pose_file:
+            pose_frames = json.load(pose_file)
         pose_array = load_pose_data(pose_path, FRAMES_WINDOW_SIZE)
+        calibration = registry.calibration_for_clip(base_name)
+        court_array = build_court_anchor_features(
+            pose_frames, calibration, FRAMES_WINDOW_SIZE
+        )
 
         # Load shuttle positions
         shuttle_array = load_shuttle_positions(shuttle_dir, base_name, FRAMES_WINDOW_SIZE)
 
         # Combine pose and shuttle features
-        feature_array = np.concatenate([pose_array, shuttle_array], axis=1)
+        feature_array = np.concatenate([pose_array, shuttle_array, court_array], axis=1)
 
         # Save features
         out_path = os.path.join(output_dir, f"{base_name}_features.npy")
         np.save(out_path, feature_array)
 
         print(f"Saved features for {base_name} → {out_path}")
-        print(f"Shape: {feature_array.shape} with {POSE_NUM_KEYPOINTS} keypoints and shuttle positions")
+        print(
+            f"Shape: {feature_array.shape} with {POSE_NUM_KEYPOINTS} keypoints, "
+            "shuttle positions, and court anchor"
+        )
 
-# Run the feature extraction
-process_clip_features(POSE_DIR, SHUTTLE_DIR, OUTPUT_DIR)
+if __name__ == "__main__":
+    process_clip_features(POSE_DIR, SHUTTLE_DIR, OUTPUT_DIR)
