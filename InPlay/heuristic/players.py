@@ -23,6 +23,23 @@ PERSON_CLASS_NAME = "person"
 COURT_SELECTION_MARGIN_METERS = 0.3
 
 
+def mediapipe_pose_api() -> Any:
+    import mediapipe as mp
+
+    solutions = getattr(mp, "solutions", None)
+    pose_module = getattr(solutions, "pose", None) if solutions is not None else None
+    if pose_module is not None:
+        return pose_module
+    try:
+        from mediapipe.python.solutions import pose as pose_module
+    except ImportError as exc:
+        raise AttributeError(
+            "MediaPipe Pose API is unavailable. Install a MediaPipe build that includes "
+            "`mediapipe.solutions.pose` or `mediapipe.python.solutions.pose`."
+        ) from exc
+    return pose_module
+
+
 def crop_point_to_image(
     point: tuple[float, float], crop: tuple[float, float, float, float]
 ) -> tuple[float, float]:
@@ -115,8 +132,8 @@ def _draw_pose_landmarks(
     if not pose_landmarks:
         return
     import cv2
-    import mediapipe as mp
 
+    pose_module = mediapipe_pose_api()
     points = [
         (
             int(round(crop_point_to_image((item["x"], item["y"]), crop)[0])),
@@ -125,7 +142,7 @@ def _draw_pose_landmarks(
         )
         for item in pose_landmarks
     ]
-    for start, end in mp.solutions.pose.POSE_CONNECTIONS:
+    for start, end in pose_module.POSE_CONNECTIONS:
         if start >= len(points) or end >= len(points):
             continue
         ax, ay, av = points[start]
@@ -220,9 +237,9 @@ def run(
     vis_output: str | Path | None = None,
 ) -> None:
     import cv2
-    import mediapipe as mp
     from ultralytics import YOLO
 
+    pose_module = mediapipe_pose_api()
     detector = YOLO(model)
     ensure_person_detector(detector, model)
     capture = cv2.VideoCapture(str(video))
@@ -259,7 +276,7 @@ def run(
         selected = select_on_court_tracks(
             observations, (width, height), _court_homography(court_calibration)
         )
-        pose = mp.solutions.pose.Pose(static_image_mode=True)
+        pose = pose_module.Pose(static_image_mode=True)
         previous_feet: dict[int, tuple[float, float]] = {}
         previous_poses: dict[int, np.ndarray] = {}
         capture = cv2.VideoCapture(str(video))
