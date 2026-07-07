@@ -2,7 +2,8 @@
 # Keep ranges broad enough for both macOS (including Apple Silicon) and Linux.
 dash>=2.14,<4
 matplotlib>=3.7,<4
-mediapipe>=0.10,<1
+# Pin MediaPipe to a wheel layout that exposes the legacy Pose API used here.
+mediapipe==0.10.14
 numpy>=1.24,<3
 opencv-python>=4.8,<5
 pandas>=2.0,<3
