@@ -209,6 +209,7 @@ def run(
     pose_model_asset: str | Path | None = None,
 ) -> None:
     import cv2
+    from tqdm import tqdm
     from ultralytics import YOLO
 
     detector = YOLO(model)
@@ -216,6 +217,7 @@ def run(
     capture = cv2.VideoCapture(str(video))
     width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
     capture.release()
     results = detector.track(
         source=str(video),
@@ -223,12 +225,15 @@ def run(
         tracker="bytetrack.yaml",
         stream=True,
         persist=True,
+        verbose=False,
     )
     frame_dump = tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, suffix=".jsonl")
     frame_dump_path = Path(frame_dump.name)
     observations: dict[int, list[tuple[int, tuple[float, float, float, float]]]] = defaultdict(list)
     try:
-        for frame_index, result in enumerate(results):
+        for frame_index, result in enumerate(
+            tqdm(results, total=frame_count or None, desc="YOLO person tracking")
+        ):
             detections: list[dict[str, object]] = []
             if result.boxes.id is not None:
                 ids = result.boxes.id.int().cpu().tolist()
@@ -284,7 +289,9 @@ def run(
             fps = capture.get(cv2.CAP_PROP_FPS) or 30.0
             writer = cv2.VideoWriter(str(vis_output), fourcc, fps, (width, height))
         with frame_dump_path.open(encoding="utf-8") as frame_handle:
-            for raw_line in frame_handle:
+            for raw_line in tqdm(
+                frame_handle, total=frame_count or None, desc="Player pose extraction"
+            ):
                 frame_info = json.loads(raw_line)
                 frame_index = int(frame_info["frame"])
                 ret, image = capture.read()
