@@ -116,6 +116,18 @@ calibration after any camera movement. Calibration files must include
 ambiguous mappings and unusable foot tracks stop feature generation instead of
 silently producing invalid training data.
 
+Render the extracted pose, shuttle, and court-anchor features back onto a
+source video:
+
+```bash
+python src/visualize_features.py videos/example.mp4 --max-frames 300
+```
+
+The renderer reads `features/pose/<base>_pose.json` and
+`features/shuttle/<base>_ball.csv` by default, resolves court calibration from
+`features/court/calibrations.json`, and writes
+`outputs/<base>_feature_overlay.mp4`.
+
 Train the shot classifier:
 
 ```bash

@@ -2,8 +2,10 @@
 # Keep ranges broad enough for both macOS (including Apple Silicon) and Linux.
 dash>=2.14,<4
 matplotlib>=3.7,<4
-# Pin MediaPipe to a wheel layout that exposes the legacy Pose API used here.
-mediapipe==0.10.14
+# MediaPipe Tasks Pose Landmarker runtime. Pose extraction also requires the
+# pose_landmarker_full.task model asset; src.pose_estimator downloads it on
+# first use unless an explicit model path is provided.
+mediapipe>=0.10.21,<0.11
 numpy>=1.24,<3
 opencv-python>=4.8,<5
 pandas>=2.0,<3
