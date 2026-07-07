@@ -17,27 +17,11 @@ from typing import Any
 
 import numpy as np
 from src.court_projection import HALF_LENGTH, HALF_WIDTH, CourtHomography
+from src.pose_estimator import create_pose_estimator, pose_connections
 
 PERSON_CLASS_ID = 0
 PERSON_CLASS_NAME = "person"
 COURT_SELECTION_MARGIN_METERS = 0.3
-
-
-def mediapipe_pose_api() -> Any:
-    import mediapipe as mp
-
-    solutions = getattr(mp, "solutions", None)
-    pose_module = getattr(solutions, "pose", None) if solutions is not None else None
-    if pose_module is not None:
-        return pose_module
-    try:
-        from mediapipe.python.solutions import pose as pose_module
-    except ImportError as exc:
-        raise AttributeError(
-            "MediaPipe Pose API is unavailable. Install a MediaPipe build that includes "
-            "`mediapipe.solutions.pose` or `mediapipe.python.solutions.pose`."
-        ) from exc
-    return pose_module
 
 
 def crop_point_to_image(
@@ -114,18 +98,6 @@ def ensure_person_detector(detector: Any, model: str | Path) -> None:
         )
 
 
-def _serialize_landmarks(landmarks: Any) -> list[dict[str, float]]:
-    return [
-        {
-            "x": float(landmark.x),
-            "y": float(landmark.y),
-            "z": float(landmark.z),
-            "visibility": float(landmark.visibility),
-        }
-        for landmark in landmarks
-    ]
-
-
 def _draw_pose_landmarks(
     frame: Any, crop: tuple[float, float, float, float], pose_landmarks: list[dict[str, float]] | None
 ) -> None:
@@ -133,7 +105,6 @@ def _draw_pose_landmarks(
         return
     import cv2
 
-    pose_module = mediapipe_pose_api()
     points = [
         (
             int(round(crop_point_to_image((item["x"], item["y"]), crop)[0])),
@@ -142,7 +113,7 @@ def _draw_pose_landmarks(
         )
         for item in pose_landmarks
     ]
-    for start, end in pose_module.POSE_CONNECTIONS:
+    for start, end in pose_connections():
         if start >= len(points) or end >= len(points):
             continue
         ax, ay, av = points[start]
@@ -235,11 +206,11 @@ def run(
     court_calibration: str | Path | None = None,
     raw_output: str | Path | None = None,
     vis_output: str | Path | None = None,
+    pose_model_asset: str | Path | None = None,
 ) -> None:
     import cv2
     from ultralytics import YOLO
 
-    pose_module = mediapipe_pose_api()
     detector = YOLO(model)
     ensure_person_detector(detector, model)
     capture = cv2.VideoCapture(str(video))
@@ -276,7 +247,7 @@ def run(
         selected = select_on_court_tracks(
             observations, (width, height), _court_homography(court_calibration)
         )
-        pose = pose_module.Pose(static_image_mode=True)
+        pose = create_pose_estimator(model_asset_path=pose_model_asset, running_mode="image")
         previous_feet: dict[int, tuple[float, float]] = {}
         previous_poses: dict[int, np.ndarray] = {}
         capture = cv2.VideoCapture(str(video))
@@ -302,6 +273,7 @@ def run(
                             "class_id": PERSON_CLASS_ID,
                             "class_name": PERSON_CLASS_NAME,
                         },
+                        "pose_backend": pose.backend_info,
                         "selected_track_ids": selected,
                     }
                 )
@@ -332,10 +304,10 @@ def run(
                     pose_activity = 0.0
                     serialized_landmarks = None
                     if valid:
-                        pose_result = pose.process(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
-                        if pose_result.pose_landmarks:
-                            landmarks = pose_result.pose_landmarks.landmark
-                            serialized_landmarks = _serialize_landmarks(landmarks)
+                        pose_result = pose.estimate_pose(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
+                        if pose_result.detected:
+                            landmarks = pose_result.landmarks
+                            serialized_landmarks = pose_result.to_raw_landmarks()
                             source_pose = np.asarray(
                                 [
                                     crop_point_to_image((landmark.x, landmark.y), box)
@@ -443,6 +415,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--court-calibration")
     parser.add_argument("--raw-output")
     parser.add_argument("--vis-output")
+    parser.add_argument("--pose-model-asset")
     args = parser.parse_args(argv)
     run(
         args.video,
@@ -451,6 +424,7 @@ def main(argv: list[str] | None = None) -> int:
         args.court_calibration,
         raw_output=args.raw_output,
         vis_output=args.vis_output,
+        pose_model_asset=args.pose_model_asset,
     )
     return 0
 
