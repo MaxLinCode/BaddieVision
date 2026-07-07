@@ -18,6 +18,7 @@ from InPlay.heuristic.players import (
     crop_point_to_image,
     detector_class_name,
     ensure_person_detector,
+    _court_homography,
     select_on_court_tracks,
     write_player_csv,
 )
@@ -230,6 +231,28 @@ def test_player_selection_uses_homography_when_available() -> None:
     assert set(select_on_court_tracks(observations, (800, 600), calibration)) == {1, 2}
 
 
+def test_player_calibration_missing_path_warns_and_records_fallback(tmp_path: Path) -> None:
+    missing = tmp_path / "missing.json"
+    with pytest.warns(RuntimeWarning, match="could not load court calibration"):
+        calibration, status = _court_homography(missing)
+    assert calibration is None
+    assert status["path"] == str(missing)
+    assert status["loaded"] is False
+    assert "screen-space" in str(status["warning"])
+    assert status["position_space"] == "screen"
+
+
+def test_player_calibration_invalid_warns_and_records_fallback(tmp_path: Path) -> None:
+    invalid = tmp_path / "invalid.json"
+    invalid.write_text("{not json", encoding="utf-8")
+    with pytest.warns(RuntimeWarning, match="could not load court calibration"):
+        calibration, status = _court_homography(invalid)
+    assert calibration is None
+    assert status["path"] == str(invalid)
+    assert status["loaded"] is False
+    assert "screen-space" in str(status["warning"])
+
+
 def test_player_detector_must_map_class_zero_to_person() -> None:
     class Detector:
         def __init__(self, names: object) -> None:
@@ -299,6 +322,87 @@ def test_raw_player_artifact_builds_heuristic_csv(tmp_path: Path) -> None:
     saved = list(csv.DictReader(output.open()))
     assert saved[0]["Frame"] == "0"
     assert saved[1]["player2_track_id"] == "22"
+
+
+def test_player_rows_keep_slots_when_track_ids_change() -> None:
+    raw_data = {
+        "schema_version": 1,
+        "frame_size": [640, 360],
+        "selected_track_ids": [11, 22],
+        "frames": [
+            {
+                "frame": 0,
+                "detections": [
+                    _player_detection(11, 160, 250, 0.01),
+                    _player_detection(22, 480, 250, 0.02),
+                ],
+            },
+            {
+                "frame": 1,
+                "detections": [
+                    _player_detection(11, 168, 252, 0.01),
+                    _player_detection(44, 486, 251, 0.02),
+                ],
+            },
+            {
+                "frame": 2,
+                "detections": [
+                    _player_detection(33, 176, 252, 0.01),
+                    _player_detection(44, 492, 252, 0.02),
+                ],
+            },
+        ],
+    }
+    rows = build_player_rows(raw_data)
+    assert [row["player1_track_id"] for row in rows] == [11, 11, 33]
+    assert [row["player2_track_id"] for row in rows] == [22, 44, 44]
+    assert all(row["player1_valid"] == 1 and row["player2_valid"] == 1 for row in rows)
+
+
+def test_player_rows_do_not_drop_fragmented_second_player_after_swap() -> None:
+    raw_data = {
+        "schema_version": 1,
+        "frame_size": [640, 360],
+        "selected_track_ids": [11, 22],
+        "frames": [
+            {
+                "frame": 0,
+                "detections": [
+                    _player_detection(11, 170, 260, 0.01),
+                    _player_detection(22, 470, 260, 0.02),
+                ],
+            },
+            {
+                "frame": 1,
+                "detections": [
+                    _player_detection(22, 176, 260, 0.01),
+                    _player_detection(55, 464, 260, 0.02),
+                ],
+            },
+            {
+                "frame": 2,
+                "detections": [
+                    _player_detection(66, 182, 261, 0.01),
+                    _player_detection(55, 458, 260, 0.02),
+                ],
+            },
+        ],
+    }
+    rows = build_player_rows(raw_data)
+    assert [row["player1_track_id"] for row in rows] == [11, 22, 66]
+    assert [row["player2_track_id"] for row in rows] == [22, 55, 55]
+    assert [row["player2_valid"] for row in rows] == [1, 1, 1]
+
+
+def _player_detection(track_id: int, foot_x: float, foot_y: float, activity: float) -> dict[str, object]:
+    return {
+        "track_id": track_id,
+        "selected": True,
+        "crop_valid": True,
+        "foot": [foot_x, foot_y],
+        "activity": activity,
+        "pose_landmarks": None,
+    }
 
 
 def test_cli_segment_evaluate_and_corrections(tmp_path: Path) -> None:

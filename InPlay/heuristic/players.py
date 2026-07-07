@@ -10,8 +10,10 @@ import argparse
 import csv
 import json
 import tempfile
+import warnings
 from collections import defaultdict
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -31,14 +33,13 @@ def crop_point_to_image(
     return x1 + point[0] * (x2 - x1), y1 + point[1] * (y2 - y1)
 
 
-def select_on_court_tracks(
+def _track_selection_scores(
     observations: dict[int, list[tuple[int, tuple[float, float, float, float]]]],
     frame_size: tuple[int, int],
     court_homography: CourtHomography | None = None,
-) -> list[int]:
-    """Select persistent central/lower-image tracks, suppressing spectators."""
+) -> dict[int, dict[str, object]]:
     width, height = frame_size
-    scores: list[tuple[float, int]] = []
+    diagnostics: dict[int, dict[str, object]] = {}
     for track_id, entries in observations.items():
         if not entries:
             continue
@@ -65,17 +66,218 @@ def select_on_court_tracks(
                 0.08 * width <= x <= 0.92 * width and 0.20 * height <= y <= 1.02 * height
                 for x, y in centers
             ) / len(centers)
-        scores.append((len(entries) * region, track_id))
+        diagnostics[int(track_id)] = {
+            "track_id": int(track_id),
+            "frames": len(entries),
+            "region_fraction": float(region),
+            "score": float(len(entries) * region),
+        }
+    return diagnostics
+
+
+def select_on_court_tracks(
+    observations: dict[int, list[tuple[int, tuple[float, float, float, float]]]],
+    frame_size: tuple[int, int],
+    court_homography: CourtHomography | None = None,
+) -> list[int]:
+    """Select persistent central/lower-image tracks, suppressing spectators."""
+    scores = [
+        (float(item["score"]), int(track_id))
+        for track_id, item in _track_selection_scores(
+            observations, frame_size, court_homography
+        ).items()
+    ]
     return [track_id for score, track_id in sorted(scores, reverse=True)[:2] if score > 0]
 
 
-def _court_homography(path: str | Path | None) -> CourtHomography | None:
+def _calibration_status(path: str | Path | None, loaded: bool, warning: str | None) -> dict[str, object]:
+    return {
+        "path": str(path) if path is not None else None,
+        "loaded": loaded,
+        "warning": warning,
+        "position_space": "court" if loaded else "screen",
+    }
+
+
+def _court_homography(
+    path: str | Path | None,
+) -> tuple[CourtHomography | None, dict[str, object]]:
     if path is None:
+        warning = (
+            "no court calibration provided; player selection falls back to a "
+            "screen-space heuristic that may be unreliable for skewed cameras"
+        )
+        warnings.warn(warning, RuntimeWarning, stacklevel=2)
+        return None, _calibration_status(path, False, warning)
+    try:
+        return CourtHomography.load(path), _calibration_status(path, True, None)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError, KeyError) as exc:
+        warning = (
+            f"could not load court calibration {path}: {exc}; player selection "
+            "falls back to a screen-space heuristic"
+        )
+        warnings.warn(warning, RuntimeWarning, stacklevel=2)
+        return None, _calibration_status(path, False, warning)
+
+
+def _foot_from_detection(detection: dict[str, Any]) -> tuple[float, float] | None:
+    if "foot" in detection:
+        foot = detection["foot"]
+        return float(foot[0]), float(foot[1])
+    if "bbox" not in detection:
+        return None
+    x1, _y1, x2, y2 = [float(value) for value in detection["bbox"]]
+    return (x1 + x2) / 2, y2
+
+
+def _court_point(
+    foot: tuple[float, float],
+    court_homography: CourtHomography | None,
+) -> tuple[float, float] | None:
+    if court_homography is None:
         return None
     try:
-        return CourtHomography.load(path)
-    except (OSError, ValueError, TypeError, json.JSONDecodeError, KeyError):
+        point = court_homography.project_to_court([foot])[0]
+    except ValueError:
         return None
+    return float(point[0]), float(point[1])
+
+
+def _eligible_position(
+    detection: dict[str, Any],
+    frame_size: tuple[int, int],
+    court_homography: CourtHomography | None,
+) -> tuple[tuple[float, float], tuple[float, float] | None, tuple[float, float]] | None:
+    foot = _foot_from_detection(detection)
+    if foot is None:
+        return None
+    width, height = frame_size
+    court = _court_point(foot, court_homography)
+    if court is not None:
+        if (
+            -HALF_WIDTH - COURT_SELECTION_MARGIN_METERS
+            <= court[0]
+            <= HALF_WIDTH + COURT_SELECTION_MARGIN_METERS
+            and -HALF_LENGTH - COURT_SELECTION_MARGIN_METERS
+            <= court[1]
+            <= HALF_LENGTH + COURT_SELECTION_MARGIN_METERS
+        ):
+            return court, court, foot
+        return None
+    if 0.08 * width <= foot[0] <= 0.92 * width and 0.20 * height <= foot[1] <= 1.02 * height:
+        return (foot[0] / width, foot[1] / height), None, foot
+    return None
+
+
+@dataclass
+class _SlotState:
+    track_id: int | None = None
+    position: tuple[float, float] | None = None
+    last_frame: int | None = None
+
+
+class PlayerSlotAssigner:
+    """Map short-lived detector tracks onto stable logical P1/P2 slots."""
+
+    def __init__(
+        self,
+        frame_size: tuple[int, int],
+        court_homography: CourtHomography | None = None,
+        selected_track_ids: list[int] | None = None,
+    ) -> None:
+        self.frame_size = frame_size
+        self.court_homography = court_homography
+        selected = selected_track_ids or []
+        self.slots = {
+            1: _SlotState(track_id=int(selected[0]) if len(selected) > 0 else None),
+            2: _SlotState(track_id=int(selected[1]) if len(selected) > 1 else None),
+        }
+        self.distance_limit = 2.5 if court_homography is not None else 0.35
+
+    def assign(self, frame_index: int, detections: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+        candidates = self._candidates(detections)
+        assigned: dict[int, dict[str, Any]] = {}
+        remaining_slots = {1, 2}
+        remaining_candidates = set(range(len(candidates)))
+
+        for slot, state in self.slots.items():
+            if state.track_id is None:
+                continue
+            for index, candidate in enumerate(candidates):
+                if index not in remaining_candidates:
+                    continue
+                if int(candidate["track_id"]) == state.track_id:
+                    if (
+                        state.position is not None
+                        and _distance(state.position, candidate["match_position"])
+                        > self.distance_limit
+                    ):
+                        continue
+                    assigned[slot] = candidate
+                    remaining_slots.remove(slot)
+                    remaining_candidates.remove(index)
+                    break
+
+        while remaining_slots and remaining_candidates:
+            best: tuple[float, int, int] | None = None
+            for slot in remaining_slots:
+                state = self.slots[slot]
+                if state.position is None:
+                    continue
+                for index in remaining_candidates:
+                    candidate = candidates[index]
+                    distance = _distance(state.position, candidate["match_position"])
+                    if distance > self.distance_limit:
+                        continue
+                    cost = distance
+                    if state.track_id is not None and int(candidate["track_id"]) != state.track_id:
+                        cost += self.distance_limit * 0.1
+                    if best is None or cost < best[0]:
+                        best = (cost, slot, index)
+            if best is None:
+                break
+            _cost, slot, index = best
+            assigned[slot] = candidates[index]
+            remaining_slots.remove(slot)
+            remaining_candidates.remove(index)
+
+        if remaining_slots and remaining_candidates:
+            ordered_slots = sorted(remaining_slots)
+            ordered_candidates = sorted(
+                (candidates[index] for index in remaining_candidates),
+                key=lambda item: (item["match_position"][1], item["match_position"][0]),
+            )
+            for slot, candidate in zip(ordered_slots, ordered_candidates):
+                assigned[slot] = candidate
+
+        for slot, candidate in assigned.items():
+            self.slots[slot] = _SlotState(
+                track_id=int(candidate["track_id"]),
+                position=candidate["match_position"],
+                last_frame=frame_index,
+            )
+        return assigned
+
+    def _candidates(self, detections: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        candidates = []
+        for detection in detections:
+            if "track_id" not in detection:
+                continue
+            position = _eligible_position(detection, self.frame_size, self.court_homography)
+            if position is None:
+                continue
+            match_position, court_foot, foot = position
+            candidate = dict(detection)
+            candidate["track_id"] = int(candidate["track_id"])
+            candidate["match_position"] = match_position
+            candidate["court_foot"] = court_foot
+            candidate["foot"] = [float(foot[0]), float(foot[1])]
+            candidates.append(candidate)
+        return candidates
+
+
+def _distance(a: tuple[float, float], b: tuple[float, float]) -> float:
+    return float(np.linalg.norm(np.asarray(a) - np.asarray(b)))
 
 
 def detector_class_name(detector: Any, class_id: int = PERSON_CLASS_ID) -> str | None:
@@ -130,8 +332,15 @@ def build_player_rows(raw_data: dict[str, Any]) -> list[dict[str, object]]:
     rows = []
     activity_window: deque[float] = deque(maxlen=30)
     selected_track_ids = [int(track_id) for track_id in raw_data.get("selected_track_ids", [])]
+    frame_size = tuple(raw_data.get("frame_size", [1, 1]))
+    assigner = PlayerSlotAssigner(
+        (int(frame_size[0]), int(frame_size[1])),
+        selected_track_ids=selected_track_ids,
+    )
     for frame in raw_data.get("frames", []):
-        rows.append(_player_row_from_frame(frame, selected_track_ids, activity_window))
+        rows.append(
+            _player_row_from_frame(frame, selected_track_ids, activity_window, assigner)
+        )
     return rows
 
 
@@ -156,25 +365,47 @@ def _player_fieldnames() -> list[str]:
 
 
 def _player_row_from_frame(
-    frame: dict[str, Any], selected_track_ids: list[int], activity_window: deque[float]
+    frame: dict[str, Any],
+    selected_track_ids: list[int],
+    activity_window: deque[float],
+    assigner: PlayerSlotAssigner | None = None,
 ) -> dict[str, object]:
     activities = []
     row: dict[str, object] = {"Frame": int(frame["frame"])}
-    detections = {
-        int(item["track_id"]): item
-        for item in frame.get("detections", [])
-        if item.get("selected")
-    }
-    for slot, track_id in enumerate(selected_track_ids, 1):
-        detection = detections.get(track_id)
+    detections_by_slot: dict[int, dict[str, Any]] = {}
+    for item in frame.get("detections", []):
+        if item.get("selected") and "slot" in item:
+            detections_by_slot[int(item["slot"])] = item
+    if not detections_by_slot:
+        candidate_detections = [
+            item for item in frame.get("detections", [])
+            if item.get("selected") or "foot" in item
+        ]
+        if assigner is not None:
+            detections_by_slot = assigner.assign(int(frame["frame"]), candidate_detections)
+        else:
+            detections_by_id = {
+                int(item["track_id"]): item
+                for item in candidate_detections
+                if item.get("selected")
+            }
+            detections_by_slot = {
+                slot: detections_by_id[track_id]
+                for slot, track_id in enumerate(selected_track_ids, 1)
+                if track_id in detections_by_id
+            }
+    for slot in (1, 2):
+        fallback_track_id = selected_track_ids[slot - 1] if len(selected_track_ids) >= slot else ""
+        detection = detections_by_slot.get(slot)
         if detection is None:
             row.update(
                 {
-                    f"player{slot}_track_id": track_id,
+                    f"player{slot}_track_id": fallback_track_id,
                     f"player{slot}_valid": 0,
                 }
             )
             continue
+        track_id = int(detection["track_id"])
         foot = detection.get("foot", [0.0, 0.0])
         activity = float(detection.get("activity", 0.0))
         valid = int(detection.get("crop_valid", 0))
@@ -244,17 +475,23 @@ def run(
                     observations[track_id].append((frame_index, box))
             frame_dump.write(json.dumps({"frame": frame_index, "detections": detections}) + "\n")
         frame_dump.close()
-        if court_calibration is None:
-            print(
-                "Warning: no court calibration provided; player selection falls back to a "
-                "screen-space heuristic that may be unreliable for skewed cameras."
-            )
-        selected = select_on_court_tracks(
-            observations, (width, height), _court_homography(court_calibration)
-        )
+        court_homography, calibration = _court_homography(court_calibration)
+        track_diagnostics = _track_selection_scores(observations, (width, height), court_homography)
+        selected = [
+            track_id
+            for score, track_id in sorted(
+                (
+                    (float(item["score"]), int(track_id))
+                    for track_id, item in track_diagnostics.items()
+                ),
+                reverse=True,
+            )[:2]
+            if score > 0
+        ]
         pose = create_pose_estimator(model_asset_path=pose_model_asset, running_mode="image")
         previous_feet: dict[int, tuple[float, float]] = {}
         previous_poses: dict[int, np.ndarray] = {}
+        slot_assigner = PlayerSlotAssigner((width, height), court_homography, selected)
         capture = cv2.VideoCapture(str(video))
         writer = None
         raw_handle = None
@@ -280,6 +517,14 @@ def run(
                         },
                         "pose_backend": pose.backend_info,
                         "selected_track_ids": selected,
+                        "calibration": calibration,
+                        "diagnostics": {
+                            "position_space": "court" if court_homography is not None else "screen",
+                            "track_selection": sorted(
+                                track_diagnostics.values(),
+                                key=lambda item: (-float(item["score"]), int(item["track_id"])),
+                            ),
+                        },
                     }
                 )
                 + "\n"
@@ -299,14 +544,13 @@ def run(
                     break
                 detections = list(frame_info["detections"])
                 frame_entry: dict[str, Any] = {"frame": frame_index, "detections": []}
-                by_id = {int(item["track_id"]): item["bbox"] for item in detections}
-                for slot, track_id in enumerate(selected, 1):
-                    if track_id not in by_id:
-                        continue
-                    box = by_id[track_id]
+                assignments = slot_assigner.assign(frame_index, detections)
+                for slot, assignment in sorted(assignments.items()):
+                    track_id = int(assignment["track_id"])
+                    box = assignment["bbox"]
                     x1, y1, x2, y2 = [int(value) for value in box]
                     crop = image[max(0, y1):min(height, y2), max(0, x1):min(width, x2)]
-                    foot = ((x1 + x2) / 2, y2)
+                    foot = tuple(assignment.get("foot", ((x1 + x2) / 2, y2)))
                     valid = crop.size > 0
                     pose_activity = 0.0
                     serialized_landmarks = None
@@ -347,6 +591,12 @@ def run(
                             "selected": True,
                             "crop_valid": bool(valid),
                             "foot": [float(foot[0]), float(foot[1])],
+                            "court_foot": (
+                                [float(value) for value in assignment["court_foot"]]
+                                if assignment.get("court_foot") is not None
+                                else None
+                            ),
+                            "position_space": "court" if court_homography is not None else "screen",
                             "activity": pose_activity,
                             "pose_landmarks": serialized_landmarks,
                         }
@@ -392,7 +642,9 @@ def run(
                             1,
                             cv2.LINE_AA,
                         )
-                player_writer.writerow(_player_row_from_frame(frame_entry, selected, activity_window))
+                player_writer.writerow(
+                    _player_row_from_frame(frame_entry, selected, activity_window)
+                )
                 if raw_handle is not None:
                     raw_handle.write(json.dumps({"type": "frame", **frame_entry}) + "\n")
                 if writer is not None:
