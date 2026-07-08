@@ -14,3 +14,11 @@
   incompatible.
 - [ ] Review source-grouped validation metrics and compare them with the
   previous classifier baseline.
+
+## InPlay player tracking
+
+- [ ] After merging player-slot stability, rerun the player tracking / pose
+  extraction step for representative videos and inspect `players.csv` plus
+  `player_poses.jsonl` to confirm stable P1/P2 slots and calibration fallback
+  diagnostics. Shot-classifier `clip_features/` regeneration is not required
+  for this change.
