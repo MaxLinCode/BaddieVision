@@ -11,9 +11,10 @@ import pytest
 
 from InPlay.heuristic.config import HeuristicConfig
 from InPlay.heuristic.corrections import finalize, validate_rows
-from InPlay.heuristic.court import add_court_signal
+from InPlay.heuristic.court import add_court_signal, add_player_court_signal
 from InPlay.heuristic.evaluate import Interval, evaluate, interval_iou
 from InPlay.heuristic.players import (
+    assign_player_slots,
     build_player_rows,
     crop_point_to_image,
     detector_class_name,
@@ -133,6 +134,61 @@ def test_stationary_false_detection_and_outside_court_end(tmp_path: Path) -> Non
     assert outside and outside[0].end_frame < moving[-1].frame
 
 
+def test_player_feet_gate_start_and_suppress_shuttle_outside_end(tmp_path: Path) -> None:
+    tracks = tmp_path / "tracks.csv"
+    write_tracks(tracks, moving_rows(80, 0, 80))
+    config = HeuristicConfig(
+        visible_streak=2,
+        start_confirmation=3,
+        start_buffer=0,
+        outside_court_frames=3,
+        end_confirmation=2,
+        end_buffer=0,
+        minimum_rally=10,
+        minimum_visible_frames=5,
+        minimum_motion=0.01,
+        smoothing_window=3,
+    )
+    calibration = tmp_path / "court.json"
+    calibration.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "image_size": [640, 360],
+                "image_to_court": np.eye(3).tolist(),
+            }
+        )
+    )
+
+    def player_rows(near_y: float, far_y: float) -> dict[int, dict[str, str]]:
+        return {
+            frame: {
+                "Frame": str(frame),
+                "player_activity": "1.0",
+                "player1_valid": "1",
+                "player1_foot_x": "0.0",
+                "player1_foot_y": str(near_y),
+                "player2_valid": "1",
+                "player2_foot_x": "0.0",
+                "player2_foot_y": str(far_y),
+            }
+            for frame in range(80)
+        }
+
+    valid = preprocess_tracks(read_track_csv(tracks, (640, 360), config), config)
+    for item in valid:
+        item.inside_courtish = False
+    assert add_player_court_signal(valid, player_rows(-3.0, 3.0), calibration, 0.2) is None
+    rallies = segment_tracks(valid, "valid", 30, config)
+    assert rallies and rallies[0].end_frame == valid[-1].frame
+
+    invalid = preprocess_tracks(read_track_csv(tracks, (640, 360), config), config)
+    for item in invalid:
+        item.inside_courtish = False
+    assert add_player_court_signal(invalid, player_rows(-3.0, -4.0), calibration, 0.2) is None
+    assert segment_tracks(invalid, "invalid", 30, config) == []
+
+
 def test_non_30_fps_and_optional_player_cannot_start(tmp_path: Path) -> None:
     path = tmp_path / "empty.csv"
     write_tracks(path, moving_rows(100, 200, 200))
@@ -230,6 +286,21 @@ def test_player_selection_uses_homography_when_available() -> None:
     assert set(select_on_court_tracks(observations, (800, 600), calibration)) == {1, 2}
 
 
+def test_player_slots_are_near_to_far_with_calibration_or_screen_fallback() -> None:
+    calibration = CourtHomography(np.eye(3))
+    court_observations = {
+        11: [(i, (-0.5, 3.0, 0.5, 4.0)) for i in range(10)],
+        22: [(i, (-0.5, -4.0, 0.5, -3.0)) for i in range(10)],
+    }
+    assert assign_player_slots([11, 22], court_observations, calibration) == [22, 11]
+
+    screen_observations = {
+        11: [(i, (100.0, 100.0, 200.0, 250.0)) for i in range(10)],
+        22: [(i, (100.0, 300.0, 200.0, 500.0)) for i in range(10)],
+    }
+    assert assign_player_slots([11, 22], screen_observations) == [22, 11]
+
+
 def test_player_detector_must_map_class_zero_to_person() -> None:
     class Detector:
         def __init__(self, names: object) -> None:
@@ -247,6 +318,7 @@ def test_raw_player_artifact_builds_heuristic_csv(tmp_path: Path) -> None:
         "schema_version": 1,
         "frame_size": [640, 360],
         "selected_track_ids": [11, 22],
+        "player_slot_track_ids": [22, 11],
         "frames": [
             {
                 "frame": 0,
@@ -287,9 +359,9 @@ def test_raw_player_artifact_builds_heuristic_csv(tmp_path: Path) -> None:
     }
     rows = build_player_rows(raw_data)
     assert rows[0]["Frame"] == 0
-    assert rows[0]["player1_track_id"] == 11
-    assert rows[0]["player2_track_id"] == 22
-    assert rows[0]["player2_valid"] == 0
+    assert rows[0]["player1_track_id"] == 22
+    assert rows[0]["player2_track_id"] == 11
+    assert rows[0]["player1_valid"] == 0
     assert rows[0]["player_activity"] == pytest.approx(0.4)
     assert rows[1]["player_activity"] == pytest.approx(0.8)
     assert rows[1]["activity_window"] == pytest.approx(0.6)
@@ -298,7 +370,7 @@ def test_raw_player_artifact_builds_heuristic_csv(tmp_path: Path) -> None:
     write_player_csv(rows, output)
     saved = list(csv.DictReader(output.open()))
     assert saved[0]["Frame"] == "0"
-    assert saved[1]["player2_track_id"] == "22"
+    assert saved[1]["player1_track_id"] == "22"
 
 
 def test_cli_segment_evaluate_and_corrections(tmp_path: Path) -> None:

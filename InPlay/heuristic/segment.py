@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .config import HeuristicConfig
-from .court import add_court_signal
+from .court import add_court_signal, add_player_court_signal
 from .tracks import FrameFeature, debug_fieldnames, preprocess_tracks, read_track_csv
 
 CANONICAL_FIELDS = [
@@ -79,14 +79,32 @@ def _candidate_score(
     return score, flags
 
 
-def _read_player_activity(path: str | Path | None) -> dict[int, float] | None:
+def _read_player_rows(path: str | Path | None) -> dict[int, dict[str, str]] | None:
     if path is None:
         return None
     with Path(path).open(newline="", encoding="utf-8-sig") as handle:
         reader = csv.DictReader(handle)
-        if not {"Frame", "player_activity"} <= set(reader.fieldnames or ()):
-            raise ValueError("player CSV requires Frame and player_activity columns")
-        return {int(row["Frame"]): float(row["player_activity"]) for row in reader}
+        if "Frame" not in set(reader.fieldnames or ()):
+            raise ValueError("player CSV requires a Frame column")
+        return {int(row["Frame"]): row for row in reader}
+
+
+def _player_activity(rows: dict[int, dict[str, str]] | None) -> dict[int, float] | None:
+    if rows is None:
+        return None
+    if any("player_activity" not in row for row in rows.values()):
+        raise ValueError("player CSV requires player_activity column")
+    return {frame: float(row["player_activity"]) for frame, row in rows.items()}
+
+
+def _service_start_ok(frames: list[FrameFeature], candidate_start: int, index: int) -> bool:
+    span = frames[candidate_start : index + 1]
+    observed = [
+        item.players_opposite_service_regions
+        for item in span
+        if item.players_opposite_service_regions is not None
+    ]
+    return not observed or any(observed)
 
 
 def segment_tracks(
@@ -110,9 +128,9 @@ def segment_tracks(
     spans: list[tuple[int, int, list[str]]] = []
 
     for index, item in enumerate(frames):
-        if item.inside_courtish is False:
+        if item.inside_courtish is False and item.players_on_courtish is not True:
             outside_streak += 1
-        elif item.inside_courtish is True:
+        elif item.inside_courtish is True or item.players_on_courtish is True:
             outside_streak = 0
         if state == "IDLE":
             if item.visible_streak >= config.visible_streak:
@@ -123,8 +141,11 @@ def segment_tracks(
                 spans.append((candidate_start, index - 1, []))
                 state = "IDLE"
             elif index - candidate_start + 1 >= config.start_confirmation:
-                candidate_start = max(0, candidate_start - config.start_buffer)
-                state = "IN_RALLY"
+                if _service_start_ok(frames, candidate_start, index):
+                    candidate_start = max(0, candidate_start - config.start_buffer)
+                    state = "IN_RALLY"
+                else:
+                    state = "IDLE"
         elif state == "IN_RALLY":
             recent_motion = _recent_motion(frames, index, config)
             stopped = (
@@ -173,7 +194,7 @@ def segment_tracks(
         elif state == "CANDIDATE_END":
             motion_returned = item.reliable and _recent_motion(frames, index, config) >= config.recent_motion_minimum
             recovered = (
-                item.inside_courtish is True
+                item.inside_courtish is True or item.players_on_courtish is True
                 if candidate_end_reason == "outside"
                 else motion_returned and item.visible_streak >= config.visible_streak
             )
@@ -188,7 +209,7 @@ def segment_tracks(
 
     if state in {"IN_RALLY", "CANDIDATE_END"}:
         spans.append((candidate_start, len(frames) - 1, ["manual_review_needed"]))
-    elif state == "CANDIDATE_START":
+    elif state == "CANDIDATE_START" and _service_start_ok(frames, candidate_start, len(frames) - 1):
         spans.append((candidate_start, len(frames) - 1, ["manual_review_needed"]))
 
     rallies: list[Rally] = []
@@ -281,18 +302,25 @@ def main(argv: list[str] | None = None) -> int:
     source_id = args.source_id or Path(args.tracks).stem
     frames = preprocess_tracks(read_track_csv(args.tracks, tuple(args.image_size), config), config)
     base_flags: list[str] = []
+    player_rows = _read_player_rows(args.players)
     if args.court_calibration:
         court_flag = add_court_signal(
             frames, args.court_calibration, config.court_tolerance, source_id
         )
         if court_flag:
             base_flags.extend([court_flag, "manual_review_needed"])
+        if player_rows:
+            player_court_flag = add_player_court_signal(
+                frames, player_rows, args.court_calibration, config.court_tolerance, source_id
+            )
+            if player_court_flag:
+                base_flags.extend([player_court_flag, "manual_review_needed"])
     rallies = segment_tracks(
         frames,
         source_id,
         args.fps,
         config,
-        _read_player_activity(args.players),
+        _player_activity(player_rows),
         base_flags,
     )
     write_rallies(args.output, rallies)
