@@ -39,6 +39,9 @@ class FrameFeature:
     reliable: bool = False
     state: str = "IDLE"
     inside_courtish: bool | None = None
+    players_on_courtish: bool | None = None
+    player_court_count: int = 0
+    players_opposite_service_regions: bool | None = None
 
 
 def _number(value: str, name: str, row_number: int) -> float:

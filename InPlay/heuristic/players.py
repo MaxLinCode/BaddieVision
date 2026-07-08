@@ -69,13 +69,39 @@ def select_on_court_tracks(
     return [track_id for score, track_id in sorted(scores, reverse=True)[:2] if score > 0]
 
 
-def _court_homography(path: str | Path | None) -> CourtHomography | None:
+def assign_player_slots(
+    selected_track_ids: list[int],
+    observations: dict[int, list[tuple[int, tuple[float, float, float, float]]]],
+    court_homography: CourtHomography | None = None,
+) -> list[int]:
+    """Return selected track IDs ordered as near-side P1, then far-side P2."""
+
+    def slot_key(track_id: int) -> tuple[float, int]:
+        entries = observations.get(track_id, [])
+        if not entries:
+            return (float("inf"), track_id)
+        feet = [((box[0] + box[2]) / 2, box[3]) for _, box in entries]
+        if court_homography is not None:
+            court_y_values = []
+            for foot in feet:
+                try:
+                    court_y_values.append(float(court_homography.project_to_court([foot])[0][1]))
+                except ValueError:
+                    continue
+            if court_y_values:
+                return (float(np.median(court_y_values)), track_id)
+        return (-float(np.median([foot[1] for foot in feet])), track_id)
+
+    return sorted(selected_track_ids, key=slot_key)
+
+
+def _court_homography(path: str | Path | None) -> tuple[CourtHomography | None, str]:
     if path is None:
-        return None
+        return None, "missing"
     try:
-        return CourtHomography.load(path)
+        return CourtHomography.load(path), "loaded"
     except (OSError, ValueError, TypeError, json.JSONDecodeError, KeyError):
-        return None
+        return None, "fallback"
 
 
 def detector_class_name(detector: Any, class_id: int = PERSON_CLASS_ID) -> str | None:
@@ -129,7 +155,10 @@ def _draw_pose_landmarks(
 def build_player_rows(raw_data: dict[str, Any]) -> list[dict[str, object]]:
     rows = []
     activity_window: deque[float] = deque(maxlen=30)
-    selected_track_ids = [int(track_id) for track_id in raw_data.get("selected_track_ids", [])]
+    selected_track_ids = [
+        int(track_id)
+        for track_id in raw_data.get("player_slot_track_ids", raw_data.get("selected_track_ids", []))
+    ]
     for frame in raw_data.get("frames", []):
         rows.append(_player_row_from_frame(frame, selected_track_ids, activity_window))
     return rows
@@ -244,13 +273,22 @@ def run(
                     observations[track_id].append((frame_index, box))
             frame_dump.write(json.dumps({"frame": frame_index, "detections": detections}) + "\n")
         frame_dump.close()
-        if court_calibration is None:
+        court_homography, calibration_status = _court_homography(court_calibration)
+        if calibration_status == "missing":
             print(
                 "Warning: no court calibration provided; player selection falls back to a "
                 "screen-space heuristic that may be unreliable for skewed cameras."
             )
+        elif calibration_status == "fallback":
+            print(
+                "Warning: court calibration could not be loaded; player selection and slot "
+                "assignment fall back to screen-space heuristics."
+            )
         selected = select_on_court_tracks(
-            observations, (width, height), _court_homography(court_calibration)
+            observations, (width, height), court_homography
+        )
+        player_slot_track_ids = assign_player_slots(
+            selected, observations, court_homography
         )
         pose = create_pose_estimator(model_asset_path=pose_model_asset, running_mode="image")
         previous_feet: dict[int, tuple[float, float]] = {}
@@ -280,6 +318,13 @@ def run(
                         },
                         "pose_backend": pose.backend_info,
                         "selected_track_ids": selected,
+                        "player_slot_track_ids": player_slot_track_ids,
+                        "court_calibration_status": calibration_status,
+                        "player_slot_assignment": (
+                            "court_y_near_to_far"
+                            if court_homography is not None
+                            else "screen_y_near_to_far_fallback"
+                        ),
                     }
                 )
                 + "\n"
@@ -300,7 +345,7 @@ def run(
                 detections = list(frame_info["detections"])
                 frame_entry: dict[str, Any] = {"frame": frame_index, "detections": []}
                 by_id = {int(item["track_id"]): item["bbox"] for item in detections}
-                for slot, track_id in enumerate(selected, 1):
+                for slot, track_id in enumerate(player_slot_track_ids, 1):
                     if track_id not in by_id:
                         continue
                     box = by_id[track_id]
@@ -364,7 +409,7 @@ def run(
                             cv2.LINE_AA,
                         )
                         _draw_pose_landmarks(image, box, serialized_landmarks)
-                selected_ids = set(selected)
+                selected_ids = set(player_slot_track_ids)
                 existing_ids = {int(item["track_id"]) for item in frame_entry["detections"]}
                 for detection in detections:
                     track_id = int(detection["track_id"])
@@ -392,7 +437,9 @@ def run(
                             1,
                             cv2.LINE_AA,
                         )
-                player_writer.writerow(_player_row_from_frame(frame_entry, selected, activity_window))
+                player_writer.writerow(
+                    _player_row_from_frame(frame_entry, player_slot_track_ids, activity_window)
+                )
                 if raw_handle is not None:
                     raw_handle.write(json.dumps({"type": "frame", **frame_entry}) + "\n")
                 if writer is not None:

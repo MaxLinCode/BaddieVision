@@ -8,6 +8,9 @@ import json
 import statistics
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Mapping
+
+import numpy as np
 
 LABEL_FIELDS = {"source_id", "rally_id", "start_frame", "end_frame"}
 
@@ -46,7 +49,10 @@ def interval_iou(left: Interval, right: Interval) -> float:
 
 
 def evaluate(
-    predictions: list[Interval], labels: list[Interval], threshold: float = 0.5
+    predictions: list[Interval],
+    labels: list[Interval],
+    threshold: float = 0.5,
+    frame_ranges: Mapping[str, tuple[int, int]] | None = None,
 ) -> tuple[dict[str, object], list[dict[str, object]]]:
     # Maximum-weight one-to-one assignment. SciPy is already a runtime dependency.
     from scipy.optimize import linear_sum_assignment
@@ -117,6 +123,24 @@ def evaluate(
     precision = true_positive / len(predictions) if predictions else 0.0
     recall = true_positive / len(labels) if labels else 0.0
     f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+    split_count = sum(
+        1
+        for label in labels
+        if sum(
+            prediction.source_id == label.source_id and _overlap_frames(prediction, label) > 0
+            for prediction in predictions
+        )
+        > 1
+    )
+    merge_count = sum(
+        1
+        for prediction in predictions
+        if sum(
+            prediction.source_id == label.source_id and _overlap_frames(prediction, label) > 0
+            for label in labels
+        )
+        > 1
+    )
     metrics: dict[str, object] = {
         "iou_threshold": threshold,
         "prediction_count": len(predictions),
@@ -131,8 +155,62 @@ def evaluate(
         "mean_end_boundary_error": statistics.fmean(end_errors) if end_errors else None,
         "mean_absolute_boundary_error": statistics.fmean(boundary_errors) if boundary_errors else None,
         "median_absolute_boundary_error": statistics.median(boundary_errors) if boundary_errors else None,
+        "false_split_count": split_count,
+        "false_merge_count": merge_count,
     }
+    if frame_ranges is not None:
+        metrics.update(frame_classification_metrics(predictions, labels, frame_ranges))
     return metrics, details
+
+
+def frame_classification_metrics(
+    predictions: list[Interval],
+    labels: list[Interval],
+    frame_ranges: Mapping[str, tuple[int, int]],
+) -> dict[str, object]:
+    """Compute frame-level precision/recall/F1 over inclusive source ranges."""
+
+    tp = fp = fn = tn = 0
+    for source_id, (start, end) in frame_ranges.items():
+        if start < 0 or end < start:
+            raise ValueError(f"invalid frame range for {source_id!r}")
+        pred_mask = _mask_for_source(predictions, source_id, start, end)
+        label_mask = _mask_for_source(labels, source_id, start, end)
+        tp += int((pred_mask & label_mask).sum())
+        fp += int((pred_mask & ~label_mask).sum())
+        fn += int((~pred_mask & label_mask).sum())
+        tn += int((~pred_mask & ~label_mask).sum())
+    precision = tp / (tp + fp) if tp + fp else 0.0
+    recall = tp / (tp + fn) if tp + fn else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+    return {
+        "frame_true_positive": tp,
+        "frame_false_positive": fp,
+        "frame_false_negative": fn,
+        "frame_true_negative": tn,
+        "frame_precision": precision,
+        "frame_recall": recall,
+        "frame_f1": f1,
+    }
+
+
+def _mask_for_source(
+    intervals: list[Interval], source_id: str, start: int, end: int
+) -> np.ndarray:
+    mask = np.zeros(end - start + 1, dtype=bool)
+    for interval in intervals:
+        if interval.source_id != source_id:
+            continue
+        left, right = max(start, interval.start), min(end, interval.end)
+        if left <= right:
+            mask[left - start : right - start + 1] = True
+    return mask
+
+
+def _overlap_frames(left: Interval, right: Interval) -> int:
+    if left.source_id != right.source_id:
+        return 0
+    return max(0, min(left.end, right.end) - max(left.start, right.start) + 1)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -142,11 +220,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--metrics", required=True)
     parser.add_argument("--matches", required=True)
     parser.add_argument("--iou-threshold", type=float, default=0.5)
+    parser.add_argument(
+        "--frame-ranges",
+        help="optional JSON object mapping source_id to inclusive [start, end] frames",
+    )
     args = parser.parse_args(argv)
     if not 0 <= args.iou_threshold <= 1:
         parser.error("--iou-threshold must be between 0 and 1")
+    frame_ranges = None
+    if args.frame_ranges:
+        raw_ranges = json.loads(Path(args.frame_ranges).read_text(encoding="utf-8"))
+        frame_ranges = {
+            str(source): (int(values[0]), int(values[1]))
+            for source, values in raw_ranges.items()
+        }
     metrics, details = evaluate(
-        read_intervals(args.predictions), read_intervals(args.labels), args.iou_threshold
+        read_intervals(args.predictions),
+        read_intervals(args.labels),
+        args.iou_threshold,
+        frame_ranges,
     )
     Path(args.metrics).write_text(json.dumps(metrics, indent=2) + "\n", encoding="utf-8")
     fieldnames = [
