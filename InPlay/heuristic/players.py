@@ -10,6 +10,7 @@ import argparse
 import csv
 import json
 import tempfile
+import warnings
 from collections import defaultdict
 from collections import deque
 from pathlib import Path
@@ -237,6 +238,42 @@ def run(
     vis_output: str | Path | None = None,
     pose_model_asset: str | Path | None = None,
 ) -> None:
+    """Compatibility wrapper for the former combined player command."""
+    warnings.warn(
+        "InPlay.heuristic.players is deprecated; use person_tracks extract followed by "
+        "player_interpretation instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    from InPlay.heuristic.person_tracks import extract_person_tracks
+    from InPlay.heuristic.player_interpretation import interpret_players
+
+    output_path = Path(output)
+    if court_calibration is None:
+        raise ValueError("--court-calibration is required for singles player interpretation")
+    person_tracks_path = Path(raw_output) if raw_output else output_path.with_name("person_tracks.jsonl")
+    pose_cache_path = output_path.with_name("pose_cache.jsonl")
+    assignments_path = output_path.with_name("player_assignments.jsonl")
+    extract_person_tracks(video, person_tracks_path, model)
+    interpret_players(
+        video,
+        person_tracks_path,
+        court_calibration,
+        pose_cache_path,
+        assignments_path,
+        output_path,
+        pose_model_asset=pose_model_asset,
+    )
+    if vis_output is not None:
+        warnings.warn(
+            "--vis-output is no longer rendered by the compatibility wrapper; use "
+            "src.single_video.render_player_preview with shuttle tracks.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    return
+
+    # Pre-layered implementation retained temporarily below for auditability.
     import cv2
     from tqdm import tqdm
     from ultralytics import YOLO
@@ -248,18 +285,23 @@ def run(
     height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
     frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
     capture.release()
-    results = detector.track(
-        source=str(video),
-        classes=[PERSON_CLASS_ID],
-        tracker="bytetrack.yaml",
-        stream=True,
-        persist=True,
-        verbose=False,
-    )
-    frame_dump = tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, suffix=".jsonl")
-    frame_dump_path = Path(frame_dump.name)
-    observations: dict[int, list[tuple[int, tuple[float, float, float, float]]]] = defaultdict(list)
+    # Initialize before tracking so MediaPipe/model/native-library failures happen
+    # before the expensive YOLO pass rather than after it.
+    pose = create_pose_estimator(model_asset_path=pose_model_asset, running_mode="image")
+    frame_dump = None
+    frame_dump_path = None
     try:
+        frame_dump = tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, suffix=".jsonl")
+        frame_dump_path = Path(frame_dump.name)
+        results = detector.track(
+            source=str(video),
+            classes=[PERSON_CLASS_ID],
+            tracker="bytetrack.yaml",
+            stream=True,
+            persist=True,
+            verbose=False,
+        )
+        observations: dict[int, list[tuple[int, tuple[float, float, float, float]]]] = defaultdict(list)
         for frame_index, result in enumerate(
             tqdm(results, total=frame_count or None, desc="YOLO person tracking")
         ):
@@ -290,7 +332,6 @@ def run(
         player_slot_track_ids = assign_player_slots(
             selected, observations, court_homography
         )
-        pose = create_pose_estimator(model_asset_path=pose_model_asset, running_mode="image")
         previous_feet: dict[int, tuple[float, float]] = {}
         previous_poses: dict[int, np.ndarray] = {}
         capture = cv2.VideoCapture(str(video))
@@ -450,11 +491,12 @@ def run(
         if raw_handle is not None:
             raw_handle.close()
         player_handle.close()
-        pose.close()
     finally:
-        frame_dump.close()
-        if frame_dump_path.exists():
+        if frame_dump is not None:
+            frame_dump.close()
+        if frame_dump_path is not None and frame_dump_path.exists():
             frame_dump_path.unlink()
+        pose.close()
 
 
 def main(argv: list[str] | None = None) -> int:

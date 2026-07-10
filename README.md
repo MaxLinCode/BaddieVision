@@ -49,6 +49,12 @@ brew install python@3.11
 PyTorch automatically uses CUDA where available. On Apple Silicon, training code
 uses Apple's MPS backend when supported and otherwise falls back to CPU.
 
+FFmpeg is an optional system dependency for the single-video notebooks. When it
+is available, working-video trimming and frame-rate conversion first try CUDA/NVENC
+and then CPU FFmpeg; environments without FFmpeg automatically use OpenCV. Install
+FFmpeg through your operating system if you want the accelerated path. No Python
+FFmpeg package is required.
+
 ## Local data and models
 
 After cloning onto another machine, copy or download your private working assets
@@ -139,6 +145,33 @@ features, and `[court_x, court_y, observed]`. Existing 73-input classifier
 checkpoints must be retrained. Training now groups validation by source video,
 so at least two calibrated sources are required and no recording appears in
 both splits.
+
+The singles player pipeline keeps detector output separate from court-role
+interpretation. Raw extraction does not require calibration or MediaPipe:
+
+```bash
+python3 -m InPlay.heuristic.person_tracks extract \
+  --video videos/example.mp4 --output outputs/example/person_tracks.jsonl
+```
+
+Interpret near-side P1 and far-side P2, incrementally enrich the pose cache,
+and preserve the rally classifier's `players.csv` schema:
+
+```bash
+python3 -m InPlay.heuristic.player_visualizer \
+  --video videos/example.mp4 \
+  --person-tracks outputs/example/person_tracks.jsonl \
+  --court-calibration features/court/example.json \
+  --pose-cache outputs/example/pose_cache.jsonl \
+  --assignments outputs/example/player_assignments.jsonl \
+  --players-csv outputs/example/players.csv \
+  --tracks-csv outputs/example/tracks.csv \
+  --preview outputs/example/preview.mp4
+```
+
+The former `InPlay.heuristic.players` command remains as a deprecated
+compatibility wrapper. Court calibration is required only for interpretation;
+missing, ambiguous, or image-size-mismatched calibration is an explicit error.
 
 Extract and train in-play features:
 
