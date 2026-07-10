@@ -1,4 +1,4 @@
-# Recommended runtime: Python 3.11.
+# Supported runtimes: Python 3.11+.
 # Keep ranges broad enough for both macOS (including Apple Silicon) and Linux.
 dash>=2.14,<4
 matplotlib>=3.7,<4
@@ -7,7 +7,7 @@ matplotlib>=3.7,<4
 # first use unless an explicit model path is provided.
 mediapipe>=0.10.21,<0.11
 numpy>=1.24,<3
-opencv-python>=4.8,<5
+opencv-python>=4.8,<6
 pandas>=2.0,<3
 parse>=1.19,<2
 Pillow>=10,<12
