@@ -268,14 +268,22 @@ def write_debug(path: str | Path, frames: list[FrameFeature]) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--tracks", required=True)
-    parser.add_argument("--fps", required=True, type=float)
-    parser.add_argument("--image-size", required=True, nargs=2, type=int, metavar=("WIDTH", "HEIGHT"))
+    parser.add_argument("--tracks")
+    parser.add_argument("--fps", type=float)
+    parser.add_argument("--image-size", nargs=2, type=int, metavar=("WIDTH", "HEIGHT"))
     parser.add_argument("--source-id", default=None)
     parser.add_argument("--output", required=True)
     parser.add_argument("--debug-frames")
     parser.add_argument("--players")
     parser.add_argument("--court-calibration")
+    parser.add_argument("--shuttle-candidates")
+    parser.add_argument("--shuttle-tracklets")
+    parser.add_argument("--shuttle-hypotheses")
+    parser.add_argument("--player-assignments")
+    parser.add_argument("--pose-cache")
+    parser.add_argument("--metadata")
+    parser.add_argument("--state-events")
+    parser.add_argument("--degraded-mode", action="store_true")
     defaults = HeuristicConfig()
     for field in fields(defaults):
         if field.name == "target_fps":
@@ -290,6 +298,33 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.shuttle_candidates:
+        from .rally_v2 import V2Inputs, decode_rallies, write_state_events
+
+        required = {
+            "shuttle_tracklets": args.shuttle_tracklets,
+            "shuttle_hypotheses": args.shuttle_hypotheses,
+            "player_assignments": args.player_assignments,
+            "pose_cache": args.pose_cache,
+            "metadata": args.metadata,
+            "court_calibration": args.court_calibration,
+            "state_events": args.state_events,
+        }
+        missing = [name.replace("_", "-") for name, value in required.items() if not value]
+        if missing:
+            raise ValueError("heuristic v2 requires --" + ", --".join(missing))
+        inputs = V2Inputs(
+            candidates=Path(args.shuttle_candidates), tracklets=Path(args.shuttle_tracklets),
+            hypotheses=Path(args.shuttle_hypotheses), player_assignments=Path(args.player_assignments),
+            pose_cache=Path(args.pose_cache), metadata=Path(args.metadata),
+            calibration=Path(args.court_calibration),
+        )
+        rallies, events, metadata = decode_rallies(inputs, degraded=args.degraded_mode)
+        write_rallies(args.output, rallies)
+        write_state_events(args.state_events, metadata, events)
+        return 0
+    if not args.tracks or args.fps is None or args.image_size is None:
+        raise ValueError("legacy mode requires --tracks, --fps, and --image-size")
     defaults = HeuristicConfig()
     overrides = {
         field.name: getattr(args, field.name)

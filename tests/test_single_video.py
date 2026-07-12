@@ -7,7 +7,6 @@ import numpy as np
 import pytest
 
 from src.single_video import (
-    build_ffmpeg_command,
     copy_model_tree,
     load_track_rows,
     prepare_working_video,
@@ -31,110 +30,115 @@ def _write_video(path: Path, *, fps: float = 60.0, frames: int = 60, size: tuple
     writer.release()
 
 
-def test_prepare_working_video_noop_returns_original(tmp_path: Path) -> None:
+def test_prepare_working_video_untrimmed_is_byte_identical(tmp_path: Path) -> None:
     source = tmp_path / "source.mp4"
     _write_video(source, fps=30, frames=10)
 
-    result = prepare_working_video(source, tmp_path / "unused.mp4", None, None, None, "sdr")
+    output = tmp_path / "working.mp4"
+    result = prepare_working_video(source, output, None, None, 30)
 
-    assert result != source
-    assert (tmp_path / "unused.mp4").exists()
+    assert result == output
+    assert output.read_bytes() == source.read_bytes()
+
+
+@pytest.mark.parametrize("suffix", [".mov", ".avi", ".mkv"])
+def test_prepare_working_video_rejects_non_mp4_before_reading(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, suffix: str
+) -> None:
+    source = tmp_path / f"source{suffix}"
+    source.write_bytes(b"not a video")
+    monkeypatch.setattr(video_helpers, "read_video_info", lambda _: pytest.fail("input was opened"))
+    with pytest.raises(ValueError, match="must be an MP4"):
+        prepare_working_video(source, tmp_path / "output.mp4", None, None)
 
 
 @pytest.mark.parametrize(
-    ("start", "end", "fps", "message"),
-    [(-1, None, None, "start_time_sec"), (None, -1, None, "end_time_sec"), (None, None, 0, "target_fps"), (2, 1, 30, "Invalid segment")],
+    ("start", "end", "message"),
+    [(-1, None, "start_time_sec"), (None, -1, "end_time_sec"), (2, 1, "Invalid or empty"), (2, 2, "Invalid or empty"), (2, None, "Invalid or empty")],
 )
 def test_prepare_working_video_validates_options(
-    tmp_path: Path, start: int | None, end: int | None, fps: int | None, message: str
+    tmp_path: Path, start: int | None, end: int | None, message: str
 ) -> None:
     source = tmp_path / "source.mp4"
     _write_video(source, fps=30, frames=30)
     with pytest.raises(ValueError, match=message):
-        prepare_working_video(source, tmp_path / "output.mp4", start, end, fps, "sdr")
+        prepare_working_video(source, tmp_path / "output.mp4", start, end)
 
 
-def test_gpu_ffmpeg_command_uses_nvdec_nvenc_and_cfr(tmp_path: Path) -> None:
-    command = build_ffmpeg_command(
-        "/usr/bin/ffmpeg",
-        tmp_path / "input.mp4",
-        tmp_path / "output.mp4",
-        source_fps=60,
-        effective_fps=30,
-        start_frame=60,
-        end_frame=180,
-        expected_frames=60,
-        gpu=True,
-    )
-    joined = " ".join(command)
-    assert "-hwaccel cuda -hwaccel_output_format cuda" in joined
-    assert "-vf scale_cuda=format=nv12" in joined
-    assert "-c:v h264_nvenc -preset p1 -rc vbr -cq 20" in joined
-    assert "-an" in command
-    assert command[command.index("-r") + 1] == "30.000000000"
-    assert command[command.index("-frames:v") + 1] == "60"
-
-
-def test_color_managed_ingest_uses_cpu_ffmpeg(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    source, output = tmp_path / "source.mp4", tmp_path / "output.mp4"
-    _write_video(source, fps=60, frames=60)
-    commands: list[list[str]] = []
-
-    real_which = video_helpers.shutil.which
-    monkeypatch.setattr(video_helpers.shutil, "which", lambda name: real_which(name))
-
-    def fake_run(command):
-        commands.append(list(command))
-        _write_video(Path(command[-1]), fps=30, frames=30)
-
-    monkeypatch.setattr(video_helpers, "_run_ffmpeg", fake_run)
-    result = prepare_working_video(source, output, None, None, 30, "sdr")
-
-    assert result == output
-    assert len(commands) == 1
-    assert "libx264" in commands[0]
-    assert "zscale=" in " ".join(commands[0])
-
-
-def test_color_managed_ffmpeg_failure_does_not_fall_back(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    source, output = tmp_path / "source.mp4", tmp_path / "output.mp4"
-    _write_video(source, fps=60, frames=60)
-    real_which = video_helpers.shutil.which
-    monkeypatch.setattr(video_helpers.shutil, "which", lambda name: real_which(name))
-    monkeypatch.setattr(video_helpers, "_run_ffmpeg", lambda _: (_ for _ in ()).throw(RuntimeError("failed")))
-
-    with pytest.warns(RuntimeWarning), pytest.raises(RuntimeError, match="Every video preparation backend failed"):
-        prepare_working_video(source, output, None, None, 30, "sdr")
-
-
-@pytest.mark.parametrize(("source_fps", "target_fps", "frames", "expected"), [(60.0, 30, 60, 30), (59.94, 24, 60, 24)])
-def test_missing_color_tools_fails_closed(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    source_fps: float,
-    target_fps: int,
-    frames: int,
-    expected: int,
+@pytest.mark.parametrize(("start", "end"), [(1, None), (None, 2), (1, 2)])
+def test_trim_uses_ffmpeg_stream_copy_without_video_conversion(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, start: int | None, end: int | None
 ) -> None:
     source, output = tmp_path / "source.mp4", tmp_path / "output.mp4"
-    _write_video(source, fps=source_fps, frames=frames)
-    monkeypatch.setattr(video_helpers.shutil, "which", lambda _: None)
-    with pytest.raises(RuntimeError, match="ffprobe is required"):
-        prepare_working_video(source, output, None, None, target_fps, "sdr")
-    assert not output.exists()
+    _write_video(source, fps=30, frames=90)
+    commands: list[list[str]] = []
+    monkeypatch.setattr(video_helpers.shutil, "which", lambda _: "/usr/bin/ffmpeg")
+
+    def fake_run(command, **kwargs):
+        commands.append(list(command))
+        _write_video(Path(command[-1]), fps=30, frames=30)
+        return video_helpers.subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(video_helpers.subprocess, "run", fake_run)
+    assert prepare_working_video(source, output, start, end) == output
+    assert len(commands) == 1
+    command = commands[0]
+    assert command[command.index("-c") + 1] == "copy"
+    forbidden = {"-c:v", "-vf", "-filter:v", "-r", "-pix_fmt", "libx264", "h264_nvenc"}
+    assert forbidden.isdisjoint(command)
 
 
-def test_failed_backends_clean_temporary_files(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_missing_ffmpeg_fails_only_for_trim(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     source, output = tmp_path / "source.mp4", tmp_path / "output.mp4"
     _write_video(source, fps=30, frames=10)
     monkeypatch.setattr(video_helpers.shutil, "which", lambda _: None)
-    monkeypatch.setattr(video_helpers, "_prepare_with_opencv", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("decode failed")))
-
-    with pytest.raises(RuntimeError, match="ffprobe is required"):
-        prepare_working_video(source, output, None, 0.2, 15, "sdr")
+    with pytest.raises(RuntimeError, match="FFmpeg is required when trimming"):
+        prepare_working_video(source, output, None, 0.2)
 
     assert not output.exists()
     assert not list(tmp_path.glob(".*.tmp.mp4"))
+
+    assert prepare_working_video(source, output, None, None) == output
+
+
+def test_fps_conversion_prefers_fast_nvenc(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    source, output = tmp_path / "source.mp4", tmp_path / "output.mp4"
+    _write_video(source, fps=60, frames=60)
+    commands = []
+    monkeypatch.setattr(video_helpers.shutil, "which", lambda _: "/usr/bin/ffmpeg")
+
+    def fake_run(command, **kwargs):
+        commands.append(list(command))
+        _write_video(Path(command[-1]), fps=30, frames=30)
+        return video_helpers.subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(video_helpers, "_run_ffmpeg_with_progress", fake_run)
+    assert prepare_working_video(source, output, None, None, 30) == output
+    assert len(commands) == 1
+    assert commands[0][commands[0].index("-vf") + 1] == "fps=30.000000000"
+    assert "h264_nvenc" in commands[0]
+    assert "-preset" in commands[0] and "p1" in commands[0]
+    assert commands[0][commands[0].index("-g") + 1] == "60"
+
+
+def test_fps_conversion_falls_back_to_ultrafast_cpu(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    source, output = tmp_path / "source.mp4", tmp_path / "output.mp4"
+    _write_video(source, fps=60, frames=60)
+    commands = []
+    monkeypatch.setattr(video_helpers.shutil, "which", lambda _: "/usr/bin/ffmpeg")
+
+    def fake_run(command, **kwargs):
+        commands.append(list(command))
+        if "h264_nvenc" in command:
+            return video_helpers.subprocess.CompletedProcess(command, 1, "", "NVENC unavailable")
+        _write_video(Path(command[-1]), fps=30, frames=30)
+        return video_helpers.subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(video_helpers, "_run_ffmpeg_with_progress", fake_run)
+    assert prepare_working_video(source, output, None, None, 30) == output
+    assert len(commands) == 2
+    assert "libx264" in commands[1]
+    assert commands[1][commands[1].index("-preset") + 1] == "ultrafast"
 
 
 def test_validate_prepared_video_reports_mismatch(tmp_path: Path) -> None:
@@ -177,14 +181,16 @@ def test_model_tree_copy_and_validation(tmp_path: Path) -> None:
 def test_manifest_and_zip_keep_existing_layout(tmp_path: Path) -> None:
     result_dir = tmp_path / "sample"
     result_dir.mkdir()
+    working_video = result_dir / "sample_input.mp4"
+    working_video.write_bytes(b"portable source video")
     tracks = result_dir / "tracks.csv"
     tracks.write_text("Frame,X,Y,Visibility\n", encoding="utf-8")
     metadata = result_dir / "metadata.json"
     metadata.write_text("{}", encoding="utf-8")
     manifest_path = result_dir / "artifact_manifest.json"
 
-    manifest = write_result_manifest(manifest_path, result_dir, "sample", [tracks, metadata])
-    assert [item["relative_path"] for item in manifest["files"]] == ["tracks.csv", "metadata.json"]
+    manifest = write_result_manifest(manifest_path, result_dir, "sample", [working_video, tracks, metadata])
+    assert [item["relative_path"] for item in manifest["files"]] == ["sample_input.mp4", "tracks.csv", "metadata.json"]
     assert json.loads(manifest_path.read_text())["source_id"] == "sample"
 
     zip_path = result_dir / "sample.zip"
@@ -193,6 +199,7 @@ def test_manifest_and_zip_keep_existing_layout(tmp_path: Path) -> None:
         assert archive.namelist() == [
             "sample/artifact_manifest.json",
             "sample/metadata.json",
+            "sample/sample_input.mp4",
             "sample/tracks.csv",
         ]
 
@@ -251,4 +258,6 @@ def test_preview_track_loading_and_metadata_schema(monkeypatch: pytest.MonkeyPat
         "pose_backend": pose_backend,
     }
     assert metadata["segment"] == {"start_time_sec": None, "end_time_sec": None, "is_clipped": False}
-    assert metadata["working_video"]["target_fps"] is None
+    assert metadata["working_video"]["input_handling_mode"] == "byte-copy"
+    assert metadata["working_video"]["stream_copy"] is False
+    assert "color_management" not in metadata

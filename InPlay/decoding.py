@@ -9,7 +9,7 @@ from typing import Sequence
 import numpy as np
 
 from .heuristic.config import HeuristicConfig
-from .heuristic.segment import Rally, segment_tracks
+from .heuristic.legacy_visibility import Rally, segment_tracks
 from .heuristic.tracks import FrameFeature
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import sys
 import shutil
@@ -13,6 +14,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 import cv2
+from tqdm.auto import tqdm
 
 
 class _FFmpegPreviewWriter:
@@ -48,6 +50,75 @@ def load_track_rows(path: Path) -> dict[int, dict[str, str]]:
         return {int(row["Frame"]): row for row in csv.DictReader(handle)}
 
 
+def _load_shuttle_evidence(candidate_path: Path | None, tracklet_path: Path | None) -> dict[int, list[dict]]:
+    if candidate_path is None or not Path(candidate_path).is_file():
+        return {}
+    metadata, frames = _read_layered_jsonl(Path(candidate_path), "shuttle_candidates")
+    if metadata.get("schema_version") != 1:
+        raise ValueError("expected shuttle_candidates schema v1 artifact")
+    tracklet_by_candidate: dict[str, str] = {}
+    if tracklet_path is not None and Path(tracklet_path).is_file():
+        tracklet_metadata, tracklets = _read_layered_jsonl(Path(tracklet_path), "shuttle_tracklets")
+        if tracklet_metadata.get("schema_version") != 1:
+            raise ValueError("expected shuttle_tracklets schema v1 artifact")
+        for tracklet in tracklets:
+            for candidate_id in tracklet.get("candidate_ids", []):
+                tracklet_by_candidate[candidate_id] = tracklet["tracklet_id"]
+    result: dict[int, list[dict]] = {}
+    for record in frames:
+        if record.get("type") == "frame":
+            result[int(record["frame"])] = [
+                {**candidate, "tracklet_id": tracklet_by_candidate.get(candidate["candidate_id"])}
+                for candidate in record.get("candidates", [])
+            ]
+    return result
+
+
+def _draw_shuttle_evidence(image, candidates: Sequence[dict]) -> None:
+    for candidate in candidates:
+        x, y = [int(round(value)) for value in candidate["center"]]
+        tracklet_id = candidate.get("tracklet_id") or candidate["candidate_id"]
+        digest = hashlib.sha256(tracklet_id.encode("utf-8")).digest()
+        color = (70 + digest[0] % 110, 70 + digest[1] % 110, 70 + digest[2] % 110)
+        cv2.circle(image, (x, y), 3, color, 1, cv2.LINE_AA)
+        label = candidate.get("tracklet_id") or "candidate"
+        cv2.putText(image, label, (x + 4, max(12, y - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.3, color, 1, cv2.LINE_AA)
+
+
+def _load_rank_one_hypothesis_segments(candidate_path: Path | None, hypotheses_path: Path | None) -> dict[int, list[tuple[tuple[int, int], tuple[int, int]]]]:
+    """Load only the best hypothesis in each association region for previews."""
+    if candidate_path is None or hypotheses_path is None or not Path(candidate_path).is_file() or not Path(hypotheses_path).is_file():
+        return {}
+    candidate_metadata, candidate_frames = _read_layered_jsonl(Path(candidate_path), "shuttle_candidates")
+    hypothesis_metadata, hypotheses = _read_layered_jsonl(Path(hypotheses_path), "shuttle_hypotheses")
+    if candidate_metadata.get("schema_version") != 1 or hypothesis_metadata.get("schema_version") != 1:
+        raise ValueError("expected shuttle hypothesis artifacts with schema v1")
+    if hypothesis_metadata.get("candidate_artifact") != Path(candidate_path).name:
+        raise ValueError("hypothesis artifact references a different candidate artifact")
+    if hypothesis_metadata.get("candidate_sha256") != hashlib.sha256(Path(candidate_path).read_bytes()).hexdigest():
+        raise ValueError("hypothesis artifact references a different candidate fingerprint")
+    points = {
+        candidate["candidate_id"]: (int(frame["frame"]), tuple(int(round(value)) for value in candidate["center"]))
+        for frame in candidate_frames if frame.get("type") == "frame"
+        for candidate in frame.get("candidates", [])
+    }
+    segments: dict[int, list[tuple[tuple[int, int], tuple[int, int]]]] = {}
+    for hypothesis in hypotheses:
+        if hypothesis.get("type") != "hypothesis" or int(hypothesis.get("rank", 0)) != 1:
+            continue
+        ordered = [points[candidate_id] for candidate_id in hypothesis.get("candidate_ids", []) if candidate_id in points]
+        for (previous_frame, previous), (frame, point) in zip(ordered, ordered[1:]):
+            if frame > previous_frame:
+                segments.setdefault(frame, []).append((previous, point))
+    return segments
+
+
+def _draw_hypothesis_segments(image, segments: Sequence[tuple[tuple[int, int], tuple[int, int]]]) -> None:
+    for start, end in segments:
+        cv2.line(image, start, end, (255, 0, 255), 2, cv2.LINE_AA)
+        cv2.circle(image, end, 4, (255, 0, 255), 1, cv2.LINE_AA)
+
+
 def _draw_pose_landmarks(frame, bbox, pose_landmarks, pose_connection_pairs: Sequence[tuple[int, int]]) -> None:
     if not pose_landmarks:
         return
@@ -75,8 +146,13 @@ def render_preview(
     player_raw_jsonl: Path,
     output_path: Path,
     pose_connection_pairs: Sequence[tuple[int, int]],
+    candidate_path: Path | None = None,
+    tracklet_path: Path | None = None,
+    hypotheses_path: Path | None = None,
 ) -> None:
     track_rows = load_track_rows(tracks_csv)
+    shuttle_evidence = _load_shuttle_evidence(candidate_path, tracklet_path)
+    hypothesis_segments = _load_rank_one_hypothesis_segments(candidate_path, hypotheses_path)
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"Failed to open preview source: {video_path}")
@@ -102,6 +178,8 @@ def render_preview(
                     x, y = int(float(track["X"])), int(float(track["Y"]))
                     cv2.circle(frame, (x, y), 7, (0, 255, 0), 2)
                     cv2.putText(frame, "Shuttle", (x + 8, max(20, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
+                _draw_shuttle_evidence(frame, shuttle_evidence.get(frame_index, []))
+                _draw_hypothesis_segments(frame, hypothesis_segments.get(frame_index, []))
                 for detection in player_frame.get("detections", []):
                     bbox = detection.get("bbox")
                     if not bbox:
@@ -140,6 +218,9 @@ def render_player_preview(
     pose_cache_jsonl: Path,
     output_path: Path,
     pose_connection_pairs: Sequence[tuple[int, int]],
+    candidate_path: Path | None = None,
+    tracklet_path: Path | None = None,
+    hypotheses_path: Path | None = None,
 ) -> None:
     """Render gray raw detections plus court-interpreted slots and cached poses."""
     track_rows = load_track_rows(tracks_csv)
@@ -154,15 +235,19 @@ def render_player_preview(
         (int(item["frame"]), int(item["track_id"]), tuple(round(float(v), 6) for v in item["bbox"])): item
         for item in poses
     }
+    shuttle_evidence = _load_shuttle_evidence(candidate_path, tracklet_path)
+    hypothesis_segments = _load_rank_one_hypothesis_segments(candidate_path, hypotheses_path)
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"Failed to open preview source: {video_path}")
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or None
     writer = _FFmpegPreviewWriter(output_path, fps, (width, height))
     colors = {"P1": (0, 170, 255), "P2": (255, 120, 20)}
     frame_index = 0
+    progress = tqdm(total=total_frames, desc="Rendering preview", unit="frame")
     try:
         while True:
             ok, image = cap.read()
@@ -173,6 +258,8 @@ def render_player_preview(
                 x, y = int(float(shuttle["X"])), int(float(shuttle["Y"]))
                 cv2.circle(image, (x, y), 7, (0, 255, 0), 2)
                 cv2.putText(image, "Shuttle", (x + 8, max(20, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
+            _draw_shuttle_evidence(image, shuttle_evidence.get(frame_index, []))
+            _draw_hypothesis_segments(image, hypothesis_segments.get(frame_index, []))
             for raw in raw_by_frame.get(frame_index, []):
                 x1, y1, x2, y2 = [int(round(value)) for value in raw["bbox"]]
                 cv2.rectangle(image, (x1, y1), (x2, y2), (105, 105, 105), 1)
@@ -195,13 +282,21 @@ def render_player_preview(
                 cv2.putText(image, label, (x1, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
                 key = (frame_index, int(assignment["track_id"]), tuple(round(float(v), 6) for v in bbox))
                 pose = pose_by_key.get(key, {})
-                _draw_pose_landmarks(image, bbox, pose.get("pose_landmarks"), pose_connection_pairs)
-                status_lines.append(f"{slot_name}: {assignment['track_id']} {assignment.get('pose_status', pose.get('status', 'missing'))}")
+                pose_bbox = pose.get("pose_bbox", bbox)
+                _draw_pose_landmarks(image, pose_bbox, pose.get("pose_landmarks"), pose_connection_pairs)
+                if pose_bbox != bbox:
+                    px1, py1, px2, py2 = [int(round(value)) for value in pose_bbox]
+                    cv2.rectangle(image, (px1, py1), (px2, py2), color, 1)
+                quality = float(pose.get("pose_quality", 0.0))
+                pose_status = pose.get("temporal_status") or pose.get("status", "missing")
+                status_lines.append(f"{slot_name}: {assignment['track_id']} pose {quality:.2f} {pose_status}")
             for index, line in enumerate(status_lines):
                 cv2.putText(image, line, (12, 22 + index * 19), cv2.FONT_HERSHEY_SIMPLEX, 0.48, colors.get(line[:2], (230, 230, 230)), 1, cv2.LINE_AA)
             writer.write(image)
             frame_index += 1
+            progress.update()
     finally:
+        progress.close()
         cap.release()
         writer.release()
     print(f"Preview written to {output_path}")
@@ -217,7 +312,7 @@ def write_metadata(
     models: dict[str, object],
     start_time_sec: int | None,
     end_time_sec: int | None,
-    target_fps: int | None,
+    target_fps: int | float | None,
     *,
     player_detector: str,
     pose_backend: dict[str, object],
@@ -236,7 +331,15 @@ def write_metadata(
         "working_video": {
             **{key: working_video_info[key] for key in ("fps", "width", "height", "frame_count")},
             "target_fps": target_fps,
-            "is_downsampled": target_fps is not None and working_video_info["fps"] + 1e-6 < original_video_info["fps"],
+            "input_handling_mode": (
+                "fps-transcode" if target_fps is not None and original_video_info["fps"] > target_fps
+                else "stream-copy-trim" if start_time_sec is not None or end_time_sec is not None
+                else "byte-copy"
+            ),
+            "stream_copy": (
+                (start_time_sec is not None or end_time_sec is not None)
+                and (target_fps is None or original_video_info["fps"] <= target_fps)
+            ),
         },
         "segment": {
             "start_time_sec": start_time_sec,
@@ -266,12 +369,6 @@ def write_metadata(
                 "color_space", "dolby_vision",
             )
         }
-    metadata["color_management"] = {
-        "source_mode": original_video_info.get("source_mode"),
-        "conversion_applied": working_video_info.get("conversion_applied"),
-        "tone_map": working_video_info.get("tone_map"),
-        "encoder": working_video_info.get("encoder", "libx264"),
-    }
     Path(path).write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     print(f"Metadata written to {path}")
 

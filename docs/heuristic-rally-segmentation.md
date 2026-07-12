@@ -54,3 +54,35 @@ Allowed manual decisions are blank, `accept`, and `reject`. Flags are
 semicolon-separated. Finalization applies manual boundaries, excludes rejected
 rows, and retains the automatic confidence, flags, failure reason, and manual
 audit fields.
+
+# Heuristic rally decoder v2
+
+The default layered workflow is an offline, precision-first singles decoder in
+`InPlay.heuristic.rally_v2`. It consumes immutable shuttle candidates and
+tracklets, replayable shuttle hypotheses, player assignments, the pose cache,
+source metadata, and one matching static-camera calibration. Every artifact is
+fingerprinted and its FPS, frame count, image size, and upstream references are
+validated before decoding.
+
+Run it through the existing segmentation entry point:
+
+```bash
+python3 -m InPlay.heuristic.segment \
+  --shuttle-candidates shuttle_candidates.jsonl \
+  --shuttle-tracklets shuttle_tracklets.jsonl \
+  --shuttle-hypotheses shuttle_hypotheses.jsonl \
+  --player-assignments player_assignments.jsonl \
+  --pose-cache pose_cache.jsonl --metadata video_metadata.json \
+  --court-calibration court.json --output rallies.csv \
+  --state-events rally_state_events.jsonl
+```
+
+`rallies.csv` retains the correction/finalization schema. Canonical boundaries
+are not padded; use `clip_export.padded_bounds` when exporting clips. The JSONL
+event stream contains the versioned profile, all input SHA-256 fingerprints,
+and one deterministic evidence/transition record per source frame. Degraded
+mode (`--degraded-mode`) can only lower results to `review`.
+
+The older TrackNet-visibility state machine remains available through the
+legacy CLI arguments and is explicitly imported by the learned InPlay decoder
+from `InPlay.heuristic.legacy_visibility`.

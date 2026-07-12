@@ -49,11 +49,24 @@ brew install python@3.11
 PyTorch automatically uses CUDA where available. On Apple Silicon, training code
 uses Apple's MPS backend when supported and otherwise falls back to CPU.
 
-FFmpeg is an optional system dependency for the single-video notebooks. When it
-is available, working-video trimming and frame-rate conversion first try CUDA/NVENC
-and then CPU FFmpeg; environments without FFmpeg automatically use OpenCV. Install
-FFmpeg through your operating system if you want the accelerated path. No Python
-FFmpeg package is required.
+The single-video notebooks accept `.mp4` source videos only. Full inputs are
+byte-copied into the portable result bundle when their frame rate is already at
+or below the configured working FPS. Higher-frame-rate inputs use FFmpeg's FPS
+filter, preferring fast NVIDIA NVENC encoding and falling back to ultrafast CPU
+encoding. Trim-only operations use stream copy, so their boundaries are
+keyframe-aligned and may not be frame-exact. No Python FFmpeg package is required.
+
+Single-video result bundles retain the legacy selected `tracks.csv` path and also
+include `shuttle_candidates.jsonl`, `shuttle_tracklets.jsonl`, and diagnostic
+`shuttle_hypotheses.jsonl`. Candidates are
+connected TrackNet components above the `0.5` threshold, not stored heatmaps;
+InpaintNet continues to run only on the legacy single-track path. Tracklets are
+conservative diagnostic fragments that can be regenerated from candidates
+without rerunning TrackNet. Hypotheses are replayable top-five, diversified
+whole-video associations of those fragments; they do not replace `tracks.csv`
+or consume player evidence yet. Player previews show only the rank-1 path from
+each association region as a magenta connected overlay, and older bundles may
+omit the hypotheses artifact.
 
 ## Local data and models
 
