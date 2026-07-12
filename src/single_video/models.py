@@ -60,6 +60,8 @@ def load_track_models(repo_dir: Path) -> dict[str, object]:
         "tracknet_seq_len": int(tracknet_ckpt["param_dict"]["seq_len"]),
         "inpaintnet_seq_len": int(inpaintnet_ckpt["param_dict"]["seq_len"]),
         "bg_mode": tracknet_ckpt["param_dict"]["bg_mode"],
+        "tracknet_model": str(tracknet_script),
+        "inpaintnet_model": str(inpaintnet_script),
         "tracknet_checkpoint": str(tracknet_path),
         "inpaintnet_checkpoint": str(inpaintnet_path),
     }

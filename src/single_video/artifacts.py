@@ -54,8 +54,8 @@ def _load_shuttle_evidence(candidate_path: Path | None, tracklet_path: Path | No
     if candidate_path is None or not Path(candidate_path).is_file():
         return {}
     metadata, frames = _read_layered_jsonl(Path(candidate_path), "shuttle_candidates")
-    if metadata.get("schema_version") != 1:
-        raise ValueError("expected shuttle_candidates schema v1 artifact")
+    if metadata.get("schema_version") not in (1, 2):
+        raise ValueError("expected shuttle_candidates schema v1/v2 artifact")
     tracklet_by_candidate: dict[str, str] = {}
     if tracklet_path is not None and Path(tracklet_path).is_file():
         tracklet_metadata, tracklets = _read_layered_jsonl(Path(tracklet_path), "shuttle_tracklets")
@@ -91,8 +91,8 @@ def _load_rank_one_hypothesis_segments(candidate_path: Path | None, hypotheses_p
         return {}
     candidate_metadata, candidate_frames = _read_layered_jsonl(Path(candidate_path), "shuttle_candidates")
     hypothesis_metadata, hypotheses = _read_layered_jsonl(Path(hypotheses_path), "shuttle_hypotheses")
-    if candidate_metadata.get("schema_version") != 1 or hypothesis_metadata.get("schema_version") != 1:
-        raise ValueError("expected shuttle hypothesis artifacts with schema v1")
+    if candidate_metadata.get("schema_version") not in (1, 2) or hypothesis_metadata.get("schema_version") != 1:
+        raise ValueError("expected shuttle candidates schema v1/v2 and hypotheses schema v1")
     if hypothesis_metadata.get("candidate_artifact") != Path(candidate_path).name:
         raise ValueError("hypothesis artifact references a different candidate artifact")
     if hypothesis_metadata.get("candidate_sha256") != hashlib.sha256(Path(candidate_path).read_bytes()).hexdigest():

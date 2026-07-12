@@ -69,3 +69,4 @@ runs/
 
 # Portable data packages for Colab/Kaggle/Drive
 data_packages/*.zip
+.annotation/

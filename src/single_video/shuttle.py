@@ -7,7 +7,7 @@ import json
 import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable, Mapping, Sequence
 
 import cv2
 import numpy as np
@@ -16,16 +16,110 @@ import numpy as np
 CANDIDATE_SCHEMA = "shuttle_candidates"
 TRACKLET_SCHEMA = "shuttle_tracklets"
 HYPOTHESES_SCHEMA = "shuttle_hypotheses"
+CANDIDATE_SCHEMA_VERSION = 2
+CANDIDATE_EXTRACTION_VERSION = "tracknet-components-v2.0"
+CANDIDATE_THRESHOLDS = (0.2, 0.3, 0.4, 0.5)
+CANDIDATE_RETENTION_KS: tuple[int | None, ...] = (1, 2, 3, 5, 8, 12, None)
+CANDIDATE_RETENTION_POLICY = (
+    "peak_activation_desc",
+    "mean_activation_desc",
+    "area_normalized_desc",
+    "candidate_id_asc",
+)
+
+
+def _is_sha256(value: str | None) -> bool:
+    return bool(
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdefABCDEF" for character in value)
+    )
+
+
+def tracknet_candidate_frame_range(
+    frame_count: int,
+    sequence_length: int,
+    ensemble_mode: str,
+) -> tuple[int, int]:
+    """Validate a working video and return its expected inclusive frame range."""
+    frame_count, sequence_length = int(frame_count), int(sequence_length)
+    if frame_count <= 0:
+        raise ValueError("cannot extract shuttle candidates from an empty or unreadable working video")
+    if sequence_length <= 0:
+        raise ValueError("TrackNet sequence_length must be positive")
+    if ensemble_mode != "nonoverlap" and frame_count < sequence_length:
+        raise ValueError(
+            "TrackNet overlap candidate extraction requires at least one complete "
+            f"sequence: frame_count={frame_count}, sequence_length={sequence_length}"
+        )
+    return 0, frame_count - 1
 
 
 class ShuttleCandidateCollector:
-    """Collect one deterministic component record per TrackNet output frame."""
+    """Collect every deterministic component from each TrackNet output frame."""
 
-    def __init__(self, *, image_size: tuple[int, int], heatmap_size: tuple[int, int], fps: float, threshold: float = 0.5):
-        self.image_size = image_size
-        self.heatmap_size = heatmap_size
+    def __init__(
+        self,
+        *,
+        image_size: tuple[int, int],
+        heatmap_size: tuple[int, int],
+        fps: float,
+        thresholds: Sequence[float] = CANDIDATE_THRESHOLDS,
+        threshold: float | None = None,
+        checkpoint_sha256: str | None = None,
+        inference_model_sha256: str | None = None,
+        inference_model_artifact: str | None = None,
+        tracknet_config: Mapping[str, Any] | None = None,
+        overlap_ensemble_mode: str | None = None,
+        source_frame_range: tuple[int, int] | None = None,
+        allow_unverified_provenance_for_testing: bool = False,
+    ):
+        """Initialize a schema-v2 proposal collector.
+
+        ``threshold`` is a compatibility alias for callers that intentionally
+        want a single threshold. Production extraction uses ``thresholds`` and
+        never truncates candidates during collection. ``source_frame_range``
+        is the expected inclusive zero-based working-video range; writing fails
+        unless every frame in that range was added, including empty frames.
+        """
+        if threshold is not None:
+            thresholds = (threshold,)
+        normalized_thresholds = tuple(sorted({float(value) for value in thresholds}))
+        if not normalized_thresholds or any(not math.isfinite(value) or not 0 <= value <= 1 for value in normalized_thresholds):
+            raise ValueError("candidate thresholds must be finite values between zero and one")
+        if len(image_size) != 2 or min(image_size) <= 0:
+            raise ValueError("image_size must contain positive width and height")
+        if len(heatmap_size) != 2 or min(heatmap_size) <= 0:
+            raise ValueError("heatmap_size must contain positive height and width")
+        if not math.isfinite(float(fps)) or float(fps) <= 0:
+            raise ValueError("fps must be positive")
+        if source_frame_range is not None:
+            source_frame_range = tuple(int(value) for value in source_frame_range)
+            if source_frame_range[0] < 0 or source_frame_range[1] < source_frame_range[0]:
+                raise ValueError("source_frame_range must be an inclusive, non-negative range")
+        if not allow_unverified_provenance_for_testing:
+            missing_hashes = []
+            if not _is_sha256(checkpoint_sha256):
+                missing_hashes.append("checkpoint_sha256")
+            if not _is_sha256(inference_model_sha256):
+                missing_hashes.append("inference_model_sha256")
+            if missing_hashes:
+                raise ValueError(
+                    "schema-v2 candidate extraction requires verified SHA-256 provenance: "
+                    + ", ".join(missing_hashes)
+                )
+        self.image_size = tuple(int(value) for value in image_size)
+        self.heatmap_size = tuple(int(value) for value in heatmap_size)
         self.fps = float(fps)
-        self.threshold = float(threshold)
+        self.thresholds = normalized_thresholds
+        self.checkpoint_sha256 = checkpoint_sha256
+        self.inference_model_sha256 = inference_model_sha256
+        self.inference_model_artifact = inference_model_artifact
+        self.tracknet_config = dict(tracknet_config or {})
+        self.overlap_ensemble_mode = overlap_ensemble_mode
+        self.source_frame_range = source_frame_range
+        self.allow_unverified_provenance_for_testing = bool(allow_unverified_provenance_for_testing)
+        self.provenance_verified = _is_sha256(checkpoint_sha256) and _is_sha256(inference_model_sha256)
         self._frames: dict[int, list[dict]] = {}
 
     def add(self, frame: int, heatmap: np.ndarray) -> None:
@@ -36,45 +130,152 @@ class ShuttleCandidateCollector:
         heatmap = np.asarray(heatmap, dtype=np.float32)
         if heatmap.shape != self.heatmap_size:
             raise ValueError(f"expected heatmap {self.heatmap_size}, got {heatmap.shape}")
-        mask = (heatmap > self.threshold).astype(np.uint8)
-        labels_count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
         heatmap_h, heatmap_w = self.heatmap_size
         image_w, image_h = self.image_size
         sx, sy = image_w / heatmap_w, image_h / heatmap_h
-        components = []
-        for label in range(1, labels_count):
-            x, y, width, height, area = [int(value) for value in stats[label]]
-            peak = float(heatmap[labels == label].max())
-            components.append((x, y, width, height, area, peak))
-        # This ordering is explicit rather than relying on OpenCV label internals.
-        components.sort(key=lambda item: (item[1], item[0], item[3], item[2], -item[4], -item[5]))
-        legacy_index = None
-        if components:
-            # TrackNet's existing path picks the largest *bounding-box* area.
-            legacy_index = max(range(len(components)), key=lambda index: components[index][2] * components[index][3])
+        heatmap_area = heatmap_h * heatmap_w
+        components: list[dict[str, Any]] = []
+        for threshold_value in self.thresholds:
+            mask = (heatmap > threshold_value).astype(np.uint8)
+            labels_count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+            threshold_components = []
+            for label in range(1, labels_count):
+                x, y, width, height, area = [int(value) for value in stats[label]]
+                ys, xs = np.nonzero(labels == label)
+                activations = heatmap[ys, xs].astype(np.float64)
+                peak_offset = int(np.argmax(activations))
+                peak_x, peak_y = int(xs[peak_offset]), int(ys[peak_offset])
+                total_activation = float(activations.sum())
+                weighted_x = float(np.dot(xs.astype(np.float64) + 0.5, activations) / total_activation)
+                weighted_y = float(np.dot(ys.astype(np.float64) + 0.5, activations) / total_activation)
+                threshold_components.append({
+                    "threshold": threshold_value,
+                    "x": x,
+                    "y": y,
+                    "width": width,
+                    "height": height,
+                    "area": area,
+                    "peak_activation": float(activations[peak_offset]),
+                    "mean_activation": float(activations.mean()),
+                    "total_activation": total_activation,
+                    "peak_heatmap": (peak_x + 0.5, peak_y + 0.5),
+                    "weighted_heatmap": (weighted_x, weighted_y),
+                    "legacy_largest_component": False,
+                })
+            # This ordering is explicit rather than relying on OpenCV label internals.
+            threshold_components.sort(key=lambda item: (
+                item["y"], item["x"], item["height"], item["width"],
+                -item["area"], -item["peak_activation"],
+            ))
+            for component_index, component in enumerate(threshold_components):
+                component["component_index"] = component_index
+            if threshold_value == 0.5 and threshold_components:
+                # TrackNet's existing path picks the largest *bounding-box* area.
+                legacy_index = max(
+                    range(len(threshold_components)),
+                    key=lambda index: threshold_components[index]["width"] * threshold_components[index]["height"],
+                )
+                threshold_components[legacy_index]["legacy_largest_component"] = True
+            components.extend(threshold_components)
         records = []
-        for index, (x, y, width, height, area, peak) in enumerate(components):
+        for component in components:
+            x, y = component["x"], component["y"]
+            width, height, area = component["width"], component["height"], component["area"]
+            peak_x, peak_y = component["peak_heatmap"]
+            weighted_x, weighted_y = component["weighted_heatmap"]
+            center = [float((x + width / 2) * sx), float((y + height / 2) * sy)]
+            peak_position = [float(peak_x * sx), float(peak_y * sy)]
+            weighted_centroid = [float(weighted_x * sx), float(weighted_y * sy)]
+            bbox = [float(x * sx), float(y * sy), float((x + width) * sx), float((y + height) * sy)]
             records.append({
-                "candidate_id": f"f{frame:06d}-c{index:03d}",
-                "center": [float((x + width / 2) * sx), float((y + height / 2) * sy)],
-                "bbox": [float(x * sx), float(y * sy), float((x + width) * sx), float((y + height) * sy)],
+                "candidate_id": (
+                    f"f{frame:06d}-t{int(round(component['threshold'] * 100)):03d}"
+                    f"-c{component['component_index']:03d}"
+                ),
+                "threshold": component["threshold"],
+                "center": center,
+                "center_normalized": [center[0] / image_w, center[1] / image_h],
+                "peak_position": peak_position,
+                "peak_position_normalized": [peak_position[0] / image_w, peak_position[1] / image_h],
+                "weighted_centroid": weighted_centroid,
+                "weighted_centroid_normalized": [weighted_centroid[0] / image_w, weighted_centroid[1] / image_h],
+                "bbox": bbox,
+                "bbox_normalized": [bbox[0] / image_w, bbox[1] / image_h, bbox[2] / image_w, bbox[3] / image_h],
                 "area": area,
-                "peak_value": peak,
-                "legacy_largest_component": index == legacy_index,
+                "area_normalized": area / heatmap_area,
+                "peak_value": component["peak_activation"],
+                "peak_activation": component["peak_activation"],
+                "mean_activation": component["mean_activation"],
+                "total_activation": component["total_activation"],
+                "peak_activation_normalized": component["peak_activation"],
+                "mean_activation_normalized": component["mean_activation"],
+                "total_activation_normalized": component["total_activation"] / heatmap_area,
+                "legacy_largest_component": component["legacy_largest_component"],
             })
         self._frames[frame] = records
 
     def write(self, path: str | Path) -> Path:
         path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
         image_w, image_h = self.image_size
         heatmap_h, heatmap_w = self.heatmap_size
+        observed_range = [min(self._frames), max(self._frames)] if self._frames else None
+        if self.source_frame_range is not None:
+            expected_start, expected_end = self.source_frame_range
+            missing = [
+                frame for frame in range(expected_start, expected_end + 1)
+                if frame not in self._frames
+            ]
+            unexpected = sorted(
+                frame for frame in self._frames
+                if frame < expected_start or frame > expected_end
+            )
+            if missing or unexpected:
+                def summarize(values: list[int]) -> str:
+                    preview = values[:10]
+                    suffix = f" (+{len(values) - len(preview)} more)" if len(values) > len(preview) else ""
+                    return f"{preview}{suffix}"
+
+                raise ValueError(
+                    "candidate frames do not completely cover expected inclusive working-video "
+                    f"range [{expected_start}, {expected_end}]; "
+                    f"missing={summarize(missing)}, unexpected={summarize(unexpected)}"
+                )
+        source_range = list(self.source_frame_range) if self.source_frame_range is not None else observed_range
         metadata = {
-            "type": "metadata", "schema": CANDIDATE_SCHEMA, "schema_version": 1,
-            "model_stage": "tracknet_pre_inpaint", "threshold": self.threshold, "fps": self.fps,
+            "type": "metadata", "schema": CANDIDATE_SCHEMA, "schema_version": CANDIDATE_SCHEMA_VERSION,
+            "model_stage": "tracknet_pre_inpaint", "thresholds": list(self.thresholds), "fps": self.fps,
             "image_size": [image_w, image_h], "heatmap_size": [heatmap_w, heatmap_h],
             "coordinate_scaling": {"x": image_w / heatmap_w, "y": image_h / heatmap_h},
+            "connectivity": 8,
+            "threshold_comparator": ">",
+            "extraction_version": CANDIDATE_EXTRACTION_VERSION,
+            "checkpoint_sha256": self.checkpoint_sha256,
+            "inference_model_sha256": self.inference_model_sha256,
+            "inference_model_artifact": self.inference_model_artifact,
+            "provenance_verified": self.provenance_verified,
+            "nonproduction_unverified_provenance": (
+                self.allow_unverified_provenance_for_testing and not self.provenance_verified
+            ),
+            "tracknet_config": self.tracknet_config,
+            "overlap_ensemble_mode": self.overlap_ensemble_mode,
+            "source_frame_range": source_range,
+            "source_frame_count": (
+                source_range[1] - source_range[0] + 1 if source_range is not None else 0
+            ),
+            "source_frame_range_inclusive": True,
+            "source_frame_index_space": "zero_based_working_video",
+            "retention_policy": list(CANDIDATE_RETENTION_POLICY),
+            "legacy_compatibility_threshold": 0.5 if 0.5 in self.thresholds else None,
+            "pixel_position_convention": "heatmap_pixel_centers_scaled_to_image_space",
+            "normalization": {
+                "image_coordinates": "x/image_width,y/image_height",
+                "area": "component_pixels/heatmap_pixels",
+                "peak_activation": "identity",
+                "mean_activation": "identity",
+                "total_activation": "sum/heatmap_pixels",
+            },
         }
+        path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("w", encoding="utf-8") as output:
             output.write(json.dumps(metadata, sort_keys=True, separators=(",", ":")) + "\n")
             for frame in sorted(self._frames):
@@ -82,11 +283,28 @@ class ShuttleCandidateCollector:
         return path
 
 
+def candidate_retention_key(candidate: Mapping[str, Any]) -> tuple[float, float, float, str]:
+    """Return the frozen, deterministic K-retention ordering key."""
+    peak = float(candidate.get("peak_activation", candidate.get("peak_value", 0.0)))
+    mean = float(candidate.get("mean_activation", peak))
+    normalized_area = float(candidate.get("area_normalized", candidate.get("area", 0.0)))
+    return -peak, -mean, -normalized_area, str(candidate["candidate_id"])
+
+
+def rank_shuttle_candidates(candidates: Iterable[Mapping[str, Any]], k: int | None = None) -> list[dict[str, Any]]:
+    """Rank a frame's proposals using the exact production retention policy."""
+    if k is not None and k < 0:
+        raise ValueError("k must be non-negative or None")
+    ranked = sorted((dict(candidate) for candidate in candidates), key=candidate_retention_key)
+    return ranked if k is None else ranked[:k]
+
+
 @dataclass(frozen=True)
 class ShuttleLinkConfig:
     max_missing_frames: int = 1
     max_speed_image_diagonals_per_second: float = 6.0
     ambiguity_ratio: float = 0.7
+    candidate_threshold: float | None = 0.5
 
 
 @dataclass(frozen=True)
@@ -104,14 +322,110 @@ class ShuttleHypothesisConfig:
     score_version: str = "tracknet_motion_v1"
 
 
-def _read_jsonl(path: Path, schema: str) -> tuple[dict, list[dict]]:
+def _read_jsonl(path: Path, schema: str, schema_versions: Sequence[int] = (1,)) -> tuple[dict, list[dict]]:
     lines = path.read_text(encoding="utf-8").splitlines()
     if not lines:
         raise ValueError(f"empty artifact: {path}")
     metadata = json.loads(lines[0])
-    if metadata.get("schema") != schema or metadata.get("schema_version") != 1:
-        raise ValueError(f"expected {schema} schema v1 artifact: {path}")
+    if metadata.get("schema") != schema or metadata.get("schema_version") not in schema_versions:
+        versions = "/".join(f"v{version}" for version in schema_versions)
+        raise ValueError(f"expected {schema} schema {versions} artifact: {path}")
     return metadata, [json.loads(line) for line in lines[1:] if line.strip()]
+
+
+def read_shuttle_candidates(path: str | Path) -> tuple[dict, list[dict]]:
+    """Read either the legacy v1 or current v2 candidate artifact."""
+    return _read_jsonl(Path(path), CANDIDATE_SCHEMA, (1, CANDIDATE_SCHEMA_VERSION))
+
+
+def evaluate_candidate_retention_recall(
+    candidate_path: str | Path,
+    labels: Iterable[Mapping[str, Any]],
+    *,
+    ks: Sequence[int | None] = CANDIDATE_RETENTION_KS,
+) -> dict[str, Any]:
+    """Evaluate exact selected-candidate retention at each K.
+
+    Labels must be resolved, one-per-frame records with ``frame`` and a
+    ``label_kind``/``outcome`` of ``selected``, ``missing_proposal``,
+    ``no_shuttle``, or ``skip``. Selected records also carry ``candidate_id``.
+
+    This deliberately measures whether the exact human-selected proposal
+    survives the production K ranking. It is *not* a threshold-comparison
+    metric: nested components for the same shuttle have different durable IDs.
+    A threshold pilot must use human adjudication or spatial ground truth rather
+    than treating IDs from different thresholds as equivalent.
+    """
+    metadata, frame_records = read_shuttle_candidates(candidate_path)
+    by_frame = {
+        int(record["frame"]): list(record.get("candidates", []))
+        for record in frame_records
+        if record.get("type") == "frame"
+    }
+    normalized_ks: list[int | None] = []
+    for k in ks:
+        if k is not None:
+            k = int(k)
+            if k < 1:
+                raise ValueError("recall K values must be positive or None for all")
+        if k not in normalized_ks:
+            normalized_ks.append(k)
+
+    hits = {k: 0 for k in normalized_ks}
+    present_frames = missing_frames = no_shuttle_frames = skipped_frames = 0
+    seen_frames: set[int] = set()
+    for label in labels:
+        frame = int(label["frame"])
+        if frame in seen_frames:
+            raise ValueError(f"multiple resolved recall labels for frame {frame}")
+        seen_frames.add(frame)
+        kind = str(label.get("label_kind", label.get("outcome", ""))).lower()
+        if kind in {"no_shuttle", "skip", "skipped"}:
+            if kind == "no_shuttle":
+                no_shuttle_frames += 1
+            else:
+                skipped_frames += 1
+            continue
+        if kind in {"missing_proposal", "missing"}:
+            present_frames += 1
+            missing_frames += 1
+            continue
+        if kind not in {"selected", "candidate"}:
+            raise ValueError(f"unsupported recall label kind for frame {frame}: {kind!r}")
+        candidates = by_frame.get(frame)
+        if candidates is None:
+            raise ValueError(f"label references frame absent from candidate artifact: {frame}")
+        selected_id = str(label.get("candidate_id", ""))
+        candidate_ids = {str(candidate["candidate_id"]) for candidate in candidates}
+        if selected_id not in candidate_ids:
+            raise ValueError(f"selected candidate {selected_id!r} is not present at frame {frame}")
+        present_frames += 1
+        ranked_ids = [str(candidate["candidate_id"]) for candidate in rank_shuttle_candidates(candidates)]
+        selected_rank = ranked_ids.index(selected_id) + 1
+        for k in normalized_ks:
+            if k is None or selected_rank <= k:
+                hits[k] += 1
+
+    recall_at_k = {
+        "all" if k is None else str(k): (hits[k] / present_frames if present_frames else None)
+        for k in normalized_ks
+    }
+    candidate_counts = [len(candidates) for candidates in by_frame.values()]
+    return {
+        "candidate_schema_version": metadata["schema_version"],
+        "retention_policy": list(CANDIDATE_RETENTION_POLICY),
+        "label_equivalence": "exact_candidate_id",
+        "threshold_comparison_valid": False,
+        "present_shuttle_frames": present_frames,
+        "missing_proposal_frames": missing_frames,
+        "no_shuttle_frames": no_shuttle_frames,
+        "skipped_frames": skipped_frames,
+        "recall_at_k": recall_at_k,
+        "candidates_per_frame": (
+            sum(candidate_counts) / len(candidate_counts) if candidate_counts else 0.0
+        ),
+        "maximum_candidates_per_frame": max(candidate_counts, default=0),
+    }
 
 
 def _unambiguous_best(distance: float, alternatives: Iterable[float], ratio: float) -> bool:
@@ -120,10 +434,17 @@ def _unambiguous_best(distance: float, alternatives: Iterable[float], ratio: flo
 
 
 def link_shuttle_candidates(candidate_path: str | Path, tracklet_path: str | Path, config: ShuttleLinkConfig | None = None) -> Path:
-    """Link candidate components conservatively without selecting a rally shuttle."""
+    """Link components conservatively using the legacy 0.5 view by default.
+
+    Schema v2 deliberately contains nested proposals from four thresholds.
+    Feeding all of those near-duplicates into the legacy diagnostic linker can
+    multiply tracklets and hypothesis paths, so the default compatibility view
+    links only threshold 0.5. Set ``candidate_threshold=None`` explicitly to
+    experiment with linking the complete proposal set.
+    """
     config = config or ShuttleLinkConfig()
     candidate_path, tracklet_path = Path(candidate_path), Path(tracklet_path)
-    metadata, frames = _read_jsonl(candidate_path, CANDIDATE_SCHEMA)
+    metadata, frames = read_shuttle_candidates(candidate_path)
     fps = float(metadata["fps"])
     width, height = (float(value) for value in metadata["image_size"])
     motion_gate_per_frame = config.max_speed_image_diagonals_per_second * math.hypot(width, height) / fps
@@ -133,6 +454,17 @@ def link_shuttle_candidates(candidate_path: str | Path, tracklet_path: str | Pat
             raise ValueError("candidate artifact contains a non-frame record")
         frame = int(frame_record["frame"])
         for candidate in frame_record.get("candidates", []):
+            if (
+                metadata.get("schema_version") == CANDIDATE_SCHEMA_VERSION
+                and config.candidate_threshold is not None
+                and not math.isclose(
+                    float(candidate.get("threshold", math.nan)),
+                    config.candidate_threshold,
+                    rel_tol=0,
+                    abs_tol=1e-9,
+                )
+            ):
+                continue
             candidates_by_frame.setdefault(frame, []).append(candidate)
 
     tracklets: list[dict] = []
@@ -197,6 +529,11 @@ def link_shuttle_candidates(candidate_path: str | Path, tracklet_path: str | Pat
         "type": "metadata", "schema": TRACKLET_SCHEMA, "schema_version": 1,
         "candidate_artifact": candidate_path.name, "candidate_sha256": fingerprint,
         "link_config": asdict(config),
+        "candidate_view": {
+            "schema_version": metadata.get("schema_version"),
+            "threshold": config.candidate_threshold if metadata.get("schema_version") == CANDIDATE_SCHEMA_VERSION else None,
+            "purpose": "v1_compatibility" if metadata.get("schema_version") == CANDIDATE_SCHEMA_VERSION else "legacy_v1",
+        },
     }
     tracklet_path.parent.mkdir(parents=True, exist_ok=True)
     with tracklet_path.open("w", encoding="utf-8") as output:
@@ -229,7 +566,7 @@ def link_shuttle_hypotheses(
         raise ValueError("min_symmetric_node_difference must be between zero and one")
 
     candidate_path, tracklet_path, hypotheses_path = map(Path, (candidate_path, tracklet_path, hypotheses_path))
-    candidate_metadata, candidate_frames = _read_jsonl(candidate_path, CANDIDATE_SCHEMA)
+    candidate_metadata, candidate_frames = read_shuttle_candidates(candidate_path)
     tracklet_metadata, tracklet_records = _read_jsonl(tracklet_path, TRACKLET_SCHEMA)
     candidate_hash = hashlib.sha256(candidate_path.read_bytes()).hexdigest()
     if tracklet_metadata.get("candidate_artifact") != candidate_path.name or tracklet_metadata.get("candidate_sha256") != candidate_hash:
