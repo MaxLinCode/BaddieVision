@@ -33,7 +33,8 @@ python3 -m src.annotation_platform --config config/annotation-sources.local.json
   --annotator alice --queue adaptive
 ```
 
-Use `N` for `NO_SHUTTLE`, `M` for `MISSING_PROPOSAL`, `S` to skip, `U` to undo,
+Use `Space` to confirm an adaptive suggestion, `N` for `NO_SHUTTLE`, `M` for
+`MISSING_PROPOSAL`, `U` for `UNSURE`, Backspace to undo,
 the arrow keys to navigate, and digits 1-9 as shortcuts. All center-frame
 candidates remain clickable even when a frame contains more than nine.
 Playback includes one second before and after the exact rendered center frame,

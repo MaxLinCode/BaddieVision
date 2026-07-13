@@ -28,6 +28,23 @@ CANDIDATE_RETENTION_POLICY = (
 )
 
 
+def legacy_tracknet_bbox(heatmap: np.ndarray) -> tuple[int, int, int, int] | None:
+    """Reproduce untouched TrackNet's threshold/contour/tie decision exactly."""
+    mask = (np.asarray(heatmap) > 0.5).astype(np.uint8)
+    contours, _ = cv2.findContours(mask.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    rects = [cv2.boundingRect(contour) for contour in contours]
+    largest = 0
+    largest_area = rects[0][2] * rects[0][3]
+    for index in range(1, len(rects)):
+        area = rects[index][2] * rects[index][3]
+        if area > largest_area:
+            largest = index
+            largest_area = area
+    return tuple(int(value) for value in rects[largest])
+
+
 def _is_sha256(value: str | None) -> bool:
     return bool(
         isinstance(value, str)
@@ -170,10 +187,12 @@ class ShuttleCandidateCollector:
             for component_index, component in enumerate(threshold_components):
                 component["component_index"] = component_index
             if threshold_value == 0.5 and threshold_components:
-                # TrackNet's existing path picks the largest *bounding-box* area.
-                legacy_index = max(
-                    range(len(threshold_components)),
-                    key=lambda index: threshold_components[index]["width"] * threshold_components[index]["height"],
+                # Identify the component chosen by untouched TrackNet, including
+                # OpenCV contour ordering for equal-area ties.
+                legacy_bbox = legacy_tracknet_bbox(heatmap)
+                legacy_index = next(
+                    index for index, item in enumerate(threshold_components)
+                    if (item["x"], item["y"], item["width"], item["height"]) == legacy_bbox
                 )
                 threshold_components[legacy_index]["legacy_largest_component"] = True
             components.extend(threshold_components)
@@ -348,7 +367,7 @@ def evaluate_candidate_retention_recall(
 
     Labels must be resolved, one-per-frame records with ``frame`` and a
     ``label_kind``/``outcome`` of ``selected``, ``missing_proposal``,
-    ``no_shuttle``, or ``skip``. Selected records also carry ``candidate_id``.
+    ``no_shuttle``, or ``unsure``. Selected records also carry ``candidate_id``.
 
     This deliberately measures whether the exact human-selected proposal
     survives the production K ranking. It is *not* a threshold-comparison
@@ -372,7 +391,7 @@ def evaluate_candidate_retention_recall(
             normalized_ks.append(k)
 
     hits = {k: 0 for k in normalized_ks}
-    present_frames = missing_frames = no_shuttle_frames = skipped_frames = 0
+    present_frames = missing_frames = no_shuttle_frames = unsure_frames = 0
     seen_frames: set[int] = set()
     for label in labels:
         frame = int(label["frame"])
@@ -380,11 +399,11 @@ def evaluate_candidate_retention_recall(
             raise ValueError(f"multiple resolved recall labels for frame {frame}")
         seen_frames.add(frame)
         kind = str(label.get("label_kind", label.get("outcome", ""))).lower()
-        if kind in {"no_shuttle", "skip", "skipped"}:
+        if kind in {"no_shuttle", "unsure"}:
             if kind == "no_shuttle":
                 no_shuttle_frames += 1
             else:
-                skipped_frames += 1
+                unsure_frames += 1
             continue
         if kind in {"missing_proposal", "missing"}:
             present_frames += 1
@@ -419,7 +438,7 @@ def evaluate_candidate_retention_recall(
         "present_shuttle_frames": present_frames,
         "missing_proposal_frames": missing_frames,
         "no_shuttle_frames": no_shuttle_frames,
-        "skipped_frames": skipped_frames,
+        "unsure_frames": unsure_frames,
         "recall_at_k": recall_at_k,
         "candidates_per_frame": (
             sum(candidate_counts) / len(candidate_counts) if candidate_counts else 0.0

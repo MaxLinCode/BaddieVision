@@ -57,6 +57,7 @@ def create_dash_app(
             dcc.Store(id="session-state", data=asdict(session)),
             dcc.Store(id="playback-view"),
             dcc.Store(id="playback-time", data=0.0),
+            dcc.Store(id="visible-suggestion"),
             dcc.Interval(id="playback-clock", interval=100, n_intervals=0),
             html.H2(task_plugin.display_name),
             html.Div(id="progress"),
@@ -94,7 +95,8 @@ def create_dash_app(
                         )
                         for option in task_plugin.label_options
                     ],
-                    html.Button("Undo [U]", id="undo"),
+                    html.Button("Accept suggestion [Space]", id="accept-suggestion"),
+                    html.Button("Undo [Backspace]", id="undo"),
                     html.Button("Previous [←]", id="previous"),
                     html.Button("Next [→]", id="next"),
                 ],
@@ -111,15 +113,25 @@ def create_dash_app(
     # Dash callbacks. Digit hotkeys select center-frame candidates.
     keyboard_script = """
     <script>
+    let annotationLocked = false;
     document.addEventListener('keydown', function(e) {
       if (e.target && ['INPUT','TEXTAREA','SELECT'].includes(e.target.tagName)) return;
-      const fixed = {u:'undo', ArrowLeft:'previous', ArrowRight:'next'};
+      if (e.repeat) { e.preventDefault(); return; }
+      const fixed = {' ':'accept-suggestion', Backspace:'undo', ArrowLeft:'previous', ArrowRight:'next'};
       const id = fixed[e.key] || fixed[e.key.toLowerCase()] ||
                  null;
       const element = id ? document.getElementById(id) :
                       (/^[1-9]$/.test(e.key) ? document.querySelector('[data-shortcut="' + e.key + '"]') :
                        document.querySelector('[data-hotkey="' + e.key.toLowerCase() + '"]'));
-      if (element) { e.preventDefault(); element.click(); }
+      if (element) {
+        e.preventDefault();
+        if (annotationLocked && !['previous','next'].includes(element.id)) return;
+        if (!['previous','next'].includes(element.id)) {
+          annotationLocked = true;
+          window.setTimeout(() => { annotationLocked = false; }, 350);
+        }
+        element.click();
+      }
     });
     </script>
     """
@@ -146,13 +158,14 @@ def create_dash_app(
         Output("candidate-buttons", "children"),
         Output("progress", "children"),
         Output("history", "children"),
+        Output("visible-suggestion", "data"),
         Input("session-state", "data"),
     )
     def show_target(raw_state: dict[str, Any]) -> tuple[Any, ...]:
         state = SessionState(**raw_state)
         target = session_manager.current(state, queue)
         if target is None:
-            return None, no_update, no_update, [], "Queue complete", ""
+            return None, no_update, no_update, [], "Queue complete", "", None
         burst, frame = target
         view = build_playback_view(
             registry, task=burst.task, source_id=burst.source_id, center_frame=frame
@@ -165,21 +178,40 @@ def create_dash_app(
             "clip_end_seconds": view.clip_end_seconds,
             "overlays": {str(key): list(value) for key, value in view.overlays_by_frame.items()},
         }
+        suggestion = (
+            task_plugin.suggestion(registry.sources[burst.source_id], frame)
+            if queue.kind == "adaptive" and hasattr(task_plugin, "suggestion") else None
+        )
         buttons = [
             html.Button(
                 f"{index}: {candidate['candidate_id']}",
                 id={"type": "candidate", "candidate_id": candidate["candidate_id"]},
                 **({"data-shortcut": str(index)} if index <= 9 else {}),
+                style=(
+                    {"outline": "4px solid #ffb300", "fontWeight": "bold"}
+                    if suggestion and suggestion.candidate_id == candidate["candidate_id"] else {}
+                ),
             )
             for index, candidate in enumerate(
                 [item for item in view.center_candidates if item.get("candidate_id")],
                 start=1,
             )
         ]
-        progress = (
+        suggestion_text = ""
+        if suggestion:
+            suggestion_text = (
+                f" · suggestion: {suggestion.semantic_label}"
+                + (f" {suggestion.candidate_id}" if suggestion.candidate_id else "")
+            )
+        progress = html.Div(
             f"{queue.kind} queue · burst {state.burst_index + 1}/{len(queue.bursts)} · "
             f"frame {state.frame_index + 1}/{len(burst.frames)} · "
-            f"{burst.source_id}:{frame}"
+            f"{burst.source_id}:{frame}{suggestion_text}",
+            style=(
+                {"background": "#8b1e1e", "color": "white", "padding": "0.75rem",
+                 "fontWeight": "bold"}
+                if suggestion and suggestion.semantic_label == "no_shuttle" else {}
+            ),
         )
         replayed = event_store.replay()
         key = burst.task, burst.source_id, frame
@@ -203,6 +235,7 @@ def create_dash_app(
             buttons,
             progress,
             json.dumps(history, indent=2, sort_keys=True),
+            asdict(suggestion) if suggestion else None,
         )
 
     app.clientside_callback(
@@ -260,6 +293,7 @@ def create_dash_app(
         Output("status", "children"),
         Input({"type": "label-option", "kind": ALL}, "n_clicks"),
         Input("undo", "n_clicks"),
+        Input("accept-suggestion", "n_clicks"),
         Input("previous", "n_clicks"),
         Input("next", "n_clicks"),
         Input({"type": "candidate", "candidate_id": ALL}, "n_clicks"),
@@ -269,6 +303,7 @@ def create_dash_app(
     def edit_target(
         label_clicks: list[int | None],
         undo: int | None,
+        accept_suggestion: int | None,
         previous: int | None,
         next_: int | None,
         candidate_clicks: list[int | None],
@@ -284,14 +319,23 @@ def create_dash_app(
             return asdict(state), "Moved to next frame"
         if triggered == "undo":
             event = event_store.undo_last(annotator=state.annotator, session_id=state.session_id)
-            state = session_manager.retreat(state, queue)
-            return asdict(state), f"Undid revision {event.superseded_revision}"
+            state = session_manager.seek(state, queue, event.source_id, event.frame)
+            return asdict(state), f"UNDO · prior frame {event.frame} · next frame {event.frame}"
         target = session_manager.current(state, queue)
         if target is None:
             return asdict(state), "Queue complete"
         burst, frame = target
         candidate_id = None
         label_kind = None
+        suggestion = (
+            task_plugin.suggestion(registry.sources[burst.source_id], frame)
+            if queue.kind == "adaptive" and hasattr(task_plugin, "suggestion") else None
+        )
+        if triggered == "accept-suggestion":
+            if suggestion is None:
+                return asdict(state), "Space ignored: no visible suggestion"
+            label_kind = suggestion.semantic_label
+            candidate_id = suggestion.candidate_id
         if isinstance(triggered, dict) and triggered.get("type") == "label-option":
             label_kind = str(triggered["kind"])
         if isinstance(triggered, dict) and triggered.get("type") == "candidate":
@@ -308,8 +352,14 @@ def create_dash_app(
             candidate_artifact_sha256=burst.candidate_artifact_sha256,
             annotator=state.annotator,
             session_id=state.session_id,
+            annotation_suggestion=suggestion,
         )
         state = session_manager.advance(state, queue)
-        return asdict(state), f"Recorded {event.label_kind} ({event.revision_id})"
+        next_target = session_manager.current(state, queue)
+        next_text = "complete" if next_target is None else f"{next_target[0].source_id}:{next_target[1]}"
+        return asdict(state), (
+            f"{event.review_action}: {event.label_kind} · prior frame "
+            f"{burst.source_id}:{frame} · next frame {next_text}"
+        )
 
     return app

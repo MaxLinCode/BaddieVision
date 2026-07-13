@@ -140,7 +140,7 @@ def _parser() -> argparse.ArgumentParser:
 
     export = subparsers.add_parser("export")
     export.add_argument("--output", type=Path, required=True)
-    export.add_argument("--include-skips", action="store_true")
+    export.add_argument("--include-unsure", action="store_true")
 
     smoke = subparsers.add_parser("smoke")
     smoke.add_argument("--output-dir", type=Path)
@@ -164,7 +164,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"audit bursts: {len(audit.bursts)}")
         return 0
     if args.command == "export":
-        event_store.export_current(args.output, task=SHUTTLE_TASK, include_skips=args.include_skips)
+        event_store.export_current(args.output, task=SHUTTLE_TASK, include_unsure=args.include_unsure)
         print(args.output)
         return 0
     if args.command == "smoke":

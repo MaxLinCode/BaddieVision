@@ -4,7 +4,7 @@ The package core has no Dash dependency. Import ``create_dash_app`` explicitly
 to construct the optional browser UI.
 """
 
-from .core import AnnotationRegistry, LabelOption, SourceRegistration, TaskPlugin
+from .core import AnnotationRegistry, AnnotationSuggestion, LabelOption, SourceRegistration, TaskPlugin
 from .events import AnnotationEvent, EventStore, ReplayState, replay_events
 from .queues import (
     AnnotationQueue,
@@ -22,6 +22,7 @@ __all__ = [
     "AnnotationEvent",
     "AnnotationQueue",
     "AnnotationRegistry",
+    "AnnotationSuggestion",
     "EventStore",
     "LabelOption",
     "QueueBurst",

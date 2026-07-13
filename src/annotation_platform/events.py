@@ -9,7 +9,9 @@ import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable, Mapping
+from typing import TYPE_CHECKING, Any, Iterable, Mapping
+
+from .core import AnnotationSuggestion
 
 from .core import AnnotationRegistry
 
@@ -31,6 +33,8 @@ class AnnotationEvent:
     session_id: str
     timestamp: str
     superseded_revision: str | None
+    review_action: str = "human_created"
+    annotation_suggestion: Mapping[str, Any] | None = None
 
     @property
     def key(self) -> LabelKey:
@@ -54,6 +58,8 @@ class AnnotationEvent:
         missing = sorted(required - value.keys())
         if missing:
             raise ValueError(f"annotation event missing fields: {missing}")
+        if value.get("label_kind") == "skip":
+            raise ValueError("unsupported annotation label kind: skip")
         candidate_id = value.get("candidate_id")
         return cls(
             revision_id=str(value["revision_id"]),
@@ -71,6 +77,12 @@ class AnnotationEvent:
                 None
                 if value["superseded_revision"] is None
                 else str(value["superseded_revision"])
+            ),
+            review_action=str(value.get("review_action", "human_created")),
+            annotation_suggestion=(
+                value.get("annotation_suggestion")
+                if isinstance(value.get("annotation_suggestion"), dict)
+                else None
             ),
         )
 
@@ -229,6 +241,7 @@ class EventStore:
         candidate_id: str | None = None,
         revision_id: str | None = None,
         timestamp: str | None = None,
+        annotation_suggestion: AnnotationSuggestion | None = None,
     ) -> AnnotationEvent:
         plugin, source = self.registry.resolve(task, source_id)
         annotator = str(annotator).strip()
@@ -257,6 +270,26 @@ class EventStore:
             candidate_id=candidate_id,
             candidate_artifact_sha256=candidate_artifact_sha256,
         )
+        suggestion_mapping = asdict(annotation_suggestion) if annotation_suggestion else None
+        if annotation_suggestion is not None:
+            if not annotation_suggestion.verified:
+                raise ValueError("annotation suggestions must be verified")
+            if annotation_suggestion.artifact_fingerprints.get(
+                "candidate_artifact_sha256"
+            ) != candidate_artifact_sha256:
+                raise ValueError("suggestion candidate-artifact fingerprint does not match")
+            expected_suggestion = (
+                plugin.suggestion(source, int(frame)) if hasattr(plugin, "suggestion") else None
+            )
+            if expected_suggestion != annotation_suggestion:
+                raise ValueError("annotation suggestion does not match the frozen provider result")
+            agrees = (
+                label_kind == annotation_suggestion.semantic_label
+                and candidate_id == annotation_suggestion.candidate_id
+            )
+            review_action = "human_confirmed" if agrees else "human_corrected"
+        else:
+            review_action = "human_created"
         event = AnnotationEvent(
             revision_id=revision_id or str(uuid.uuid4()),
             task=task,
@@ -270,6 +303,8 @@ class EventStore:
             session_id=session_id,
             timestamp=timestamp or datetime.now(timezone.utc).isoformat(),
             superseded_revision=head.revision_id if head else None,
+            review_action=review_action,
+            annotation_suggestion=suggestion_mapping,
         )
         # Validate the chain before touching disk.
         replay_events((*state.events, event))
@@ -287,7 +322,7 @@ class EventStore:
         output_path: str | Path,
         *,
         task: str | None = None,
-        include_skips: bool = False,
+        include_unsure: bool = False,
     ) -> Path:
         """Export the replayed current view while keeping the event log canonical."""
         state = self.replay()
@@ -296,13 +331,13 @@ class EventStore:
             event
             for event in state.active.values()
             if (task is None or event.task == task)
-            and (include_skips or event.label_kind != "skip")
+            and (include_unsure or event.label_kind != "unsure")
         ]
         selected.sort(key=lambda event: (event.task, event.source_id, event.frame))
         metadata = {
             "type": "metadata",
             "schema": "annotation_export",
-            "schema_version": 1,
+            "schema_version": 2,
             "event_log": self.path.name,
             "event_segments": [
                 {"name": path.name, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
@@ -360,7 +395,7 @@ class EventStore:
                         "task": burst.task,
                         "source_id": burst.source_id,
                         "frame": frame,
-                        "completed": event is not None and event.label_kind != "skip",
+                        "completed": event is not None,
                         "label_kind": event.label_kind if event else None,
                         "revision_id": event.revision_id if event else None,
                     }

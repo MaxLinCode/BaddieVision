@@ -94,6 +94,19 @@ class LabelOption:
     hotkey: str | None = None
 
 
+@dataclass(frozen=True)
+class AnnotationSuggestion:
+    """Immutable, provider-neutral suggestion attached to a human review event."""
+
+    provider: str
+    semantic_label: str
+    candidate_id: str | None
+    policy: Mapping[str, Any]
+    artifact_fingerprints: Mapping[str, str]
+    verified: bool
+    metadata: Mapping[str, Any]
+
+
 class TaskPlugin(Protocol):
     """Interface implemented by an annotation task.
 
@@ -130,6 +143,8 @@ class TaskPlugin(Protocol):
     def overlays(self, source: SourceRegistration, frame: int) -> Sequence[Mapping[str, Any]]: ...
 
     def queue_score(self, source: SourceRegistration, frame: int) -> float: ...
+
+    def suggestion(self, source: SourceRegistration, frame: int) -> AnnotationSuggestion | None: ...
 
 
 @dataclass(frozen=True)

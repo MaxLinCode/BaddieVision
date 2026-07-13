@@ -14,10 +14,37 @@ from src.single_video.shuttle import (
     evaluate_candidate_retention_recall,
     link_shuttle_candidates,
     link_shuttle_hypotheses,
+    legacy_tracknet_bbox,
     rank_shuttle_candidates,
     read_shuttle_candidates,
     tracknet_candidate_frame_range,
 )
+
+
+def _untouched_tracknet_bbox(heatmap):
+    import cv2
+
+    mask = (heatmap > 0.5).astype(np.uint8)
+    contours, _ = cv2.findContours(mask.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    rects = [cv2.boundingRect(contour) for contour in contours]
+    best, max_area = 0, rects[0][2] * rects[0][3]
+    for index in range(1, len(rects)):
+        area = rects[index][2] * rects[index][3]
+        if area > max_area:
+            best, max_area = index, area
+    return rects[best]
+
+
+@pytest.mark.parametrize("heatmap", [
+    np.zeros((8, 8), dtype=np.float32),
+    np.pad(np.ones((2, 3), dtype=np.float32), ((2, 4), (1, 4))),
+    np.diag(np.ones(8, dtype=np.float32)),
+    np.array([[0, 0, 0, 0, 0], [0, .9, 0, .9, 0], [0, .9, 0, .9, 0]], dtype=np.float32),
+])
+def test_legacy_suggestion_bbox_matches_untouched_tracknet(heatmap) -> None:
+    assert legacy_tracknet_bbox(heatmap) == _untouched_tracknet_bbox(heatmap)
 
 
 def _records(path: Path) -> list[dict]:

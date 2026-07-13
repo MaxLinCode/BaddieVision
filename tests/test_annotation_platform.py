@@ -43,6 +43,16 @@ def _write_candidates(
     }
     if schema_version == 2:
         metadata["source_frame_range"] = [0, frame_count - 1]
+        metadata.update({
+            "model_stage": "tracknet_pre_inpaint",
+            "thresholds": [0.2, 0.3, 0.4, 0.5],
+            "threshold_comparator": ">",
+            "extraction_version": "tracknet-components-v2.0",
+            "legacy_compatibility_threshold": 0.5,
+            "checkpoint_sha256": "a" * 64,
+            "inference_model_sha256": "b" * 64,
+            "provenance_verified": True,
+        })
     with path.open("w", encoding="utf-8") as output:
         output.write(json.dumps(metadata) + "\n")
         for frame in range(frame_count):
@@ -56,6 +66,8 @@ def _write_candidates(
                         "peak_activation" if schema_version == 2 else "peak_value": (
                             0.9 if index == 0 else 0.3
                         ),
+                        "threshold": 0.5,
+                        "legacy_largest_component": index == 0,
                     }
                 )
             output.write(json.dumps({"type": "frame", "frame": frame, "candidates": candidates}) + "\n")
@@ -240,6 +252,67 @@ def test_select_correction_undo_replay_and_restart(tmp_path: Path) -> None:
     assert restarted.heads[first.key].revision_id == undo.revision_id
     assert restarted.active[first.key].revision_id == first.revision_id
     assert restarted.active[first.key].candidate_id == "f2-a"
+
+
+def test_verified_suggestion_and_semantic_review_actions(tmp_path: Path) -> None:
+    registry, plugin, _, _ = _registry(tmp_path)
+    source = registry.sources["match"]
+    suggestion = plugin.suggestion(source, 2)
+    assert suggestion is not None
+    assert suggestion.provider == "legacy_tracknet"
+    assert suggestion.candidate_id == "f2-a"
+    assert suggestion.metadata["opencv_version"] == cv2.__version__
+    store = EventStore(tmp_path / "events.jsonl", registry)
+    common = dict(
+        task="shuttle_selection", source_id="match", frame=2,
+        candidate_artifact_sha256=plugin.artifact_sha256(source), annotator="alice",
+        session_id="session", annotation_suggestion=suggestion,
+    )
+    confirmed = store.record(**common, label_kind="selected", candidate_id="f2-a")
+    corrected = store.record(**common, label_kind="unsure")
+    assert confirmed.review_action == "human_confirmed"
+    assert corrected.review_action == "human_corrected"
+    assert corrected.annotation_suggestion["candidate_id"] == "f2-a"
+
+
+def test_suggestions_require_exact_verified_v2_provenance(tmp_path: Path) -> None:
+    registry, plugin, _, candidates = _registry(tmp_path)
+    assert plugin.suggestion(registry.sources["match"], 0) is not None
+    records = candidates.read_text(encoding="utf-8").splitlines()
+    metadata = json.loads(records[0])
+    metadata["extraction_version"] = "older"
+    candidates.write_text(json.dumps(metadata) + "\n" + "\n".join(records[1:]) + "\n")
+    second = tmp_path / "second"
+    second.mkdir()
+    registry, plugin, _, _ = _registry(second, schema_version=1)
+    assert plugin.suggestion(registry.sources["match"], 0) is None
+
+
+def test_no_shuttle_confirmation_and_v2_unsure_export_filter(tmp_path: Path) -> None:
+    video = tmp_path / "source.mp4"
+    video.write_bytes(b"video")
+    candidates = _write_candidates(tmp_path / "candidates.jsonl", candidate_count=0)
+    registry = AnnotationRegistry()
+    registry.register_source("match", video, fps=4, frame_count=12, image_size=(64, 48),
+                             artifacts={"candidates": candidates})
+    plugin = ShuttleSelectionPlugin()
+    registry.register_task(plugin)
+    suggestion = plugin.suggestion(registry.sources["match"], 0)
+    assert suggestion is not None and suggestion.semantic_label == "no_shuttle"
+    store = EventStore(tmp_path / "events.jsonl", registry)
+    common = dict(task="shuttle_selection", source_id="match",
+                  candidate_artifact_sha256=plugin.artifact_sha256(registry.sources["match"]),
+                  annotator="alice", session_id="session")
+    confirmed = store.record(**common, frame=0, label_kind="no_shuttle",
+                             annotation_suggestion=suggestion)
+    store.record(**common, frame=1, label_kind="unsure")
+    assert confirmed.review_action == "human_confirmed"
+    exported = store.export_current(tmp_path / "export.jsonl")
+    records = [json.loads(line) for line in exported.read_text().splitlines()]
+    assert records[0]["schema_version"] == 2
+    assert [record["label_kind"] for record in records[1:]] == ["no_shuttle"]
+    store.export_current(tmp_path / "all.jsonl", include_unsure=True)
+    assert "unsure" in (tmp_path / "all.jsonl").read_text()
 
 
 def test_repeated_undo_walks_back_session_edits_instead_of_toggling(tmp_path: Path) -> None:

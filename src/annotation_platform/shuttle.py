@@ -8,11 +8,21 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from .core import LabelOption, SourceRegistration, file_sha256
+import cv2
+
+from .core import AnnotationSuggestion, LabelOption, SourceRegistration, file_sha256
 
 
 SHUTTLE_TASK = "shuttle_selection"
-SHUTTLE_LABELS = ("selected", "no_shuttle", "missing_proposal", "skip", "undo")
+SHUTTLE_LABELS = ("selected", "no_shuttle", "missing_proposal", "unsure", "undo")
+LEGACY_EXTRACTION_VERSION = "tracknet-components-v2.0"
+LEGACY_POLICY = {
+    "model_stage": "tracknet_pre_inpaint",
+    "threshold": 0.5,
+    "threshold_comparator": ">",
+    "contours": {"retrieval": "RETR_EXTERNAL", "approximation": "CHAIN_APPROX_SIMPLE"},
+    "selection": "first_largest_bounding_box_area_strict_greater_than",
+}
 
 
 @dataclass(frozen=True)
@@ -107,7 +117,7 @@ class ShuttleSelectionPlugin:
         return (
             LabelOption("no_shuttle", "No shuttle", "n"),
             LabelOption("missing_proposal", "Missing proposal", "m"),
-            LabelOption("skip", "Skip", "s"),
+            LabelOption("unsure", "Unsure", "u"),
         )
 
     def prepare_source(self, source: SourceRegistration) -> None:
@@ -233,3 +243,54 @@ class ShuttleSelectionPlugin:
 
     def image_size(self, source: SourceRegistration) -> tuple[int, int]:
         return source.image_size
+
+    def suggestion(self, source: SourceRegistration, frame: int) -> AnnotationSuggestion | None:
+        """Return the frozen legacy TrackNet decision only for verified v2 artifacts."""
+        artifact = self._artifact(source)
+        metadata = artifact.metadata
+        hashes = (metadata.get("checkpoint_sha256"), metadata.get("inference_model_sha256"))
+        valid_hashes = all(
+            isinstance(value, str) and len(value) == 64
+            and all(char in "0123456789abcdefABCDEF" for char in value)
+            for value in hashes
+        )
+        if not (
+            metadata.get("schema_version") == 2
+            and metadata.get("extraction_version") == LEGACY_EXTRACTION_VERSION
+            and metadata.get("model_stage") == LEGACY_POLICY["model_stage"]
+            and metadata.get("threshold_comparator") == ">"
+            and metadata.get("legacy_compatibility_threshold") == 0.5
+            and 0.5 in metadata.get("thresholds", [])
+            and metadata.get("provenance_verified") is True
+            and not metadata.get("nonproduction_unverified_provenance", False)
+            and valid_hashes
+        ):
+            return None
+        candidates = artifact.frames.get(int(frame))
+        if candidates is None:
+            return None
+        marked = [item for item in candidates if item.get("legacy_largest_component") is True]
+        threshold_candidates = [item for item in candidates if item.get("threshold") == 0.5]
+        if len(marked) > 1 or any(item.get("threshold") != 0.5 for item in marked):
+            return None
+        if threshold_candidates and len(marked) != 1:
+            return None
+        candidate_id = str(marked[0]["candidate_id"]) if marked else None
+        return AnnotationSuggestion(
+            provider="legacy_tracknet",
+            semantic_label="selected" if candidate_id else "no_shuttle",
+            candidate_id=candidate_id,
+            policy=LEGACY_POLICY,
+            artifact_fingerprints={
+                "candidate_artifact_sha256": artifact.sha256,
+                "checkpoint_sha256": str(hashes[0]),
+                "inference_model_sha256": str(hashes[1]),
+            },
+            verified=True,
+            metadata={
+                "opencv_version": cv2.__version__,
+                "extraction_implementation_version": metadata["extraction_version"],
+                "inference_model_artifact": metadata.get("inference_model_artifact"),
+                "overlap_ensemble_mode": metadata.get("overlap_ensemble_mode"),
+            },
+        )

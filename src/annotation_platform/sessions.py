@@ -97,6 +97,22 @@ class SessionManager:
         self._write(updated)
         return updated
 
+    def seek(self, state: SessionState, queue: AnnotationQueue, source_id: str, frame: int) -> SessionState:
+        """Move the durable cursor to an exact queue frame."""
+        self._validate_queue(state, queue)
+        for burst_index, burst in enumerate(queue.bursts):
+            if burst.source_id != source_id:
+                continue
+            for frame_index, queued_frame in enumerate(burst.frames):
+                if queued_frame == int(frame):
+                    updated = SessionState(**{
+                        **asdict(state), "burst_index": burst_index, "frame_index": frame_index,
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    })
+                    self._write(updated)
+                    return updated
+        raise ValueError(f"frame is not present in session queue: {source_id}:{frame}")
+
     def _validate_queue(self, state: SessionState, queue: AnnotationQueue) -> None:
         if state.queue_id != queue.queue_id:
             raise ValueError("session queue fingerprint does not match")
