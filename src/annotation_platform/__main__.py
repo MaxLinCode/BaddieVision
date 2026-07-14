@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import shlex
+import sys
 from pathlib import Path
 
 import cv2
@@ -17,7 +20,15 @@ from .queues import (
     build_uniform_audit_queue,
     validate_queue,
 )
-from .sessions import SessionManager
+from .pilot import (
+    evaluate_threshold_pilot,
+    filter_pilot_artifact,
+    freeze_threshold_policy,
+    materialize_final_runtime,
+    migrate_v1_runtime,
+    wilson_interval,
+)
+from .sessions import SessionManager, SessionState
 from .shuttle import SHUTTLE_TASK, ShuttleSelectionPlugin
 from .views import build_playback_view, render_center_frame
 
@@ -136,7 +147,9 @@ def _parser() -> argparse.ArgumentParser:
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8050)
     serve.add_argument("--debug", action="store_true")
-    serve.add_argument("--session-id")
+    session_choice = serve.add_mutually_exclusive_group()
+    session_choice.add_argument("--session-id")
+    session_choice.add_argument("--new-session", action="store_true")
 
     export = subparsers.add_parser("export")
     export.add_argument("--output", type=Path, required=True)
@@ -144,6 +157,23 @@ def _parser() -> argparse.ArgumentParser:
 
     smoke = subparsers.add_parser("smoke")
     smoke.add_argument("--output-dir", type=Path)
+
+    report = subparsers.add_parser("pilot-report")
+    report.add_argument("--labels", type=Path, required=True)
+    report.add_argument("--output", type=Path, required=True)
+
+    freeze = subparsers.add_parser("freeze-pilot")
+    freeze.add_argument("--report", type=Path, required=True)
+    freeze.add_argument("--output-dir", type=Path, required=True)
+    freeze.add_argument("--target-recall", type=float, default=0.99)
+
+    migrate = subparsers.add_parser("migrate-v1")
+    migrate.add_argument("--v1-runtime", type=Path, required=True)
+    migrate.add_argument("--v1-config", type=Path, required=True)
+
+    final = subparsers.add_parser("finalize-runtime")
+    final.add_argument("--pilot-runtime", type=Path, required=True)
+    final.add_argument("--pilot-config", type=Path, required=True)
     return parser
 
 
@@ -152,6 +182,112 @@ def main(argv: list[str] | None = None) -> int:
     registry = load_registry(args.config)
     runtime = args.runtime.expanduser().resolve()
     event_store = EventStore(runtime / "events" / "shuttle.jsonl", registry)
+    if args.command == "pilot-report":
+        records = [json.loads(line) for line in args.labels.read_text(encoding="utf-8").splitlines()]
+        labels = [record for record in records if record.get("type") != "metadata"]
+        reports = {}
+        for source_id, source in registry.sources.items():
+            source_labels = [record for record in labels if record.get("source_id") == source_id]
+            reports[source_id] = evaluate_threshold_pilot(
+                source.artifacts["candidates"], source_labels
+            )
+        combined_rows = []
+        first_rows = next(iter(reports.values()))["threshold_results"] if reports else []
+        for index, first in enumerate(first_rows):
+            rows = [report["threshold_results"][index] for report in reports.values()]
+            total = sum(int(row["observed_target_frames"]) for row in rows)
+            hits = sum(int(row["observed_hits"]) for row in rows)
+            hits_at_k = {
+                key: sum(int(row["hits_at_k"][key]) for row in rows)
+                for key in first["hits_at_k"]
+            }
+            def combined_counts(field: str) -> list[int]:
+                return [
+                    int(count)
+                    for row in rows
+                    for value, frequency in row[field].items()
+                    for count in [value] * int(frequency)
+                ]
+
+            raw_counts = combined_counts("raw_candidate_count_histogram")
+            grouped_counts = combined_counts("grouped_candidate_count_histogram")
+            def summary(values: list[int]) -> dict[str, float | int]:
+                values.sort()
+                def percentile(q: float) -> float:
+                    if not values:
+                        return 0.0
+                    position = (len(values) - 1) * q
+                    lower, upper = int(position), math.ceil(position)
+                    return values[lower] + (values[upper] - values[lower]) * (position - lower)
+                return {"mean": sum(values) / len(values) if values else 0.0,
+                        "p50": percentile(.5), "p90": percentile(.9),
+                        "p95": percentile(.95), "p99": percentile(.99),
+                        "maximum": max(values, default=0)}
+            combined_rows.append({
+                **first,
+                "observed_target_frames": total,
+                "observed_hits": hits,
+                **{
+                    field: sum(int(row[field]) for row in rows)
+                    for field in (
+                        "selected_label_frames",
+                        "missing_proposal_frames",
+                        "annotated_missing_proposal_frames",
+                        "selected_lost_at_cutoff_frames",
+                        "occluded_inferable_frames",
+                        "no_in_frame_target_frames",
+                        "unsure_frames",
+                        "legacy_no_shuttle_frames",
+                    )
+                },
+                "observed_proposal_recall": hits / total if total else None,
+                "wilson_95": wilson_interval(hits, total),
+                "hits_at_k": hits_at_k,
+                "recall_at_k": {key: value / total if total else None for key, value in hits_at_k.items()},
+                "raw_candidates_per_frame": summary(raw_counts),
+                "grouped_candidates_per_frame": summary(grouped_counts),
+                "source_results": {source_id: rows[position] for position, source_id in enumerate(reports)},
+            })
+        output = {
+            "schema": "shuttle_threshold_pilot_report",
+            "schema_version": 1,
+            "sources": reports,
+            "threshold_results": combined_rows,
+        }
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(output, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+        print(args.output)
+        return 0
+    if args.command == "freeze-pilot":
+        report = json.loads(args.report.read_text(encoding="utf-8"))
+        freeze = freeze_threshold_policy(report, args.target_recall)
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        for source_id, source in registry.sources.items():
+            output = args.output_dir / f"{source_id}-shuttle-candidates-frozen.jsonl"
+            filter_pilot_artifact(source.artifacts["candidates"], output, freeze)
+            print(output)
+        freeze_path = args.output_dir / "threshold-freeze.json"
+        freeze_path.write_text(json.dumps(freeze, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+        print(freeze_path)
+        return 0
+    if args.command == "migrate-v1":
+        old_registry = load_registry(args.v1_config)
+        old_artifacts = {
+            source_id: source.artifacts["candidates"]
+            for source_id, source in old_registry.sources.items()
+        }
+        result = migrate_v1_runtime(args.v1_runtime, runtime, registry, old_artifacts)
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    if args.command == "finalize-runtime":
+        pilot_registry = load_registry(args.pilot_config)
+        pilot_artifacts = {
+            source_id: source.artifacts["candidates"]
+            for source_id, source in pilot_registry.sources.items()
+        }
+        result = materialize_final_runtime(args.pilot_runtime, runtime, registry, pilot_artifacts)
+        print(json.dumps(result, sort_keys=True))
+        return 0
     if args.command == "build-queues":
         adaptive, audit = _queues(
             registry,
@@ -195,13 +331,81 @@ def main(argv: list[str] | None = None) -> int:
     )
     selected_queue = adaptive if args.queue == "adaptive" else audit
     sessions = SessionManager(runtime / "sessions")
+    replayed = event_store.replay()
     if args.session_id:
-        session = sessions.load(args.session_id)
-    else:
+        session = sessions.load_compatible(args.session_id, args.annotator, selected_queue)
+        status = "resumed explicit session"
+    elif args.new_session:
         session = sessions.create(args.annotator, selected_queue)
+        status = "created new session"
+    else:
+        session = sessions.select(args.annotator, selected_queue, replayed.active)
+        if session is None:
+            session = sessions.create(args.annotator, selected_queue)
+            status = "created new session (no compatible session found)"
+        else:
+            status = "auto-resumed session"
+    session = sessions.reconcile(session, selected_queue, replayed.active)
+    resume_command = _resume_command(args, runtime, session.session_id)
+    _print_session_status(status, session, sessions, selected_queue, resume_command)
     app = create_dash_app(registry, selected_queue, event_store, sessions, session)
-    app.run(host=args.host, port=args.port, debug=args.debug)
+    try:
+        app.run(host=args.host, port=args.port, debug=args.debug)
+    finally:
+        durable = sessions.load(session.session_id)
+        print("Annotation server stopped. Durable recovery state:")
+        _print_session_status("saved session", durable, sessions, selected_queue, resume_command)
     return 0
+
+
+def _resume_command(args: argparse.Namespace, runtime: Path, session_id: str) -> str:
+    parts = [
+        sys.executable,
+        "-m",
+        "src.annotation_platform",
+        "--config",
+        str(Path(args.config).expanduser().resolve()),
+        "--runtime",
+        str(runtime),
+        "serve",
+        "--annotator",
+        args.annotator,
+        "--queue",
+        args.queue,
+        "--audit-seed",
+        str(args.audit_seed),
+        "--audit-count",
+        str(args.audit_count),
+        "--adaptive-count",
+        str(args.adaptive_count),
+        "--host",
+        args.host,
+        "--port",
+        str(args.port),
+        "--session-id",
+        session_id,
+    ]
+    if args.debug:
+        parts.append("--debug")
+    return shlex.join(parts)
+
+
+def _print_session_status(
+    status: str,
+    session: SessionState,
+    sessions: SessionManager,
+    queue: AnnotationQueue,
+    resume_command: str,
+) -> None:
+    # Kept as a small helper so startup and shutdown cannot drift apart.
+    state = session
+    position = sessions.position(state, queue)
+    target = sessions.current(state, queue)
+    current = "complete" if target is None else f"{target[0].source_id}:{target[1]}"
+    print(f"Session: {state.session_id} ({status})")
+    print(f"Queue position: {position + (0 if target is None else 1)}/{sessions.queue_length(queue)}")
+    print(f"Current frame: {current}")
+    print(f"Resume command: {resume_command}")
 
 
 if __name__ == "__main__":
