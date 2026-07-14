@@ -263,9 +263,17 @@ def test_v1_migration_is_transactional_preserves_queue_order_and_classifies_labe
     )
     queue = AnnotationQueue(
         queue_id="v1-queue", kind="adaptive", task="shuttle_selection", seed=None,
-        bursts=(burst,), construction={"requested_anchor_count": 1},
+        bursts=(burst,), construction={
+            "requested_anchor_count": 1,
+            "audit_queue_id": "v1-audit-queue",
+        },
     )
     queue.write(v1 / "queues" / "shuttle-adaptive.json", immutable=False)
+    audit_queue = AnnotationQueue(
+        queue_id="v1-audit-queue", kind="audit", task="shuttle_selection", seed=1729,
+        bursts=(burst,), construction={"anchor_count": 1},
+    )
+    audit_queue.write(v1 / "queues" / "shuttle-audit.json", immutable=False)
     before = {path: path.read_bytes() for path in v1.rglob("*") if path.is_file()}
 
     output = tmp_path / "pilot-runtime"
@@ -282,6 +290,8 @@ def test_v1_migration_is_transactional_preserves_queue_order_and_classifies_labe
     assert rebound.bursts[0].candidate_artifact_sha256 == hashlib.sha256(
         pilot_candidates.read_bytes()
     ).hexdigest()
+    rebound_audit = AnnotationQueue.read(output / "queues" / "shuttle-audit.json")
+    assert rebound.construction["audit_queue_id"] == rebound_audit.queue_id
     migrated = [json.loads(line) for line in (output / "events" / "shuttle.jsonl").read_text().splitlines()]
     assert len(migrated) == 1
     assert migrated[0]["review_action"] == "migrated"

@@ -445,6 +445,23 @@ def migrate_v1_runtime(
     try:
         (temporary / "events").mkdir(parents=True)
         rebound = [rebind_queue(queue, new_hashes, lineage=lineage) for queue in queues]
+        rebound_audit_ids = {
+            original.queue_id: migrated.queue_id
+            for original, migrated in zip(queues, rebound)
+            if original.kind == "audit"
+        }
+        rebound = [
+            replace(
+                migrated,
+                construction={
+                    **migrated.construction,
+                    "audit_queue_id": rebound_audit_ids[original.construction["audit_queue_id"]],
+                },
+            )
+            if original.construction.get("audit_queue_id") is not None
+            else migrated
+            for original, migrated in zip(queues, rebound)
+        ]
         for queue in rebound:
             name = "shuttle-audit.json" if queue.kind == "audit" else "shuttle-adaptive.json"
             queue.write(temporary / "queues" / name, immutable=False)
