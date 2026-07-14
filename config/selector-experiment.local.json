@@ -1,0 +1,35 @@
+{
+  "schema": "temporal_selector_experiment_config",
+  "schema_version": 1,
+  "seed": 1729,
+  "crossfit_manifest_path": "selector-two-fold-manifest.json",
+  "dataset": {
+    "minimum_cutoff": 0.05,
+    "retention_k": 8,
+    "pose_visibility_threshold": 0.5,
+    "expected_annotation_sha256": "e8903886a49cf5d0fec4d0743befd98e05822ccc15247c762d756ab8e4e41425",
+    "annotations_path": "../.annotation-final/events/shuttle.jsonl",
+    "queue_paths": [
+      "../.annotation-final/queues/shuttle-adaptive.json",
+      "../.annotation-final/queues/shuttle-audit.json"
+    ],
+    "sources": [
+      {
+        "source_id": "malaysia_max_30s_to_120s",
+        "video_path": "../outputs/malaysia_max_30s_to_120s/malaysia_max_30s_to_120s_input.mp4",
+        "candidates_path": "../outputs/frozen/malaysia_max_30s_to_120s-shuttle-candidates-frozen.jsonl",
+        "assignments_path": "../outputs/malaysia_max_30s_to_120s/player_assignments.jsonl",
+        "pose_cache_path": "../outputs/malaysia_max_30s_to_120s/pose_cache.jsonl",
+        "calibration_path": "../features/court/malaysiamax.json"
+      },
+      {
+        "source_id": "max_vs_nik_30s_to_120s",
+        "video_path": "../outputs/max_vs_nik_30s_to_120s/max_vs_nik_30s_to_120s_input.mp4",
+        "candidates_path": "../outputs/frozen/max_vs_nik_30s_to_120s-shuttle-candidates-frozen.jsonl",
+        "assignments_path": "../outputs/max_vs_nik_30s_to_120s/player_assignments.jsonl",
+        "pose_cache_path": "../outputs/max_vs_nik_30s_to_120s/pose_cache.jsonl",
+        "calibration_path": "../features/court/max_vs_nik_calibration.json"
+      }
+    ]
+  }
+}
