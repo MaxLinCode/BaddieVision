@@ -87,7 +87,8 @@ def group_shuttle_candidates(
     for candidate in ordered:
         threshold = float(candidate.get("threshold", 0.0))
         compatible = [
-            group for group in groups
+            group
+            for group in groups
             if threshold not in group["thresholds"]
             and _bbox_contains_peak(group["representative"], candidate)
         ]
@@ -102,23 +103,29 @@ def group_shuttle_candidates(
             group["members"].append(candidate)
             group["thresholds"].add(threshold)
         else:
-            groups.append({
-                "representative": candidate,
-                "members": [candidate],
-                "thresholds": {threshold},
-            })
+            groups.append(
+                {
+                    "representative": candidate,
+                    "members": [candidate],
+                    "thresholds": {threshold},
+                }
+            )
     output: list[Mapping[str, Any]] = []
     for group in groups:
         representative = dict(group["representative"])
-        members = sorted(group["members"], key=ShuttleSelectionPlugin._representative_key)
+        members = sorted(
+            group["members"], key=ShuttleSelectionPlugin._representative_key
+        )
         member_ids = [str(item["candidate_id"]) for item in members]
-        representative.update({
-            "candidate_group_id": "group:" + str(representative["candidate_id"]),
-            "grouping_version": GROUPING_VERSION,
-            "grouped_candidate_ids": member_ids,
-            "raw_member_ids": member_ids,
-            "grouped_candidate_count": len(member_ids),
-        })
+        representative.update(
+            {
+                "candidate_group_id": "group:" + str(representative["candidate_id"]),
+                "grouping_version": GROUPING_VERSION,
+                "grouped_candidate_ids": member_ids,
+                "raw_member_ids": member_ids,
+                "grouped_candidate_count": len(member_ids),
+            }
+        )
         output.append(representative)
     return tuple(sorted(output, key=ShuttleSelectionPlugin._representative_key))
 
@@ -144,6 +151,7 @@ class ShuttleCandidateArtifact:
     metadata: Mapping[str, Any]
     frames: Mapping[int, tuple[Mapping[str, Any], ...]]
     candidates: Mapping[str, tuple[int, Mapping[str, Any]]]
+    frozen_frames: Mapping[int, tuple[Mapping[str, Any], ...]]
 
     @classmethod
     def load(cls, path: str | Path) -> "ShuttleCandidateArtifact":
@@ -156,10 +164,13 @@ class ShuttleCandidateArtifact:
             metadata = json.loads(lines[0])
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ValueError(f"invalid candidate metadata: {path}") from exc
-        if metadata.get("schema") != "shuttle_candidates" or metadata.get("schema_version") not in {1, 2}:
+        if metadata.get("schema") != "shuttle_candidates" or metadata.get(
+            "schema_version"
+        ) not in {1, 2}:
             raise ValueError(f"expected shuttle_candidates schema v1/v2: {path}")
         frames: dict[int, tuple[Mapping[str, Any], ...]] = {}
         candidates: dict[str, tuple[int, Mapping[str, Any]]] = {}
+        frozen_frames: dict[int, tuple[Mapping[str, Any], ...]] = {}
         frame_order: list[int] = []
         for line_number, raw_line in enumerate(lines[1:], start=2):
             if not raw_line.strip():
@@ -167,14 +178,25 @@ class ShuttleCandidateArtifact:
             try:
                 record = json.loads(raw_line)
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise ValueError(f"invalid candidate JSON at {path}:{line_number}") from exc
+                raise ValueError(
+                    f"invalid candidate JSON at {path}:{line_number}"
+                ) from exc
             if record.get("type") != "frame":
-                raise ValueError(f"candidate artifact contains non-frame record at line {line_number}")
+                raise ValueError(
+                    f"candidate artifact contains non-frame record at line {line_number}"
+                )
             frame = int(record["frame"])
             if frame in frames:
                 raise ValueError(f"duplicate candidate frame: {frame}")
             frame_order.append(frame)
             items = tuple(record.get("candidates", ()))
+            frozen_items = record.get("frozen_candidates")
+            if frozen_items is not None:
+                if not isinstance(frozen_items, list):
+                    raise ValueError(
+                        f"frozen candidates must be a list on frame {frame}"
+                    )
+                frozen_frames[frame] = tuple(frozen_items)
             for candidate in items:
                 candidate_id = str(candidate.get("candidate_id", ""))
                 if not candidate_id:
@@ -190,7 +212,9 @@ class ShuttleCandidateArtifact:
                 or len(declared_range) != 2
                 or any(isinstance(value, bool) for value in declared_range)
             ):
-                raise ValueError("schema-v2 candidates require source_frame_range [start, end]")
+                raise ValueError(
+                    "schema-v2 candidates require source_frame_range [start, end]"
+                )
             frame_start, frame_end = (int(value) for value in declared_range)
             if frame_start < 0 or frame_end < frame_start:
                 raise ValueError("invalid schema-v2 source_frame_range")
@@ -209,6 +233,7 @@ class ShuttleCandidateArtifact:
             metadata,
             frames,
             candidates,
+            frozen_frames,
         )
 
 
@@ -250,15 +275,20 @@ class ShuttleSelectionPlugin:
             if (
                 not isinstance(artifact_image_size, list)
                 or len(artifact_image_size) != 2
-                or tuple(int(value) for value in artifact_image_size) != source.image_size
+                or tuple(int(value) for value in artifact_image_size)
+                != source.image_size
             ):
                 raise ValueError(
                     f"candidate/source image_size mismatch for {source.source_id}: "
                     f"{artifact_image_size} != {list(source.image_size)}"
                 )
-        invalid_frames = [frame for frame in artifact.frames if not 0 <= frame < source.frame_count]
+        invalid_frames = [
+            frame for frame in artifact.frames if not 0 <= frame < source.frame_count
+        ]
         if invalid_frames:
-            raise ValueError(f"candidate frames outside source bounds: {invalid_frames[:3]}")
+            raise ValueError(
+                f"candidate frames outside source bounds: {invalid_frames[:3]}"
+            )
         self._artifacts[source.source_id] = artifact
 
     def _artifact(
@@ -308,7 +338,9 @@ class ShuttleSelectionPlugin:
         if not 0 <= int(frame) < source.frame_count:
             raise ValueError(f"frame outside source bounds: {frame}")
         if candidate_artifact_sha256 != artifact.sha256:
-            raise ValueError("label candidate-artifact SHA-256 does not match the registered artifact")
+            raise ValueError(
+                "label candidate-artifact SHA-256 does not match the registered artifact"
+            )
         if label_kind not in SHUTTLE_LABELS:
             raise ValueError(f"invalid shuttle label kind: {label_kind}")
         if label_kind in LEGACY_SHUTTLE_LABELS:
@@ -356,7 +388,10 @@ class ShuttleSelectionPlugin:
             if not isinstance(pixel_value, (list, tuple)) or len(pixel_value) != 2:
                 return None
             try:
-                return [float(pixel_value[0]) / image_width, float(pixel_value[1]) / image_height]
+                return [
+                    float(pixel_value[0]) / image_width,
+                    float(pixel_value[1]) / image_height,
+                ]
             except (TypeError, ValueError, ZeroDivisionError):
                 return None
 
@@ -372,7 +407,9 @@ class ShuttleSelectionPlugin:
             "center_normalized": normalized("center_normalized", "center"),
         }
 
-    def overlays(self, source: SourceRegistration, frame: int) -> Sequence[Mapping[str, Any]]:
+    def overlays(
+        self, source: SourceRegistration, frame: int
+    ) -> Sequence[Mapping[str, Any]]:
         artifact = self._artifact(source)
         frame = int(frame)
         if frame not in artifact.frames:
@@ -382,7 +419,9 @@ class ShuttleSelectionPlugin:
         return artifact.frames[frame]
 
     @staticmethod
-    def _representative_key(candidate: Mapping[str, Any]) -> tuple[float, float, float, float, str]:
+    def _representative_key(
+        candidate: Mapping[str, Any],
+    ) -> tuple[float, float, float, float, str]:
         return (
             -float(candidate.get("threshold", 0.0)),
             -float(candidate.get("peak_activation", candidate.get("peak_value", 0.0))),
@@ -391,8 +430,18 @@ class ShuttleSelectionPlugin:
             str(candidate.get("candidate_id", "")),
         )
 
-    def annotator_overlays(self, source: SourceRegistration, frame: int) -> Sequence[Mapping[str, Any]]:
+    def annotator_overlays(
+        self, source: SourceRegistration, frame: int
+    ) -> Sequence[Mapping[str, Any]]:
         """Return deterministic non-transitive cross-threshold proposal groups."""
+        artifact = self._artifact(source)
+        if "frozen_candidate_view" in artifact.metadata:
+            try:
+                return artifact.frozen_frames[int(frame)]
+            except KeyError as exc:
+                raise ValueError(
+                    f"frozen artifact has no candidate view for {source.source_id}:{frame}"
+                ) from exc
         return group_shuttle_candidates(self.overlays(source, frame))
 
     def display_overlays(
@@ -404,7 +453,8 @@ class ShuttleSelectionPlugin:
         minimum_threshold: float | None = None,
     ) -> Sequence[Mapping[str, Any]]:
         candidates = tuple(
-            candidate for candidate in self.overlays(source, frame)
+            candidate
+            for candidate in self.overlays(source, frame)
             if minimum_threshold is None
             or float(candidate.get("threshold", 1.0)) >= float(minimum_threshold)
         )
@@ -412,9 +462,18 @@ class ShuttleSelectionPlugin:
             return candidates
         if view != "grouped":
             raise ValueError("candidate view must be 'grouped' or 'raw'")
+        artifact = self._artifact(source)
+        if "frozen_candidate_view" in artifact.metadata:
+            if minimum_threshold is not None:
+                raise ValueError(
+                    "frozen grouped views do not support runtime threshold filtering"
+                )
+            return self.annotator_overlays(source, frame)
         return group_shuttle_candidates(candidates)
 
-    def representative_candidate_id(self, source: SourceRegistration, frame: int, candidate_id: str) -> str:
+    def representative_candidate_id(
+        self, source: SourceRegistration, frame: int, candidate_id: str
+    ) -> str:
         for candidate in self.annotator_overlays(source, frame):
             if candidate_id in candidate.get("grouped_candidate_ids", ()):
                 return str(candidate["candidate_id"])
@@ -442,13 +501,19 @@ class ShuttleSelectionPlugin:
     def image_size(self, source: SourceRegistration) -> tuple[int, int]:
         return source.image_size
 
-    def suggestion(self, source: SourceRegistration, frame: int) -> AnnotationSuggestion | None:
+    def suggestion(
+        self, source: SourceRegistration, frame: int
+    ) -> AnnotationSuggestion | None:
         """Return the frozen legacy TrackNet decision only for verified v2 artifacts."""
         artifact = self._artifact(source)
         metadata = artifact.metadata
-        hashes = (metadata.get("checkpoint_sha256"), metadata.get("inference_model_sha256"))
+        hashes = (
+            metadata.get("checkpoint_sha256"),
+            metadata.get("inference_model_sha256"),
+        )
         valid_hashes = all(
-            isinstance(value, str) and len(value) == 64
+            isinstance(value, str)
+            and len(value) == 64
             and all(char in "0123456789abcdefABCDEF" for char in value)
             for value in hashes
         )
@@ -467,8 +532,12 @@ class ShuttleSelectionPlugin:
         candidates = artifact.frames.get(int(frame))
         if candidates is None:
             return None
-        marked = [item for item in candidates if item.get("legacy_largest_component") is True]
-        threshold_candidates = [item for item in candidates if item.get("threshold") == 0.5]
+        marked = [
+            item for item in candidates if item.get("legacy_largest_component") is True
+        ]
+        threshold_candidates = [
+            item for item in candidates if item.get("threshold") == 0.5
+        ]
         if len(marked) > 1 or any(item.get("threshold") != 0.5 for item in marked):
             return None
         if threshold_candidates and len(marked) != 1:

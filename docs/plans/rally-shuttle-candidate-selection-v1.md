@@ -10,6 +10,21 @@ Defer the InPlay head, TrackNet internal features, full-heatmap storage, trackle
 
 ## Key Changes
 
+### Frozen contract clarifications
+
+- Candidate grouping and retention ranking are executed once, while the frozen
+  candidate artifact is created. Annotation and dataset code consume the
+  artifact's ordered frozen view and must never reconstruct it.
+- The `0 / 30 / 162` dimensions describe only extra per-frame context. Every
+  mode still receives the separate 12-feature candidate stream.
+- An audit label from source X may train the fold evaluated on source Y, but it
+  may be evaluated only with a model trained without source X. Metric
+  compilation rejects predictions whose recorded training, evaluation, and
+  prediction sources do not match the source-disjoint fold manifest.
+- Proposal coverage is reported separately from selector accuracy conditional
+  on a retained target. Dataset manifests preserve each target or masking
+  reason needed to compute both quantities.
+
 ### 1. High-recall proposal extraction
 
 - Introduce `shuttle_candidates` schema v2 while retaining v1 reader compatibility.

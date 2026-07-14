@@ -13,7 +13,7 @@ import cv2
 
 from .core import AnnotationRegistry
 from .dash_app import create_dash_app
-from .events import EventStore
+from .events import AnnotationEvent, EventStore, replay_events
 from .queues import (
     AnnotationQueue,
     build_adaptive_queue,
@@ -99,8 +99,13 @@ def _queues(
     if audit_path.exists():
         audit = AnnotationQueue.read(audit_path)
         validate_queue(registry, audit)
-        if audit.seed != audit_seed or audit.construction.get("anchor_count") != audit_count:
-            raise ValueError("persisted audit queue does not match requested seed/count")
+        if (
+            audit.seed != audit_seed
+            or audit.construction.get("anchor_count") != audit_count
+        ):
+            raise ValueError(
+                "persisted audit queue does not match requested seed/count"
+            )
     else:
         audit = build_uniform_audit_queue(
             registry,
@@ -115,7 +120,9 @@ def _queues(
         if adaptive.construction.get("requested_anchor_count") != adaptive_count:
             raise ValueError("persisted adaptive queue does not match requested count")
         if adaptive.construction.get("audit_queue_id") != audit.queue_id:
-            raise ValueError("persisted adaptive queue references a different audit queue")
+            raise ValueError(
+                "persisted adaptive queue references a different audit queue"
+            )
     else:
         adaptive = build_adaptive_queue(
             registry,
@@ -166,6 +173,8 @@ def _parser() -> argparse.ArgumentParser:
     freeze.add_argument("--report", type=Path, required=True)
     freeze.add_argument("--output-dir", type=Path, required=True)
     freeze.add_argument("--target-recall", type=float, default=0.99)
+    freeze.add_argument("--minimum-cutoff", type=float)
+    freeze.add_argument("--retention-k", type=int)
 
     migrate = subparsers.add_parser("migrate-v1")
     migrate.add_argument("--v1-runtime", type=Path, required=True)
@@ -183,16 +192,36 @@ def main(argv: list[str] | None = None) -> int:
     runtime = args.runtime.expanduser().resolve()
     event_store = EventStore(runtime / "events" / "shuttle.jsonl", registry)
     if args.command == "pilot-report":
-        records = [json.loads(line) for line in args.labels.read_text(encoding="utf-8").splitlines()]
-        labels = [record for record in records if record.get("type") != "metadata"]
+        records = [
+            json.loads(line)
+            for line in args.labels.read_text(encoding="utf-8").splitlines()
+        ]
+        event_records = [
+            record for record in records if record.get("type") != "metadata"
+        ]
+        # Event logs are revision streams, not flat labels.  Reporting on all
+        # revisions would double-count corrected frames.
+        if event_records and "revision_id" in event_records[0]:
+            labels = [
+                event.to_mapping()
+                for event in replay_events(
+                    AnnotationEvent.from_mapping(record) for record in event_records
+                ).active.values()
+            ]
+        else:
+            labels = event_records
         reports = {}
         for source_id, source in registry.sources.items():
-            source_labels = [record for record in labels if record.get("source_id") == source_id]
+            source_labels = [
+                record for record in labels if record.get("source_id") == source_id
+            ]
             reports[source_id] = evaluate_threshold_pilot(
                 source.artifacts["candidates"], source_labels
             )
         combined_rows = []
-        first_rows = next(iter(reports.values()))["threshold_results"] if reports else []
+        first_rows = (
+            next(iter(reports.values()))["threshold_results"] if reports else []
+        )
         for index, first in enumerate(first_rows):
             rows = [report["threshold_results"][index] for report in reports.values()]
             total = sum(int(row["observed_target_frames"]) for row in rows)
@@ -201,6 +230,7 @@ def main(argv: list[str] | None = None) -> int:
                 key: sum(int(row["hits_at_k"][key]) for row in rows)
                 for key in first["hits_at_k"]
             }
+
             def combined_counts(field: str) -> list[int]:
                 return [
                     int(count)
@@ -211,63 +241,156 @@ def main(argv: list[str] | None = None) -> int:
 
             raw_counts = combined_counts("raw_candidate_count_histogram")
             grouped_counts = combined_counts("grouped_candidate_count_histogram")
+
             def summary(values: list[int]) -> dict[str, float | int]:
                 values.sort()
+
                 def percentile(q: float) -> float:
                     if not values:
                         return 0.0
                     position = (len(values) - 1) * q
                     lower, upper = int(position), math.ceil(position)
-                    return values[lower] + (values[upper] - values[lower]) * (position - lower)
-                return {"mean": sum(values) / len(values) if values else 0.0,
-                        "p50": percentile(.5), "p90": percentile(.9),
-                        "p95": percentile(.95), "p99": percentile(.99),
-                        "maximum": max(values, default=0)}
-            combined_rows.append({
-                **first,
-                "observed_target_frames": total,
-                "observed_hits": hits,
-                **{
-                    field: sum(int(row[field]) for row in rows)
-                    for field in (
-                        "selected_label_frames",
-                        "missing_proposal_frames",
-                        "annotated_missing_proposal_frames",
-                        "selected_lost_at_cutoff_frames",
-                        "occluded_inferable_frames",
-                        "no_in_frame_target_frames",
-                        "unsure_frames",
-                        "legacy_no_shuttle_frames",
+                    return values[lower] + (values[upper] - values[lower]) * (
+                        position - lower
                     )
-                },
-                "observed_proposal_recall": hits / total if total else None,
-                "wilson_95": wilson_interval(hits, total),
-                "hits_at_k": hits_at_k,
-                "recall_at_k": {key: value / total if total else None for key, value in hits_at_k.items()},
-                "raw_candidates_per_frame": summary(raw_counts),
-                "grouped_candidates_per_frame": summary(grouped_counts),
-                "source_results": {source_id: rows[position] for position, source_id in enumerate(reports)},
-            })
+
+                return {
+                    "mean": sum(values) / len(values) if values else 0.0,
+                    "p50": percentile(0.5),
+                    "p90": percentile(0.9),
+                    "p95": percentile(0.95),
+                    "p99": percentile(0.99),
+                    "maximum": max(values, default=0),
+                }
+
+            combined_rows.append(
+                {
+                    **first,
+                    "observed_target_frames": total,
+                    "observed_hits": hits,
+                    **{
+                        field: sum(int(row[field]) for row in rows)
+                        for field in (
+                            "selected_label_frames",
+                            "missing_proposal_frames",
+                            "annotated_missing_proposal_frames",
+                            "selected_lost_at_cutoff_frames",
+                            "occluded_inferable_frames",
+                            "no_in_frame_target_frames",
+                            "unsure_frames",
+                            "legacy_no_shuttle_frames",
+                        )
+                    },
+                    "observed_proposal_recall": hits / total if total else None,
+                    "wilson_95": wilson_interval(hits, total),
+                    "hits_at_k": hits_at_k,
+                    "recall_at_k": {
+                        key: value / total if total else None
+                        for key, value in hits_at_k.items()
+                    },
+                    "raw_candidates_per_frame": summary(raw_counts),
+                    "grouped_candidates_per_frame": summary(grouped_counts),
+                    "source_results": {
+                        source_id: rows[position]
+                        for position, source_id in enumerate(reports)
+                    },
+                }
+            )
         output = {
             "schema": "shuttle_threshold_pilot_report",
             "schema_version": 1,
             "sources": reports,
             "threshold_results": combined_rows,
         }
+        queue_reports = {}
+        for kind in ("audit", "adaptive"):
+            queue_path = runtime / "queues" / f"shuttle-{kind}.json"
+            if not queue_path.exists():
+                continue
+            queue = AnnotationQueue.read(queue_path)
+            owned = queue.frame_keys()
+            kind_sources = {}
+            for source_id, source in registry.sources.items():
+                source_labels = [
+                    record
+                    for record in labels
+                    if record.get("source_id") == source_id
+                    and (source_id, int(record["frame"])) in owned
+                ]
+                kind_sources[source_id] = evaluate_threshold_pilot(
+                    source.artifacts["candidates"], source_labels
+                )
+            queue_reports[kind] = {
+                "queue_id": queue.queue_id,
+                "queue_kind": kind,
+                "sources": kind_sources,
+                "label_count": sum(
+                    len(
+                        [
+                            record
+                            for record in labels
+                            if (record.get("source_id"), int(record["frame"])) in owned
+                        ]
+                    )
+                    for _ in [0]
+                ),
+                "threshold_results": [
+                    {
+                        "minimum_cutoff": row["minimum_cutoff"],
+                        "observed_target_frames": sum(
+                            int(
+                                report["threshold_results"][index][
+                                    "observed_target_frames"
+                                ]
+                            )
+                            for report in kind_sources.values()
+                        ),
+                        "observed_hits": sum(
+                            int(report["threshold_results"][index]["observed_hits"])
+                            for report in kind_sources.values()
+                        ),
+                        "source_results": {
+                            source_id: report["threshold_results"][index]
+                            for source_id, report in kind_sources.items()
+                        },
+                    }
+                    for index, row in enumerate(
+                        next(iter(kind_sources.values()))["threshold_results"]
+                        if kind_sources
+                        else ()
+                    )
+                ],
+            }
+            for row in queue_reports[kind]["threshold_results"]:
+                total = row["observed_target_frames"]
+                row["observed_proposal_recall"] = (
+                    row["observed_hits"] / total if total else None
+                )
+                row["wilson_95"] = wilson_interval(row["observed_hits"], total)
+        output["queue_reports"] = queue_reports
         args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(json.dumps(output, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+        args.output.write_text(
+            json.dumps(output, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+        )
         print(args.output)
         return 0
     if args.command == "freeze-pilot":
         report = json.loads(args.report.read_text(encoding="utf-8"))
-        freeze = freeze_threshold_policy(report, args.target_recall)
+        freeze = freeze_threshold_policy(
+            report,
+            args.target_recall,
+            minimum_cutoff=args.minimum_cutoff,
+            retention_k=args.retention_k,
+        )
         args.output_dir.mkdir(parents=True, exist_ok=True)
         for source_id, source in registry.sources.items():
             output = args.output_dir / f"{source_id}-shuttle-candidates-frozen.jsonl"
             filter_pilot_artifact(source.artifacts["candidates"], output, freeze)
             print(output)
         freeze_path = args.output_dir / "threshold-freeze.json"
-        freeze_path.write_text(json.dumps(freeze, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+        freeze_path.write_text(
+            json.dumps(freeze, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+        )
         print(freeze_path)
         return 0
     if args.command == "migrate-v1":
@@ -285,7 +408,9 @@ def main(argv: list[str] | None = None) -> int:
             source_id: source.artifacts["candidates"]
             for source_id, source in pilot_registry.sources.items()
         }
-        result = materialize_final_runtime(args.pilot_runtime, runtime, registry, pilot_artifacts)
+        result = materialize_final_runtime(
+            args.pilot_runtime, runtime, registry, pilot_artifacts
+        )
         print(json.dumps(result, sort_keys=True))
         return 0
     if args.command == "build-queues":
@@ -300,7 +425,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"audit bursts: {len(audit.bursts)}")
         return 0
     if args.command == "export":
-        event_store.export_current(args.output, task=SHUTTLE_TASK, include_unsure=args.include_unsure)
+        event_store.export_current(
+            args.output, task=SHUTTLE_TASK, include_unsure=args.include_unsure
+        )
         print(args.output)
         return 0
     if args.command == "smoke":
@@ -333,7 +460,9 @@ def main(argv: list[str] | None = None) -> int:
     sessions = SessionManager(runtime / "sessions")
     replayed = event_store.replay()
     if args.session_id:
-        session = sessions.load_compatible(args.session_id, args.annotator, selected_queue)
+        session = sessions.load_compatible(
+            args.session_id, args.annotator, selected_queue
+        )
         status = "resumed explicit session"
     elif args.new_session:
         session = sessions.create(args.annotator, selected_queue)
@@ -354,7 +483,9 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         durable = sessions.load(session.session_id)
         print("Annotation server stopped. Durable recovery state:")
-        _print_session_status("saved session", durable, sessions, selected_queue, resume_command)
+        _print_session_status(
+            "saved session", durable, sessions, selected_queue, resume_command
+        )
     return 0
 
 
@@ -403,7 +534,9 @@ def _print_session_status(
     target = sessions.current(state, queue)
     current = "complete" if target is None else f"{target[0].source_id}:{target[1]}"
     print(f"Session: {state.session_id} ({status})")
-    print(f"Queue position: {position + (0 if target is None else 1)}/{sessions.queue_length(queue)}")
+    print(
+        f"Queue position: {position + (0 if target is None else 1)}/{sessions.queue_length(queue)}"
+    )
     print(f"Current frame: {current}")
     print(f"Resume command: {resume_command}")
 
