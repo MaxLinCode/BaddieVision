@@ -116,6 +116,8 @@ def test_candidate_collection_keeps_all_components_and_empty_frames(tmp_path: Pa
     assert frame["candidates"][0]["total_activation_normalized"] == pytest.approx(1.6 / 32)
     assert frame["candidates"][1]["legacy_largest_component"] is True
     assert empty == {"type": "frame", "frame": 3, "candidates": []}
+    with pytest.raises(FileExistsError, match="non-overwriting output path"):
+        collector.write(output)
 
 
 def test_multi_threshold_boundaries_connectivity_and_ids_are_stable(tmp_path: Path) -> None:
@@ -132,7 +134,7 @@ def test_multi_threshold_boundaries_connectivity_and_ids_are_stable(tmp_path: Pa
     diagonal[0, 0] = diagonal[1, 1] = 0.9
     all_thresholds = _collector(image_size=(30, 30), heatmap_size=(3, 3), fps=30)
     all_thresholds.add(4, diagonal)
-    assert len(all_thresholds._frames[4]) == 4
+    assert len(all_thresholds._frames[4]) == 7
     assert all(item["area"] == 2 for item in all_thresholds._frames[4])
     single_threshold = _collector(
         image_size=(30, 30), heatmap_size=(3, 3), fps=30, threshold=0.5,
@@ -300,7 +302,7 @@ def test_v1_reader_and_v2_legacy_link_view_avoid_threshold_duplicates(tmp_path: 
     link_shuttle_hypotheses(candidates_path, tracklets_path, hypotheses_path)
     _, *hypotheses = _records(hypotheses_path)
     assert hypotheses[0]["candidate_ids"] == linked_ids
-    assert len(_load_shuttle_evidence(candidates_path, tracklets_path)[0]) == 4
+    assert len(_load_shuttle_evidence(candidates_path, tracklets_path)[0]) == 7
     assert _load_rank_one_hypothesis_segments(candidates_path, hypotheses_path)[1]
 
 
@@ -324,11 +326,11 @@ def test_exact_candidate_retention_recall_uses_present_denominator(tmp_path: Pat
     assert report["missing_proposal_frames"] == 1
     assert report["no_shuttle_frames"] == 1
     assert report["recall_at_k"] == {
-        "1": 0.0, "2": 0.0, "3": 0.5, "5": 0.5,
+        "1": 0.0, "2": 0.0, "3": 0.0, "5": 0.0,
         "8": 0.5, "12": 0.5, "all": 0.5,
     }
-    assert report["candidates_per_frame"] == pytest.approx(4 / 3)
-    assert report["maximum_candidates_per_frame"] == 4
+    assert report["candidates_per_frame"] == pytest.approx(7 / 3)
+    assert report["maximum_candidates_per_frame"] == 7
 
 
 def test_notebooks_forward_tracknet_model_provenance() -> None:
@@ -336,8 +338,10 @@ def test_notebooks_forward_tracknet_model_provenance() -> None:
     for variant in ("Local", "Colab", "Kaggle"):
         notebook = json.loads((notebook_dir / f"Single_Video_Feature_Extraction_{variant}.ipynb").read_text(encoding="utf-8"))
         source = "".join(line for cell in notebook["cells"] for line in cell.get("source", []))
-        assert '"tracknet_model": models["tracknet_model"]' in source
-        assert '"tracknet_checkpoint": models["tracknet_checkpoint"]' in source
+        # The complete conditional bundle carries TrackNet provenance through
+        # the same reuse path and includes InpaintNet only on explicit opt-in.
+        assert "models = load_track_models(REPO_DIR, use_inpaintnet=USE_INPAINTNET)" in source
+        assert "reuse_models=models" in source
     predict_source = (Path(__file__).parents[1] / "src" / "TrackNetV3" / "predictArgs.py").read_text(encoding="utf-8")
     assert "CAP_PROP_FRAME_COUNT" in predict_source
     assert "source_frame_range=candidate_source_range" in predict_source

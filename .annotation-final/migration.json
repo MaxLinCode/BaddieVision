@@ -1,0 +1,12 @@
+{
+  "derived_missing_proposal_count": 1,
+  "final_artifact_hashes": {
+    "malaysia_max_30s_to_120s": "89b7dab252b6ea26eb618451a00362a033dcc6211ccc93d98c97657d52832b1a",
+    "max_vs_nik_30s_to_120s": "cc6272da4f474b58431906d26bb7e0928da1f8f08dc442a7333adf333b30961c"
+  },
+  "grouping_version": "peak-contained-high-to-low-v1",
+  "kind": "threshold_pilot_to_final",
+  "pilot_event_log_sha256": "206cb6559d265b9a8117190b0bb18bf30696379d1e2a57bdd9deb4407e4470a3",
+  "pilot_revision_count": 949,
+  "pilot_runtime": "/Users/maxlin/Code/BaddieVision/.annotation-pilot"
+}

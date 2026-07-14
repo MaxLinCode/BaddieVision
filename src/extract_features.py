@@ -27,9 +27,9 @@ annotated_out_dir.mkdir(parents=True, exist_ok=True)
 print(f"[Before model] Allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
 print(f"[Before model] Reserved:  {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
 
-# TrackNet Checkpoint Paths
+# TrackNet checkpoint path. InpaintNet remains available through the explicit
+# ``inpaintnet_file``/``reuse_models`` opt-in in TrackNetV3.predictArgs.
 tracknet_file = PROJECT_ROOT / "src" / "TrackNetV3" / "ckpts" / "TrackNet_best.pt"
-inpaintnet_file = PROJECT_ROOT / "src" / "TrackNetV3" / "ckpts" / "InpaintNet_best.pt"
 
 # Load TrackNet checkpoint to CPU
 tracknet_ckpt = torch.load(tracknet_file, map_location=torch.device('cpu'))
@@ -38,13 +38,6 @@ bg_mode = tracknet_ckpt['param_dict']['bg_mode']
 
 # Load TrackNet TorchScript model
 tracknet = load_torchscript_model(str(PROJECT_ROOT / "models" / "TrackNet_torchscript.pt"))
-
-# Load InpaintNet checkpoint to CPU
-inpaintnet_ckpt = torch.load(inpaintnet_file, map_location=torch.device('cpu'))
-inpaintnet_seq_len = inpaintnet_ckpt['param_dict']['seq_len']
-
-# Load InpaintNet TorchScript model
-inpaintnet = load_torchscript_model(str(PROJECT_ROOT / "models" / "InpaintNet_torchscript.pt"))
 
 # Clear GPU cache after loading models
 torch.cuda.empty_cache()
@@ -55,9 +48,7 @@ print(f"[After model] Reserved:  {torch.cuda.memory_reserved() / 1024**2:.2f} MB
 # Prepare reusable models dict
 reuse_models = {
     'tracknet': tracknet,
-    'inpaintnet': inpaintnet,
     'tracknet_seq_len': tracknet_seq_len,
-    'inpaintnet_seq_len': inpaintnet_seq_len,
     'bg_mode': bg_mode
 }
 
