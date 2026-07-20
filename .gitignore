@@ -70,3 +70,7 @@ runs/
 # Portable data packages for Colab/Kaggle/Drive
 data_packages/*.zip
 .annotation/
+.annotation-*/
+config/sources.local.json
+config/selector-experiment.generated.json
+config/selector-experiment.generated-loso-manifest.json

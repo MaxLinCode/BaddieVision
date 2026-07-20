@@ -194,6 +194,24 @@ python InPlay/extract_combined_features.py
 python InPlay/train_lstm_model.py
 ```
 
+The maintained joint experiment predicts strict rally state and publishes
+shuttle selections only inside decoded rallies. After labeling fingerprinted
+rally intervals and completing the refill queue documented in
+[`docs/annotation-platform.md`](docs/annotation-platform.md), set
+`dataset.rally_intervals_path` and `dataset.rally_manifest_path` in the selector
+experiment config and run:
+
+```bash
+python3 -m src.temporal_selector.experiment \
+  --config config/selector-experiment.local.json \
+  --output-dir outputs/joint-selector-run \
+  --context-mode full_context
+```
+
+Joint runs write per-frame `rally_shuttle_predictions.jsonl` and strict
+`rallies.csv`. Frames outside decoded rallies have shuttle outcome
+`not_required`; clip padding remains an exporter concern.
+
 Train the YOLO shuttle detector:
 
 ```bash

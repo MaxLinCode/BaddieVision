@@ -17,9 +17,12 @@ from .events import AnnotationEvent, EventStore, replay_events
 from .queues import (
     AnnotationQueue,
     build_adaptive_queue,
+    build_rally_audit_extension_queue,
+    build_rally_refill_queue,
     build_uniform_audit_queue,
     validate_queue,
 )
+from src.temporal_selector.rally_intervals import read_rally_intervals
 from .pilot import (
     evaluate_threshold_pilot,
     filter_pilot_artifact,
@@ -145,9 +148,24 @@ def _parser() -> argparse.ArgumentParser:
     queue.add_argument("--audit-count", type=int, default=10)
     queue.add_argument("--adaptive-count", type=int, default=20)
 
+    refill = subparsers.add_parser("build-rally-refill")
+    refill.add_argument("--intervals", type=Path, required=True)
+    refill.add_argument("--interval-manifest", type=Path, required=True)
+
+    rally_audit = subparsers.add_parser("build-rally-audit")
+    rally_audit.add_argument("--intervals", type=Path, required=True)
+    rally_audit.add_argument("--interval-manifest", type=Path, required=True)
+    rally_audit.add_argument("--audit-seed", type=int, default=1729)
+    rally_audit.add_argument("--audit-count", type=int, default=10)
+    rally_audit.add_argument("--adaptive-count", type=int, default=20)
+
     serve = subparsers.add_parser("serve")
     serve.add_argument("--annotator", required=True)
-    serve.add_argument("--queue", choices=("adaptive", "audit"), default="adaptive")
+    serve.add_argument(
+        "--queue",
+        choices=("adaptive", "audit", "rally-audit", "refill"),
+        default="adaptive",
+    )
     serve.add_argument("--audit-seed", type=int, default=1729)
     serve.add_argument("--audit-count", type=int, default=10)
     serve.add_argument("--adaptive-count", type=int, default=20)
@@ -424,6 +442,61 @@ def main(argv: list[str] | None = None) -> int:
         print(f"adaptive bursts: {len(adaptive.bursts)}")
         print(f"audit bursts: {len(audit.bursts)}")
         return 0
+    if args.command == "build-rally-refill":
+        rally_index = read_rally_intervals(
+            args.intervals.expanduser().resolve(),
+            args.interval_manifest.expanduser().resolve(),
+        )
+        reserved_frames: set[tuple[str, int]] = set()
+        for name in ("shuttle-audit.json", "shuttle-rally-audit.json"):
+            queue_path = runtime / "queues" / name
+            if queue_path.exists():
+                reserved_frames.update(AnnotationQueue.read(queue_path).frame_keys())
+        queue = build_rally_refill_queue(
+            registry,
+            SHUTTLE_TASK,
+            rally_index,
+            already_labeled={
+                (source_id, frame)
+                for task, source_id, frame in event_store.replay().active
+                if task == SHUTTLE_TASK
+            },
+            excluded_frames=reserved_frames,
+        )
+        output = runtime / "queues" / "shuttle-refill.json"
+        queue.write(output, immutable=True)
+        print(f"refill bursts: {len(queue.bursts)} -> {output}")
+        return 0
+    if args.command == "build-rally-audit":
+        rally_index = read_rally_intervals(
+            args.intervals.expanduser().resolve(),
+            args.interval_manifest.expanduser().resolve(),
+        )
+        adaptive, audit = _queues(
+            registry,
+            runtime,
+            audit_seed=args.audit_seed,
+            audit_count=args.audit_count,
+            adaptive_count=args.adaptive_count,
+        )
+        active_frames = {
+            (source_id, frame)
+            for task, source_id, frame in event_store.replay().active
+            if task == SHUTTLE_TASK
+        }
+        queue = build_rally_audit_extension_queue(
+            registry,
+            SHUTTLE_TASK,
+            rally_index,
+            existing_audit_frames=audit.frame_keys(),
+            excluded_frames=(
+                adaptive.frame_keys() | audit.frame_keys() | active_frames
+            ),
+        )
+        output = runtime / "queues" / "shuttle-rally-audit.json"
+        queue.write(output, immutable=True)
+        print(f"rally audit bursts: {len(queue.bursts)} -> {output}")
+        return 0
     if args.command == "export":
         event_store.export_current(
             args.output, task=SHUTTLE_TASK, include_unsure=args.include_unsure
@@ -449,14 +522,26 @@ def main(argv: list[str] | None = None) -> int:
                 f"{len(view.center_candidates)} center candidates -> {output}"
             )
         return 0
-    adaptive, audit = _queues(
-        registry,
-        runtime,
-        audit_seed=args.audit_seed,
-        audit_count=args.audit_count,
-        adaptive_count=args.adaptive_count,
-    )
-    selected_queue = adaptive if args.queue == "adaptive" else audit
+    if args.queue in {"refill", "rally-audit"}:
+        selected_queue = AnnotationQueue.read(
+            runtime
+            / "queues"
+            / (
+                "shuttle-refill.json"
+                if args.queue == "refill"
+                else "shuttle-rally-audit.json"
+            )
+        )
+        validate_queue(registry, selected_queue)
+    else:
+        adaptive, audit = _queues(
+            registry,
+            runtime,
+            audit_seed=args.audit_seed,
+            audit_count=args.audit_count,
+            adaptive_count=args.adaptive_count,
+        )
+        selected_queue = adaptive if args.queue == "adaptive" else audit
     sessions = SessionManager(runtime / "sessions")
     replayed = event_store.replay()
     if args.session_id:

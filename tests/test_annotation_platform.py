@@ -16,12 +16,20 @@ from src.annotation_platform import (
     LabelOption,
     ShuttleSelectionPlugin,
     build_adaptive_queue,
+    build_rally_audit_extension_queue,
+    build_rally_refill_queue,
     build_playback_view,
     build_uniform_audit_queue,
     draw_candidates,
     native_fps_burst,
     render_center_frame,
     replay_events,
+    validate_queue,
+)
+from src.temporal_selector.rally_intervals import (
+    RallyInterval,
+    RallyIntervalIndex,
+    RallySourceManifest,
 )
 from src.annotation_platform.__main__ import _parser, _print_session_status, _queues
 from src.annotation_platform.dash_app import (
@@ -172,6 +180,41 @@ def test_general_registry_accepts_a_second_task_plugin(tmp_path: Path) -> None:
     assert resolved is plugin
     assert source.image_size == (16, 12)
     assert resolved.overlays(source, 3) == ()
+
+
+def test_rally_refill_and_audit_extension_queues(tmp_path: Path) -> None:
+    registry, _, _, _ = _registry(tmp_path, frame_count=20, fps=4.0)
+    source = registry.sources["match"]
+    source_manifest = RallySourceManifest(
+        "match", source.video_sha256, source.fps, source.frame_count
+    )
+    rally_index = RallyIntervalIndex(
+        (RallyInterval("match", "match-0001", 4, 15),),
+        {"match": source_manifest},
+        "c" * 64,
+        "revision",
+    )
+    audit = build_rally_audit_extension_queue(
+        registry,
+        "shuttle_selection",
+        rally_index,
+        existing_audit_frames=set(),
+        excluded_frames=set(),
+    )
+    assert audit.kind == "audit"
+    validate_queue(registry, audit)
+    refill = build_rally_refill_queue(
+        registry,
+        "shuttle_selection",
+        rally_index,
+        already_labeled={("match", 4), ("match", 15)},
+        excluded_frames=audit.frame_keys(),
+    )
+    assert refill.kind == "refill"
+    assert ("match", 4) not in refill.frame_keys()
+    assert ("match", 15) not in refill.frame_keys()
+    assert audit.frame_keys().isdisjoint(refill.frame_keys())
+    validate_queue(registry, refill)
 
 
 @pytest.mark.parametrize("schema_version", [1, 2])

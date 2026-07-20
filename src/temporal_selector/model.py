@@ -24,6 +24,16 @@ class SelectorOutput:
     candidate_logits: Tensor
     null_logits: Tensor
     encoded: EncodedSelectorBatch
+    inplay_logits: Tensor | None = None
+
+
+@dataclass
+class JointLosses:
+    total: Tensor
+    selection: Tensor
+    inplay: Tensor
+    selection_frames: int
+    inplay_frames: int
 
 
 class _InputEncoder(nn.Module):
@@ -162,6 +172,15 @@ class NullSelectionHead(nn.Module):
         return self.projection(tokens).squeeze(-1)
 
 
+class InPlayHead(nn.Module):
+    def __init__(self, token_size: int) -> None:
+        super().__init__()
+        self.projection = nn.Linear(token_size, 1)
+
+    def forward(self, tokens: Tensor) -> Tensor:
+        return self.projection(tokens).squeeze(-1)
+
+
 class TemporalShuttleSelector(nn.Module):
     """Selector wrapper keeping reusable encoding separate from both heads."""
 
@@ -212,3 +231,75 @@ class TemporalShuttleSelector(nn.Module):
         finite_candidates = output.candidate_logits.masked_fill(~batch.candidate_mask, 0.0)
         finite_nulls = output.null_logits.masked_fill(~batch.frame_mask, 0.0)
         return (finite_candidates.sum() + finite_nulls.sum()) * 0.0
+
+    def joint_losses(
+        self,
+        batch: SelectorBatch,
+        output: SelectorOutput | None = None,
+        *,
+        inplay_pos_weight: Tensor | None = None,
+        selection_weight: float = 1.0,
+        inplay_weight: float = 1.0,
+    ) -> JointLosses:
+        """Return independently normalized selection and binary rally losses."""
+        if batch.inplay_targets is None:
+            raise ValueError("joint training requires inplay_targets")
+        output = output or self(batch)
+        if output.inplay_logits is None:
+            raise ValueError("joint model output is missing inplay_logits")
+        selection = TemporalShuttleSelector.loss(self, batch, output)
+        supervised = batch.frame_mask & (batch.inplay_targets != MASKED_TARGET)
+        inplay_frames = int(supervised.sum())
+        if inplay_frames:
+            inplay = F.binary_cross_entropy_with_logits(
+                output.inplay_logits[supervised],
+                batch.inplay_targets[supervised].to(output.inplay_logits.dtype),
+                pos_weight=inplay_pos_weight,
+            )
+        else:
+            inplay = output.inplay_logits.masked_fill(~batch.frame_mask, 0.0).sum() * 0.0
+        selection_frames = int(
+            (batch.frame_mask & (batch.targets != MASKED_TARGET)).sum()
+        )
+        total = selection * float(selection_weight) + inplay * float(inplay_weight)
+        return JointLosses(total, selection, inplay, selection_frames, inplay_frames)
+
+
+class JointRallyShuttleModel(TemporalShuttleSelector):
+    """Joint binary rally-state and conditional shuttle-selection model."""
+
+    def __init__(self, config: SelectorConfig | None = None) -> None:
+        super().__init__(config)
+        self.inplay_head = InPlayHead(self.config.token_size)
+
+    def forward(self, batch: SelectorBatch) -> SelectorOutput:
+        output = super().forward(batch)
+        frame_tokens = self._gather(
+            output.encoded.tokens, output.encoded.frame_token_indices
+        )
+        inplay_logits = self.inplay_head(frame_tokens).masked_fill(
+            output.encoded.frame_token_indices < 0, float("-inf")
+        )
+        return SelectorOutput(
+            output.candidate_logits,
+            output.null_logits,
+            output.encoded,
+            inplay_logits,
+        )
+
+    def loss(
+        self,
+        batch: SelectorBatch,
+        output: SelectorOutput | None = None,
+        *,
+        inplay_pos_weight: Tensor | None = None,
+        selection_weight: float = 1.0,
+        inplay_weight: float = 1.0,
+    ) -> Tensor:
+        return self.joint_losses(
+            batch,
+            output,
+            inplay_pos_weight=inplay_pos_weight,
+            selection_weight=selection_weight,
+            inplay_weight=inplay_weight,
+        ).total

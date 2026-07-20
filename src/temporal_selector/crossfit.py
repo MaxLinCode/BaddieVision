@@ -1,4 +1,4 @@
-"""Source-disjoint two-fold manifests and out-of-source prediction checks."""
+"""Source-disjoint crossfit manifests and out-of-source prediction checks."""
 
 from __future__ import annotations
 
@@ -51,6 +51,28 @@ def build_two_source_crossfit(
     return CrossFitManifest(int(seed), folds, fingerprint)
 
 
+def build_leave_one_source_out(
+    source_ids: Sequence[str], *, seed: int = 1729
+) -> CrossFitManifest:
+    """Build deterministic folds holding out exactly one complete source each."""
+    sources = tuple(dict.fromkeys(map(str, source_ids)))
+    if len(sources) < 2:
+        raise ValueError("leave-one-source-out requires at least two unique sources")
+    folds = tuple(
+        CrossFitFold(
+            chr(ord("A") + index),
+            tuple(source for source in sources if source != held_out),
+            (held_out,),
+        )
+        for index, held_out in enumerate(sources)
+    )
+    payload = {"seed": int(seed), "folds": [vars(fold) for fold in folds]}
+    fingerprint = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return CrossFitManifest(int(seed), folds, fingerprint)
+
+
 def validate_out_of_source_predictions(
     manifest: CrossFitManifest, predictions: Iterable[Mapping[str, Any]]
 ) -> None:
@@ -69,7 +91,7 @@ def validate_out_of_source_predictions(
             or evaluation_sources != fold.evaluation_source_ids
             or source not in fold.evaluation_source_ids
             or source in fold.training_source_ids
-            or label_queue not in {"audit", "adaptive"}
+            or label_queue not in {"audit", "adaptive", "refill", "dense"}
         ):
             raise ValueError("prediction is not out-of-source for its cross-fit fold")
 

@@ -29,6 +29,7 @@ class SelectorBatch:
     frame_mask: Tensor
     relative_time_seconds: Tensor
     targets: Tensor
+    inplay_targets: Tensor | None = None
 
     def validate(self, *, candidate_feature_dim: int = 12, frame_feature_dim: int | None = None) -> "SelectorBatch":
         cv, fv = self.candidate_values, self.frame_values
@@ -57,11 +58,28 @@ class SelectorBatch:
             raise ValueError("relative_time_seconds must have shape [batch, frames]")
         if self.targets.shape != expected_frames or self.targets.dtype not in (torch.int32, torch.int64):
             raise ValueError("targets must be an integer tensor with shape [batch, frames]")
+        if self.inplay_targets is not None:
+            if self.inplay_targets.shape != expected_frames or self.inplay_targets.dtype not in (
+                torch.int32,
+                torch.int64,
+            ):
+                raise ValueError(
+                    "inplay_targets must be an integer tensor with shape [batch, frames]"
+                )
+            allowed = (
+                (self.inplay_targets == MASKED_TARGET)
+                | (self.inplay_targets == 0)
+                | (self.inplay_targets == 1)
+            )
+            if not bool(torch.all(allowed)):
+                raise ValueError("inplay_targets must contain only -100, 0, or 1")
         tensors = (
             self.candidate_validity, self.candidate_frame_indices, self.candidate_mask,
             self.frame_values, self.frame_validity, self.frame_mask,
             self.relative_time_seconds, self.targets,
         )
+        if self.inplay_targets is not None:
+            tensors = (*tensors, self.inplay_targets)
         if any(t.device != cv.device for t in tensors):
             raise ValueError("all SelectorBatch tensors must be on the same device")
         if not torch.isfinite(cv[self.candidate_mask]).all():
@@ -87,6 +105,10 @@ class SelectorBatch:
                     raise ValueError("a real candidate references padding or a nonexistent frame")
             if torch.any(self.targets[batch_index, ~real_frames] != MASKED_TARGET):
                 raise ValueError("padding frames must use target -100")
+            if self.inplay_targets is not None and torch.any(
+                self.inplay_targets[batch_index, ~real_frames] != MASKED_TARGET
+            ):
+                raise ValueError("padding frames must use InPlay target -100")
             for frame_index in torch.nonzero(real_frames, as_tuple=False).flatten().tolist():
                 target = int(self.targets[batch_index, frame_index])
                 if target < MASKED_TARGET or target not in (MASKED_TARGET, NULL_TARGET) and target < 0:
@@ -102,4 +124,9 @@ class SelectorBatch:
         return self
 
     def to(self, device: torch.device | str) -> "SelectorBatch":
-        return SelectorBatch(**{name: value.to(device) for name, value in vars(self).items()})
+        return SelectorBatch(
+            **{
+                name: value.to(device) if value is not None else None
+                for name, value in vars(self).items()
+            }
+        )

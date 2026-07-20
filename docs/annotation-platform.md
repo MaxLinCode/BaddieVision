@@ -139,6 +139,38 @@ python3 -m src.annotation_platform --config config/annotation-sources.local.json
   --output .annotation/exports/shuttle-labels.jsonl
 ```
 
+Strict rally annotation and targeted refill reuse the existing shuttle events:
+
+```bash
+python3 -m InPlay.heuristic.label_intervals \
+  --video outputs/MATCH/MATCH_input.mp4 --source-id MATCH \
+  --output .annotation-final/rallies.csv \
+  --manifest .annotation-final/rallies.manifest.json
+
+python3 -m src.annotation_platform --config config/annotation-sources.local.json \
+  --runtime .annotation-final build-rally-audit \
+  --intervals .annotation-final/rallies.csv \
+  --interval-manifest .annotation-final/rallies.manifest.json
+
+python3 -m src.annotation_platform --config config/annotation-sources.local.json \
+  --runtime .annotation-final build-rally-refill \
+  --intervals .annotation-final/rallies.csv \
+  --interval-manifest .annotation-final/rallies.manifest.json
+
+python3 -m src.annotation_platform --config config/annotation-sources.local.json \
+  --runtime .annotation-final serve --annotator NAME --queue refill
+```
+
+The interval writer replaces only the named source and preserves other sources
+already present in the fingerprinted CSV/manifest pair. `refill` excludes every
+frame with an active shuttle revision and is immutable once written. The rally
+audit extension adds one uncontaminated midpoint-nearest burst only to rallies
+without existing uniform-audit coverage; serve it with `--queue rally-audit`.
+After both queues are complete, add `shuttle-rally-audit.json` and
+`shuttle-refill.json` to the experiment config's `queue_paths` so metrics retain
+their audit/refill provenance. The dense joint dataset reads all active events
+even when a frame is not owned by an original queue.
+
 Labels are immutable JSONL revisions. Corrections supersede the current
 frame revision, while undo appends another revision and restores the preceding
 label. If a process leaves a partial final JSON object, replay ignores that

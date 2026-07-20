@@ -1,6 +1,7 @@
 import pytest
 
 from src.temporal_selector import (
+    build_leave_one_source_out,
     build_two_source_crossfit,
     partition_metrics_by_queue,
     validate_out_of_source_predictions,
@@ -76,3 +77,13 @@ def test_audit_metric_compilation_rejects_in_source_or_manifest_drift(field, val
 def test_crossfit_requires_exactly_two_sources():
     with pytest.raises(ValueError, match="exactly two"):
         build_two_source_crossfit(("only-one",))
+
+
+def test_leave_one_source_out_holds_out_each_source_once():
+    manifest = build_leave_one_source_out(("one", "two", "three"), seed=71)
+    assert [fold.evaluation_source_ids for fold in manifest.folds] == [
+        ("one",), ("two",), ("three",)
+    ]
+    assert [fold.training_source_ids for fold in manifest.folds] == [
+        ("two", "three"), ("one", "three"), ("one", "two")
+    ]
