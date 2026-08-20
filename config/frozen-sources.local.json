@@ -9,6 +9,11 @@
       "source_id": "max_vs_nik_30s_to_120s",
       "video_path": "../outputs/max_vs_nik_30s_to_120s/max_vs_nik_30s_to_120s_input.mp4",
       "candidates_path": "../outputs/frozen/max_vs_nik_30s_to_120s-shuttle-candidates-frozen.jsonl"
+    },
+    {
+      "source_id": "max_vs_nik_120s_to_ends",
+      "video_path": "../outputs/max_vs_nik_120s_to_ends/max_vs_nik_120s_to_ends_input.mp4",
+      "candidates_path": "../outputs/max_vs_nik_120s_to_ends/shuttle_candidates_frozen.jsonl"
     }
   ]
 }

@@ -6,15 +6,7 @@
       "source_id": "match-a-static-camera",
       "enabled": true,
       "video_path": "../outputs/match-a-static-camera/match-a-static-camera_input.mp4",
-      "video_sha256": null,
-      "output_dir": "../outputs/match-a-static-camera",
-      "artifacts": {
-        "candidates": "../outputs/match-a-static-camera/shuttle_candidates_pilot.jsonl",
-        "frozen_candidates": "../outputs/match-a-static-camera/shuttle_candidates_frozen.jsonl",
-        "assignments": "../outputs/match-a-static-camera/player_assignments.jsonl",
-        "pose_cache": "../outputs/match-a-static-camera/pose_cache.jsonl",
-        "calibration": "../features/court/match-a-static-camera.json"
-      }
+      "artifact_root": "../outputs/match-a-static-camera"
     }
   ]
 }

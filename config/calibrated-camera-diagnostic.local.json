@@ -1,0 +1,62 @@
+{
+  "schema": "temporal_selector_experiment_config",
+  "schema_version": 1,
+  "seed": 1729,
+  "crossfit_manifest_path": "calibrated-camera-diagnostic.local-loso-manifest.json",
+  "dataset": {
+    "minimum_cutoff": 0.05,
+    "retention_k": 8,
+    "pose_visibility_threshold": 0.5,
+    "expected_annotation_sha256": "8c19f8d7cebc458fcd1b1138fd503231c9a3f3bea551e807e07e8beb5792c4d5",
+    "annotations_path": "../.annotation-final/events/shuttle.jsonl",
+    "rally_intervals_path": "../.annotation-final/rallies.csv",
+    "rally_manifest_path": "../.annotation-final/rallies.manifest.json",
+    "queue_paths": [
+      "../.annotation-final/queues/shuttle-adaptive.json",
+      "../.annotation-final/queues/shuttle-audit.json",
+      "../.annotation-final/queues/shuttle-refill.json"
+    ],
+    "sources": [
+      {
+        "source_id": "malaysia_max_30s_to_120s",
+        "video_path": "../outputs/malaysia_max_30s_to_120s/malaysia_max_30s_to_120s_input.mp4",
+        "candidates_path": "../outputs/malaysia_max_30s_to_120s/shuttle/candidates.frozen.jsonl",
+        "assignments_path": "../outputs/malaysia_max_30s_to_120s/players/assignments.jsonl",
+        "pose_cache_path": "../outputs/malaysia_max_30s_to_120s/players/poses.jsonl",
+        "calibration_path": "../outputs/malaysia_max_30s_to_120s/court/calibration.json"
+      },
+      {
+        "source_id": "malaysia_max_390s_to_ends",
+        "video_path": "../outputs/malaysia_max_390s_to_ends/malaysia_max_390s_to_ends_input.mp4",
+        "candidates_path": "../outputs/malaysia_max_390s_to_ends/shuttle/candidates.frozen.jsonl",
+        "assignments_path": "../outputs/malaysia_max_390s_to_ends/players/assignments.jsonl",
+        "pose_cache_path": "../outputs/malaysia_max_390s_to_ends/players/poses.jsonl",
+        "calibration_path": "../outputs/malaysia_max_390s_to_ends/court/calibration.json"
+      },
+      {
+        "source_id": "max_vs_nik_30s_to_120s",
+        "video_path": "../outputs/max_vs_nik_30s_to_120s/max_vs_nik_30s_to_120s_input.mp4",
+        "candidates_path": "../outputs/max_vs_nik_30s_to_120s/shuttle/candidates.frozen.jsonl",
+        "assignments_path": "../outputs/max_vs_nik_30s_to_120s/players/assignments.jsonl",
+        "pose_cache_path": "../outputs/max_vs_nik_30s_to_120s/players/poses.jsonl",
+        "calibration_path": "../outputs/max_vs_nik_30s_to_120s/court/calibration.json"
+      },
+      {
+        "source_id": "max_vs_nik_120s_to_ends",
+        "video_path": "../outputs/max_vs_nik_120s_to_ends/max_vs_nik_120s_to_ends_input.mp4",
+        "candidates_path": "../outputs/max_vs_nik_120s_to_ends/shuttle/candidates.frozen.jsonl",
+        "assignments_path": "../outputs/max_vs_nik_120s_to_ends/players/assignments.jsonl",
+        "pose_cache_path": "../outputs/max_vs_nik_120s_to_ends/players/poses.jsonl",
+        "calibration_path": "../outputs/max_vs_nik_120s_to_ends/court/calibration.json"
+      },
+      {
+        "source_id": "ff_bothell-seg3",
+        "video_path": "../outputs/ff_bothell-seg3/ff_bothell-seg3_input.mp4",
+        "candidates_path": "../outputs/ff_bothell-seg3/shuttle/candidates.frozen.jsonl",
+        "assignments_path": "../outputs/ff_bothell-seg3/players/assignments.jsonl",
+        "pose_cache_path": "../outputs/ff_bothell-seg3/players/poses.jsonl",
+        "calibration_path": "../outputs/ff_bothell-seg3/court/calibration.json"
+      }
+    ]
+  }
+}

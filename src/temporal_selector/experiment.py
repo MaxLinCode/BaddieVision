@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import math
 import random
+import warnings
+from collections import Counter
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -14,7 +17,7 @@ from typing import Any, Iterable, Mapping, Sequence
 import numpy as np
 import torch
 from torch.nn import functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 from InPlay.heuristic.evaluate import Interval, evaluate as evaluate_intervals
 
 from .batch import MASKED_TARGET, NULL_TARGET, SelectorBatch
@@ -22,8 +25,6 @@ from .config import ContextMode, SelectorConfig
 from .crossfit import (
     CrossFitFold,
     CrossFitManifest,
-    build_leave_one_source_out,
-    build_two_source_crossfit,
     validate_out_of_source_predictions,
 )
 from .dataset import (
@@ -32,6 +33,7 @@ from .dataset import (
     SelectorSourceConfig,
     SelectorWindow,
     SelectorWindowDataset,
+    PoseCoordinateMode,
     collate_selector_windows,
 )
 from .joint_inference import (
@@ -41,7 +43,7 @@ from .joint_inference import (
     decoded_intervals,
     write_joint_artifacts,
 )
-from .model import JointRallyShuttleModel, TemporalShuttleSelector
+from .model import JointRallyShuttleModel, SelectorOutput, TemporalShuttleSelector
 
 NULL_SELECTION = "NULL_SELECTION"
 NOT_REQUIRED = "not_required"
@@ -54,6 +56,15 @@ def select_device() -> torch.device:
         return torch.device("cuda")
     if torch.backends.mps.is_available():
         return torch.device("mps")
+    if torch.backends.mps.is_built():
+        warnings.warn(
+            "PyTorch was built with MPS support, but MPS is unavailable; "
+            "training will use CPU. Verify that an MPS tensor can be allocated "
+            "outside any sandbox that may hide Metal before running a long "
+            "experiment.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     return torch.device("cpu")
 
 
@@ -383,31 +394,133 @@ def _apply_candidate_dropout(
     candidate_frames[dropped] = -1
     selection_targets = batch.targets.clone()
     selection_targets[dropped] = MASKED_TARGET
+    # The incoming batch has already been validated by collation. These mask
+    # updates preserve its shape and target invariants, so validating again
+    # here would only repeat data-dependent device synchronizations before the
+    # model performs its own boundary validation.
     return replace(
         batch,
         candidate_mask=candidate_mask,
         candidate_frame_indices=candidate_frames,
         targets=selection_targets,
-    ).validate(frame_feature_dim=batch.frame_values.shape[-1])
+    )
+
+
+def _mask_candidate_inputs(batch: SelectorBatch) -> SelectorBatch:
+    """Remove every shuttle-candidate token and its selection supervision."""
+    return replace(
+        batch,
+        candidate_mask=torch.zeros_like(batch.candidate_mask),
+        candidate_frame_indices=torch.full_like(batch.candidate_frame_indices, -1),
+        targets=torch.full_like(batch.targets, MASKED_TARGET),
+    )
+
+
+class _TokenBucketBatchSampler(Sampler[list[int]]):
+    """Deterministically shuffle while limiting attention padding per batch."""
+
+    def __init__(
+        self,
+        windows: Sequence[SelectorWindow],
+        *,
+        batch_size: int,
+        generator: torch.Generator,
+        bucket_multiplier: int = 8,
+        sampling_mode: str = "uniform",
+    ) -> None:
+        self.windows = windows
+        self.batch_size = batch_size
+        self.generator = generator
+        self.bucket_size = max(batch_size, batch_size * bucket_multiplier)
+        if sampling_mode not in {"uniform", "boundary_balanced"}:
+            raise ValueError("sampling mode must be uniform or boundary_balanced")
+        self.sampling_mode = sampling_mode
+        self.last_sampling_stats: dict[str, Any] | None = None
+
+    @staticmethod
+    def _category(window: SelectorWindow) -> str:
+        if window.metadata.get("owns_short_rally"):
+            return "short_rally"
+        if window.metadata.get("owns_rally_boundary"):
+            return "boundary"
+        return "ordinary"
+
+    def __len__(self) -> int:
+        return math.ceil(len(self.windows) / self.batch_size)
+
+    def __iter__(self):
+        categories = [self._category(window) for window in self.windows]
+        if self.sampling_mode == "boundary_balanced":
+            weights = torch.tensor(
+                [{"ordinary": 1, "boundary": 3, "short_rally": 5}[item] for item in categories],
+                dtype=torch.float64,
+            )
+            shuffled = torch.multinomial(
+                weights, len(self.windows), replacement=True, generator=self.generator
+            ).tolist()
+        else:
+            shuffled = torch.randperm(len(self.windows), generator=self.generator).tolist()
+        self.last_sampling_stats = {
+            "requested_window_count": len(self.windows),
+            "requested_category_counts": dict(sorted(Counter(categories).items())),
+            "realized_category_counts": dict(
+                sorted(Counter(categories[index] for index in shuffled).items())
+            ),
+            "unique_sampled_window_count": len(set(shuffled)),
+        }
+        batches: list[list[int]] = []
+        for start in range(0, len(shuffled), self.bucket_size):
+            bucket = shuffled[start : start + self.bucket_size]
+            bucket.sort(
+                key=lambda index: (
+                    len(self.windows[index].frame_indices)
+                    + len(self.windows[index].candidate_ids)
+                )
+            )
+            batches.extend(
+                bucket[offset : offset + self.batch_size]
+                for offset in range(0, len(bucket), self.batch_size)
+            )
+        if batches:
+            batch_order = torch.randperm(
+                len(batches), generator=self.generator
+            ).tolist()
+            for index in batch_order:
+                yield batches[index]
 
 
 def _train_fold(
     model: TemporalShuttleSelector,
     windows: Sequence[SelectorWindow],
+    evaluation_windows: Sequence[SelectorWindow],
+    fold: CrossFitFold,
     *,
     device: torch.device,
     epochs: int,
     batch_size: int,
     seed: int,
     candidate_dropout: float = 0.2,
-) -> list[dict[str, float]]:
+    selection_weight: float = 1.0,
+    boundary_weight: float = 1.0,
+    boundary_window_seconds: float = 1.0,
+    mask_candidates: bool = False,
+    evaluation_owned_only: bool = False,
+    sampling_mode: str = "uniform",
+    checkpoint_selection: str = "final",
+    validation_partition_designated: bool = False,
+    boundary_aux_weight: float = 0.25,
+) -> list[dict[str, Any]]:
     generator = torch.Generator().manual_seed(seed)
     dropout_generator = torch.Generator().manual_seed(seed + 10_000)
+    sampler = _TokenBucketBatchSampler(
+        windows,
+        batch_size=batch_size,
+        generator=generator,
+        sampling_mode=sampling_mode,
+    )
     loader = DataLoader(
         list(windows),
-        batch_size=batch_size,
-        shuffle=True,
-        generator=generator,
+        batch_sampler=sampler,
         collate_fn=collate_selector_windows,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
@@ -415,13 +528,46 @@ def _train_fold(
     if any((window.inplay_targets is not None) != joint for window in windows):
         raise ValueError("training fold mixes legacy and joint windows")
     pos_weight = _inplay_pos_weight(windows, device) if joint else None
-    history: list[dict[str, float]] = []
+    if checkpoint_selection not in {"final", "validation_loss"}:
+        raise ValueError("checkpoint selection must be final or validation_loss")
+    if checkpoint_selection == "validation_loss" and not validation_partition_designated:
+        raise ValueError(
+            "validation-loss checkpoint selection requires a designated validation partition"
+        )
+
+    def _soft_pos_weight(field: str) -> torch.Tensor | None:
+        values: list[float] = []
+        for window in windows:
+            targets = getattr(window, field)
+            if targets is None:
+                continue
+            values.extend(
+                float(value)
+                for frame, value in zip(window.frame_indices, targets)
+                if frame in window.owned_frames and float(value) != MASKED_TARGET
+            )
+        positive_mass = sum(values)
+        if not values or positive_mass <= 0:
+            return None
+        return torch.tensor(
+            min(10.0, (len(values) - positive_mass) / positive_mass),
+            dtype=torch.float32,
+            device=device,
+        )
+
+    start_pos_weight = _soft_pos_weight("rally_start_targets")
+    end_pos_weight = _soft_pos_weight("rally_end_targets")
+    history: list[dict[str, Any]] = []
+    best: tuple[float, float, int, dict[str, torch.Tensor]] | None = None
     for epoch in range(epochs):
         model.train()
-        totals, selections, inplays = [], [], []
+        metric_sums = torch.zeros(5, device=device)
+        batch_count = 0
         for batch in loader:
             batch = batch.to(device)
-            if joint:
+            if mask_candidates:
+                batch = _mask_candidate_inputs(batch)
+            elif joint:
                 batch = _apply_candidate_dropout(
                     batch,
                     generator=dropout_generator,
@@ -430,47 +576,244 @@ def _train_fold(
             optimizer.zero_grad(set_to_none=True)
             if joint:
                 components = model.joint_losses(
-                    batch, inplay_pos_weight=pos_weight
+                    batch,
+                    inplay_pos_weight=pos_weight,
+                    selection_weight=selection_weight,
+                    boundary_weight=boundary_weight,
+                    boundary_window_seconds=boundary_window_seconds,
+                    return_counts=False,
+                    boundary_start_pos_weight=start_pos_weight,
+                    boundary_end_pos_weight=end_pos_weight,
+                    boundary_aux_weight=boundary_aux_weight,
                 )
                 loss = components.total
-                selections.append(float(components.selection.detach().cpu()))
-                inplays.append(float(components.inplay.detach().cpu()))
+                metric_sums[1] += components.selection.detach()
+                metric_sums[2] += components.inplay.detach()
+                if components.rally_start is not None:
+                    metric_sums[3] += components.rally_start.detach()
+                    metric_sums[4] += components.rally_end.detach()
             else:
                 loss = model.loss(batch)
-                selections.append(float(loss.detach().cpu()))
+                metric_sums[1] += loss.detach()
             if not bool(torch.isfinite(loss)):
-                raise RuntimeError("training produced a non-finite joint loss")
+                raise RuntimeError(
+                    "training produced a non-finite joint loss "
+                    f"(total={float(loss.detach())}, "
+                    f"selection={float(components.selection.detach()) if joint else float(loss.detach())}, "
+                    f"inplay={float(components.inplay.detach()) if joint else 0.0})"
+                )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-            totals.append(float(loss.detach().cpu()))
-        if not totals:
+            metric_sums[0] += loss.detach()
+            batch_count += 1
+        if not batch_count:
             raise ValueError("training fold has no windows")
+        total_sum, selection_sum, inplay_sum, start_sum, end_sum = metric_sums.cpu().tolist()
         summary = {
-            "total": sum(totals) / len(totals),
-            "selection": sum(selections) / len(selections),
-            "inplay": sum(inplays) / len(inplays) if inplays else 0.0,
+            "total": total_sum / batch_count,
+            "selection": selection_sum / batch_count,
+            "inplay": inplay_sum / batch_count if joint else 0.0,
+            "rally_start": start_sum / batch_count,
+            "rally_end": end_sum / batch_count,
+            "sampling": sampler.last_sampling_stats,
         }
+        if joint:
+            model.eval()
+            heldout_rows = aggregate_joint_predictions(
+                _predict_windows(
+                    model,
+                    evaluation_windows,
+                    fold,
+                    device=device,
+                    batch_size=batch_size,
+                    owned_only=evaluation_owned_only,
+                    mask_candidates=mask_candidates,
+                )
+            )
+            summary.update(_heldout_inplay_epoch_metrics(heldout_rows, evaluation_windows))
+            if getattr(model, "boundary_heads", False):
+                summary.update(_heldout_boundary_epoch_metrics(heldout_rows))
+            candidate = (
+                float(summary["heldout_inplay_loss"]),
+                -float(summary["heldout_roc_auc"]),
+                epoch,
+                copy.deepcopy(model.state_dict()),
+            )
+            if best is None or candidate[:3] < best[:3]:
+                best = candidate
+            model.train()
         history.append(summary)
         print(
             f"epoch {epoch + 1}/{epochs}: total={summary['total']:.6f} "
-            f"selection={summary['selection']:.6f} inplay={summary['inplay']:.6f}",
+            f"selection={summary['selection']:.6f} inplay={summary['inplay']:.6f}"
+            + (
+                f" heldout_loss={summary['heldout_inplay_loss']:.6f}"
+                f" P={summary['heldout_precision']:.3f}"
+                f" R={summary['heldout_recall']:.3f}"
+                f" F1={summary['heldout_f1']:.3f}"
+                if joint else ""
+            ),
             flush=True,
         )
+    selected_epoch = epochs
+    selected_loss = history[-1].get("heldout_inplay_loss")
+    selected_auc = history[-1].get("heldout_roc_auc")
+    if checkpoint_selection == "validation_loss":
+        if best is None:
+            raise ValueError("validation selection requires joint held-out metrics")
+        model.load_state_dict(best[3])
+        selected_loss, selected_auc, selected_epoch = best[0], -best[1], best[2] + 1
+    model.checkpoint_selection = {
+        "policy": checkpoint_selection,
+        "selected_epoch": selected_epoch,
+        "validation_inplay_loss": selected_loss,
+        "validation_roc_auc": selected_auc,
+    }
     return history
 
 
-def _predict_window(
-    model: TemporalShuttleSelector,
+def _binary_roc_auc(labels: Sequence[int], scores: Sequence[float]) -> float | None:
+    """Return tie-aware binary ROC AUC without an optional sklearn dependency."""
+    positives = sum(label == 1 for label in labels)
+    negatives = sum(label == 0 for label in labels)
+    if not positives or not negatives:
+        return None
+    ordered = sorted(zip(scores, labels), key=lambda item: item[0])
+    positive_rank_sum = 0.0
+    rank = 1
+    index = 0
+    while index < len(ordered):
+        end = index + 1
+        while end < len(ordered) and ordered[end][0] == ordered[index][0]:
+            end += 1
+        average_rank = (rank + rank + end - index - 1) / 2
+        positive_rank_sum += average_rank * sum(
+            label == 1 for _, label in ordered[index:end]
+        )
+        rank += end - index
+        index = end
+    return (positive_rank_sum - positives * (positives + 1) / 2) / (positives * negatives)
+
+
+def _heldout_inplay_epoch_metrics(
+    rows: Sequence[Mapping[str, Any]],
+    windows: Sequence[SelectorWindow],
+) -> dict[str, float]:
+    """Compile thresholded frame and one-second boundary diagnostics."""
+    supervised = [row for row in rows if row.get("inplay_target") in (0, 1)]
+    labels = [int(row["inplay_target"]) for row in supervised]
+    probabilities = [float(row["in_play_probability"]) for row in supervised]
+    predicted = [value >= 0.5 for value in probabilities]
+    tp = sum(label == 1 and value for label, value in zip(labels, predicted))
+    fp = sum(label == 0 and value for label, value in zip(labels, predicted))
+    fn = sum(label == 1 and not value for label, value in zip(labels, predicted))
+    negatives = sum(label == 0 for label in labels)
+    precision = _ratio(tp, tp + fp) or 0.0
+    recall = _ratio(tp, tp + fn) or 0.0
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+
+    by_source: dict[str, list[Mapping[str, Any]]] = {}
+    for row in supervised:
+        by_source.setdefault(str(row["prediction_source_id"]), []).append(row)
+    fps_by_source = {
+        window.source_id: float(window.metadata["fps"]) for window in windows
+    }
+    boundary_keys: set[tuple[str, int]] = set()
+    for source_id, source_rows in by_source.items():
+        source_rows.sort(key=lambda row: int(row["frame"]))
+        transitions = [
+            int(right["frame"])
+            for left, right in zip(source_rows, source_rows[1:])
+            if int(left["inplay_target"]) != int(right["inplay_target"])
+        ]
+        radius = max(1, round(fps_by_source[source_id]))
+        for transition in transitions:
+            boundary_keys.update(
+                (source_id, frame)
+                for frame in range(transition - radius, transition + radius + 1)
+            )
+    boundary_losses = [
+        float(row["inplay_loss"])
+        for row in supervised
+        if (str(row["prediction_source_id"]), int(row["frame"])) in boundary_keys
+        and row.get("inplay_loss") is not None
+    ]
+    losses = [float(row["inplay_loss"]) for row in supervised if row.get("inplay_loss") is not None]
+    return {
+        "heldout_inplay_loss": sum(losses) / len(losses) if losses else 0.0,
+        "heldout_precision": precision,
+        "heldout_recall": recall,
+        "heldout_f1": f1,
+        "heldout_negative_false_positive_rate": fp / negatives if negatives else 0.0,
+        "heldout_roc_auc": _binary_roc_auc(labels, probabilities) or 0.0,
+        "heldout_boundary_window_loss": (
+            sum(boundary_losses) / len(boundary_losses) if boundary_losses else 0.0
+        ),
+    }
+
+
+def _heldout_boundary_epoch_metrics(
+    rows: Sequence[Mapping[str, Any]],
+) -> dict[str, float]:
+    output: dict[str, float] = {}
+    for name in ("rally_start", "rally_end"):
+        supervised = [
+            row for row in rows if row.get(f"{name}_target") != MASKED_TARGET
+        ]
+        losses = [float(row[f"{name}_loss"]) for row in supervised]
+        labels = [int(float(row[f"{name}_target"]) == 1.0) for row in supervised]
+        scores = [float(row[f"{name}_probability"]) for row in supervised]
+        output[f"heldout_{name}_loss"] = sum(losses) / len(losses) if losses else 0.0
+        output[f"heldout_{name}_roc_auc"] = _binary_roc_auc(labels, scores) or 0.0
+    return output
+
+
+def _write_epoch_diagnostic_plot(
+    path: Path, training_summaries: Mapping[str, Mapping[str, Any]]
+) -> None:
+    """Plot held-out InPlay curves for every fold on a shared epoch axis."""
+    import matplotlib.pyplot as plt
+
+    fields = (
+        ("heldout_inplay_loss", "Binary loss"),
+        ("heldout_precision", "Precision"),
+        ("heldout_recall", "Recall"),
+        ("heldout_f1", "F1"),
+        ("heldout_negative_false_positive_rate", "Negative-frame FPR"),
+        ("heldout_roc_auc", "ROC AUC"),
+        ("heldout_boundary_window_loss", "Boundary ±1s loss"),
+    )
+    figure, axes = plt.subplots(3, 3, figsize=(14, 10), constrained_layout=True)
+    for axis, (field, title) in zip(axes.flat, fields):
+        for fold_id, summary in sorted(training_summaries.items()):
+            history = summary["epoch_mean_losses"]
+            axis.plot(
+                range(1, len(history) + 1),
+                [float(epoch[field]) for epoch in history],
+                marker="o",
+                markersize=2,
+                label=f"fold {fold_id}",
+            )
+        axis.set(title=title, xlabel="Epoch")
+        axis.grid(alpha=0.25)
+    for axis in axes.flat[len(fields):]:
+        axis.set_visible(False)
+    axes.flat[0].legend()
+    figure.suptitle("Held-out InPlay diagnostics")
+    figure.savefig(path, dpi=160)
+    plt.close(figure)
+
+
+def _prediction_records_for_window(
+    output: SelectorOutput,
+    output_index: int,
     window: SelectorWindow,
     fold: CrossFitFold,
     *,
-    device: torch.device,
     owned_only: bool = True,
+    candidates_masked: bool = False,
 ) -> list[dict[str, Any]]:
-    batch = collate_selector_windows([window]).to(device)
-    with torch.no_grad():
-        output = model(batch)
     records = []
     max_time = max(
         (abs(float(value)) for value in window.relative_time_seconds),
@@ -480,40 +823,45 @@ def _predict_window(
         owned = frame in window.owned_frames
         if owned_only and not owned:
             continue
-        slots = torch.nonzero(
-            window.candidate_frame_indices == local_frame, as_tuple=False
-        ).flatten().tolist()
+        slots = (
+            []
+            if candidates_masked
+            else torch.nonzero(
+                window.candidate_frame_indices == local_frame, as_tuple=False
+            ).flatten().tolist()
+        )
         candidate_ids = [window.candidate_ids[slot] for slot in slots]
         candidate_logits_by_id = {
-            candidate_id: float(output.candidate_logits[0, slot].cpu())
+            candidate_id: float(output.candidate_logits[output_index, slot])
             for candidate_id, slot in zip(candidate_ids, slots)
         }
         frame_logits = torch.cat(
             (
-                output.candidate_logits[0, slots],
-                output.null_logits[0, local_frame].view(1),
+                output.candidate_logits[output_index, slots],
+                output.null_logits[output_index, local_frame].view(1),
             )
         )
-        predicted_index = int(torch.argmax(frame_logits).cpu())
+        predicted_index = int(torch.argmax(frame_logits))
         predicted_candidate = (
             None if predicted_index == len(slots) else candidate_ids[predicted_index]
         )
         predicted_slot = None if predicted_candidate is None else slots[predicted_index]
         target = int(window.targets[local_frame])
-        status = window.target_status[local_frame]
+        original_status = window.target_status[local_frame]
+        status = "candidate_inputs_masked" if candidates_masked else original_status
         target_candidate = (
             resolve_retained_candidate(window, local_frame, target)
-            if status == "selected_retained"
+            if not candidates_masked and status == "selected_retained"
             else None
         )
         selection_loss = None
-        if target != MASKED_TARGET:
+        if target != MASKED_TARGET and not candidates_masked:
             resolved_target = len(slots) if target == NULL_TARGET else target
             selection_loss = float(
                 F.cross_entropy(
                     frame_logits.view(1, -1),
-                    torch.tensor([resolved_target], device=device),
-                ).cpu()
+                    torch.tensor([resolved_target]),
+                )
             )
         inplay_target = (
             int(window.inplay_targets[local_frame])
@@ -521,12 +869,12 @@ def _predict_window(
             else None
         )
         inplay_logit = (
-            float(output.inplay_logits[0, local_frame].cpu())
+            float(output.inplay_logits[output_index, local_frame])
             if output.inplay_logits is not None
             else None
         )
         inplay_probability = (
-            float(torch.sigmoid(output.inplay_logits[0, local_frame]).cpu())
+            float(torch.sigmoid(output.inplay_logits[output_index, local_frame]))
             if output.inplay_logits is not None
             else None
         )
@@ -534,10 +882,32 @@ def _predict_window(
         if inplay_target in (0, 1) and output.inplay_logits is not None:
             inplay_loss = float(
                 F.binary_cross_entropy_with_logits(
-                    output.inplay_logits[0, local_frame].view(1),
-                    torch.tensor([float(inplay_target)], device=device),
-                ).cpu()
+                    output.inplay_logits[output_index, local_frame].view(1),
+                    torch.tensor([float(inplay_target)]),
+                )
             )
+        boundary_values: dict[str, Any] = {}
+        for name in ("rally_start", "rally_end"):
+            logits = getattr(output, f"{name}_logits")
+            targets = getattr(window, f"{name}_targets")
+            target = float(targets[local_frame]) if targets is not None else None
+            logit = float(logits[output_index, local_frame]) if logits is not None else None
+            probability = (
+                float(torch.sigmoid(logits[output_index, local_frame]))
+                if logits is not None else None
+            )
+            loss_value = None
+            if target is not None and target != MASKED_TARGET and logits is not None:
+                loss_value = float(F.binary_cross_entropy_with_logits(
+                    logits[output_index, local_frame].view(1),
+                    torch.tensor([target]),
+                ))
+            boundary_values.update({
+                f"{name}_target": target,
+                f"{name}_logit": logit,
+                f"{name}_probability": probability,
+                f"{name}_loss": loss_value,
+            })
         selected_position = None
         candidate_positions = {}
         for candidate_id, slot in zip(candidate_ids, slots):
@@ -580,6 +950,7 @@ def _predict_window(
                 "relative_time_seconds": relative_time,
                 "aggregation_weight": aggregation_weight,
                 "true_status": status,
+                "original_true_status": original_status,
                 "true_outcome": true_outcome,
                 "target_candidate_id": target_candidate,
                 "predicted_outcome": predicted_candidate or NULL_SELECTION,
@@ -588,13 +959,15 @@ def _predict_window(
                 "candidate_ids": candidate_ids,
                 "candidate_logits": candidate_logits_by_id,
                 "candidate_positions": candidate_positions,
-                "null_logit": float(output.null_logits[0, local_frame].cpu()),
+                "null_logit": float(output.null_logits[output_index, local_frame]),
                 "candidate_count": len(candidate_ids),
+                "candidate_inputs_masked": candidates_masked,
                 "selection_loss": selection_loss,
                 "inplay_target": inplay_target,
                 "inplay_logit": inplay_logit,
                 "in_play_probability": inplay_probability,
                 "inplay_loss": inplay_loss,
+                **boundary_values,
                 "decoded_inplay": (
                     inplay_probability >= 0.5
                     if inplay_probability is not None
@@ -607,6 +980,78 @@ def _predict_window(
             }
         )
     return records
+
+
+def _predict_windows(
+    model: TemporalShuttleSelector,
+    windows: Sequence[SelectorWindow],
+    fold: CrossFitFold,
+    *,
+    device: torch.device,
+    batch_size: int,
+    owned_only: bool = True,
+    mask_candidates: bool = False,
+) -> list[dict[str, Any]]:
+    """Predict windows in batches and transfer logits to CPU once per batch."""
+    records: list[dict[str, Any]] = []
+    for start in range(0, len(windows), batch_size):
+        window_batch = windows[start : start + batch_size]
+        batch = collate_selector_windows(window_batch).to(device)
+        if mask_candidates:
+            batch = _mask_candidate_inputs(batch)
+        with torch.no_grad():
+            device_output = model(batch)
+        output = replace(
+            device_output,
+            candidate_logits=device_output.candidate_logits.cpu(),
+            null_logits=device_output.null_logits.cpu(),
+            inplay_logits=(
+                device_output.inplay_logits.cpu()
+                if device_output.inplay_logits is not None
+                else None
+            ),
+            rally_start_logits=(
+                device_output.rally_start_logits.cpu()
+                if device_output.rally_start_logits is not None else None
+            ),
+            rally_end_logits=(
+                device_output.rally_end_logits.cpu()
+                if device_output.rally_end_logits is not None else None
+            ),
+        )
+        for output_index, window in enumerate(window_batch):
+            records.extend(
+                _prediction_records_for_window(
+                    output,
+                    output_index,
+                    window,
+                    fold,
+                    owned_only=owned_only,
+                    candidates_masked=mask_candidates,
+                )
+            )
+    return records
+
+
+def _predict_window(
+    model: TemporalShuttleSelector,
+    window: SelectorWindow,
+    fold: CrossFitFold,
+    *,
+    device: torch.device,
+    owned_only: bool = True,
+    mask_candidates: bool = False,
+) -> list[dict[str, Any]]:
+    """Compatibility wrapper for callers predicting a single window."""
+    return _predict_windows(
+        model,
+        [window],
+        fold,
+        device=device,
+        batch_size=1,
+        owned_only=owned_only,
+        mask_candidates=mask_candidates,
+    )
 
 
 def aggregate_joint_predictions(
@@ -632,6 +1077,14 @@ def aggregate_joint_predictions(
         inplay_logit = sum(
             float(row["inplay_logit"]) * weight for row, weight in zip(rows, weights)
         ) / weight_total
+        boundary_logits = {}
+        for name in ("rally_start", "rally_end"):
+            values = [row.get(f"{name}_logit") for row in rows]
+            boundary_logits[name] = (
+                sum(float(value) * weight for value, weight in zip(values, weights))
+                / weight_total
+                if all(value is not None for value in values) else None
+            )
         null_logit = sum(
             float(row["null_logit"]) * weight for row, weight in zip(rows, weights)
         ) / weight_total
@@ -668,6 +1121,17 @@ def aggregate_joint_predictions(
                 "null_logit": null_logit,
                 "inplay_logit": inplay_logit,
                 "in_play_probability": float(torch.sigmoid(torch.tensor(inplay_logit))),
+                **{
+                    f"{name}_logit": logit
+                    for name, logit in boundary_logits.items()
+                },
+                **{
+                    f"{name}_probability": (
+                        float(torch.sigmoid(torch.tensor(logit)))
+                        if logit is not None else None
+                    )
+                    for name, logit in boundary_logits.items()
+                },
                 "predicted_candidate_id": predicted_candidate,
                 "predicted_selection_outcome": predicted_candidate or NULL_SELECTION,
                 "predicted_outcome": predicted_candidate or NULL_SELECTION,
@@ -679,12 +1143,18 @@ def aggregate_joint_predictions(
             }
         )
         target = int(owner["inplay_target"])
-        record["inplay_loss"] = float(
-            F.binary_cross_entropy_with_logits(
-                torch.tensor([inplay_logit]), torch.tensor([float(target)])
+        record["inplay_loss"] = (
+            float(
+                F.binary_cross_entropy_with_logits(
+                    torch.tensor([inplay_logit]), torch.tensor([float(target)])
+                )
             )
+            if target in (0, 1)
+            else None
         )
-        if owner["true_status"] == "selected_retained":
+        if bool(owner.get("candidate_inputs_masked")):
+            target_index = None
+        elif owner["true_status"] == "selected_retained":
             target_index = candidate_ids.index(str(owner["target_candidate_id"]))
         elif owner["true_status"] == "null":
             target_index = len(candidate_ids)
@@ -714,9 +1184,14 @@ def run_experiment(
     batch_size: int = 1,
     seed: int = 1729,
     device: torch.device | None = None,
+    inplay_only: bool = False,
+    boundary_weight: float = 1.0,
+    boundary_window_seconds: float = 1.0,
 ) -> dict[str, Any]:
     if epochs <= 0 or batch_size <= 0:
         raise ValueError("epochs and batch size must be positive")
+    if boundary_weight < 1.0 or boundary_window_seconds <= 0:
+        raise ValueError("boundary weight must be >= 1 and its window must be positive")
     if seed != manifest.seed:
         raise ValueError("experiment seed must match the checked-in cross-fit manifest")
     output_dir = prepare_output_directory(output_dir)
@@ -727,6 +1202,8 @@ def run_experiment(
         raise ValueError("experiment dataset mixes legacy and joint windows")
     if joint and context_mode != "full_context":
         raise ValueError("joint rally experiments require full_context")
+    if inplay_only and not joint:
+        raise ValueError("InPlay-only ablation requires rally targets")
     model_config = SelectorConfig(
         context_mode=context_mode,
         frame_feature_dim=FRAME_DIMS[context_mode],
@@ -757,40 +1234,51 @@ def run_experiment(
         history = _train_fold(
             model,
             train_windows,
+            evaluation_windows,
+            fold,
             device=device,
             epochs=epochs,
             batch_size=batch_size,
             seed=seed + fold_index,
+            selection_weight=0.0 if inplay_only else 1.0,
+            boundary_weight=boundary_weight,
+            boundary_window_seconds=boundary_window_seconds,
+            mask_candidates=inplay_only,
         )
         model.eval()
         decoder_config: InPlayDecoderConfig | None = None
         if joint:
             calibration_rows = aggregate_joint_predictions(
-                record
-                for window in train_windows
-                for record in _predict_window(
-                    model, window, fold, device=device, owned_only=False
+                _predict_windows(
+                    model,
+                    train_windows,
+                    fold,
+                    device=device,
+                    batch_size=batch_size,
+                    owned_only=False,
+                    mask_candidates=inplay_only,
                 )
             )
             calibration_rows.sort(
                 key=lambda row: (row["prediction_source_id"], row["frame"])
             )
+            calibration_rows = [
+                row for row in calibration_rows if row.get("inplay_target") in (0, 1)
+            ]
             decoder_config = calibrate_inplay_decoder(
                 [float(row["in_play_probability"]) for row in calibration_rows],
                 [int(row["inplay_target"]) for row in calibration_rows],
                 fps=float(train_windows[0].metadata["fps"]),
             )
-        fold_observations = [
-            record
-            for window in evaluation_windows
-            for record in _predict_window(
-                model,
-                window,
-                fold,
-                device=device,
-                owned_only=not joint,
-            )
-        ]
+        fold_observations = _predict_windows(
+            model,
+            evaluation_windows,
+            fold,
+            device=device,
+            batch_size=batch_size,
+            owned_only=not joint,
+            mask_candidates=inplay_only,
+        )
         fold_predictions = (
             aggregate_joint_predictions(fold_observations)
             if joint
@@ -860,7 +1348,17 @@ def run_experiment(
                 "gradient_clip_norm": 1.0,
                 "device": str(device),
                 "epoch_mean_losses": history,
-                "candidate_dropout_probability": 0.2 if joint else 0.0,
+                "candidate_dropout_probability": 0.0 if inplay_only else 0.2 if joint else 0.0,
+                "candidate_inputs_masked": inplay_only,
+                "selection_loss_weight": 0.0 if inplay_only else 1.0,
+                "inplay_only_ablation": inplay_only,
+                "conditioning_mode": (
+                    model.conditioning_mode
+                    if isinstance(model, JointRallyShuttleModel)
+                    else None
+                ),
+                "boundary_weight": boundary_weight,
+                "boundary_window_seconds": boundary_window_seconds,
                 "decoder_config": asdict(decoder_config) if decoder_config else None,
             },
             checkpoint_path,
@@ -889,7 +1387,9 @@ def run_experiment(
         "schema": "temporal_selector_experiment_metrics",
         "schema_version": 2 if joint else 1,
         "task_definition": (
-            "strict_inplay_with_conditional_shuttle_selection"
+            "strict_inplay_without_shuttle_candidate_inputs"
+            if inplay_only
+            else "strict_inplay_with_conditional_shuttle_selection"
             if joint
             else "continuous_shuttle_selection"
         ),
@@ -898,6 +1398,10 @@ def run_experiment(
         "seed": seed,
         "epochs": epochs,
         "batch_size": batch_size,
+        "inplay_only_ablation": inplay_only,
+        "candidate_inputs_masked": inplay_only,
+        "boundary_weight": boundary_weight,
+        "boundary_window_seconds": boundary_window_seconds,
         "dataset_fingerprint": dataset.manifest["dataset_fingerprint"],
         "crossfit_fingerprint": manifest.fingerprint,
         "training": training_summaries,
@@ -923,6 +1427,14 @@ def run_experiment(
     (output_dir / "metrics.json").write_text(
         json.dumps(metrics, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
+    (output_dir / "epoch_metrics.json").write_text(
+        json.dumps(training_summaries, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    if joint:
+        _write_epoch_diagnostic_plot(
+            output_dir / "epoch-inplay-diagnostics.png", training_summaries
+        )
     return metrics
 
 
@@ -947,28 +1459,30 @@ def load_crossfit_manifest(path: Path) -> CrossFitManifest:
         for fold in folds
     ):
         raise ValueError("cross-fit manifest must contain source-disjoint folds")
-    if any(
-        not fold.training_source_ids or len(fold.evaluation_source_ids) != 1
-        for fold in folds
+    if any(not fold.training_source_ids or not fold.evaluation_source_ids for fold in folds):
+        raise ValueError("cross-fit folds require training and held-out sources")
+    universe = set(folds[0].training_source_ids + folds[0].evaluation_source_ids)
+    evaluated = [source for fold in folds for source in fold.evaluation_source_ids]
+    if (
+        len(evaluated) != len(set(evaluated))
+        or set(evaluated) != universe
+        or any(
+            set(fold.training_source_ids) | set(fold.evaluation_source_ids) != universe
+            for fold in folds
+        )
     ):
-        raise ValueError("cross-fit folds require training sources and one held-out source")
-    if len(folds) == 2 and all(len(fold.training_source_ids) == 1 for fold in folds):
-        expected = build_two_source_crossfit(
-            (folds[0].training_source_ids[0], folds[0].evaluation_source_ids[0]),
-            seed=manifest.seed,
-        )
-    else:
-        expected = build_leave_one_source_out(
-            tuple(fold.evaluation_source_ids[0] for fold in folds),
-            seed=manifest.seed,
-        )
-    if manifest != expected:
+        raise ValueError("cross-fit folds must hold out every source exactly once")
+    payload = {"seed": manifest.seed, "folds": [vars(fold) for fold in folds]}
+    expected_fingerprint = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    if manifest.fingerprint != expected_fingerprint:
         raise ValueError("cross-fit manifest topology or fingerprint is invalid")
     return manifest
 
 
 def load_dataset_config(
-    path: Path, *, context_mode: ContextMode
+    path: Path, *, context_mode: ContextMode, pose_coordinate_mode: PoseCoordinateMode = "image"
 ) -> tuple[SelectorDataConfig, CrossFitManifest]:
     path = Path(path).expanduser().resolve()
     value = json.loads(path.read_text(encoding="utf-8"))
@@ -992,6 +1506,7 @@ def load_dataset_config(
         minimum_cutoff=float(data.get("minimum_cutoff", 0.05)),
         retention_k=int(data.get("retention_k", 8)),
         pose_visibility_threshold=float(data.get("pose_visibility_threshold", 0.5)),
+        pose_coordinate_mode=pose_coordinate_mode,
         expected_annotation_sha256=data.get("expected_annotation_sha256"),
         rally_intervals_path=(
             _resolve(path, data["rally_intervals_path"])
@@ -1019,17 +1534,36 @@ def _parser() -> argparse.ArgumentParser:
         choices=("candidates_only", "players_court", "full_context"),
         default="full_context",
     )
+    parser.add_argument(
+        "--pose-coordinate-mode",
+        choices=("image", "player_relative"),
+        default="image",
+    )
+    parser.add_argument(
+        "--boundary-weight",
+        type=float,
+        default=1.0,
+        help="maximum tapered InPlay BCE weight at true state transitions",
+    )
+    parser.add_argument("--boundary-window-seconds", type=float, default=1.0)
     parser.add_argument("--epochs", type=int, default=25)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--seed", type=int, default=1729)
     parser.add_argument("--device", choices=("auto", "cpu", "mps", "cuda"), default="auto")
+    parser.add_argument(
+        "--inplay-only",
+        action="store_true",
+        help="set shuttle-selection loss weight to zero for an InPlay-only ablation",
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     dataset_config, manifest = load_dataset_config(
-        args.config, context_mode=args.context_mode
+        args.config,
+        context_mode=args.context_mode,
+        pose_coordinate_mode=args.pose_coordinate_mode,
     )
     dataset = SelectorWindowDataset(dataset_config)
     device = None if args.device == "auto" else torch.device(args.device)
@@ -1042,6 +1576,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         batch_size=args.batch_size,
         seed=args.seed,
         device=device,
+        inplay_only=args.inplay_only,
+        boundary_weight=args.boundary_weight,
+        boundary_window_seconds=args.boundary_window_seconds,
     )
     print(json.dumps(metrics["crossfit_macro"], indent=2, sort_keys=True))
     return 0

@@ -1,20 +1,35 @@
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 import torch
 
-from src.temporal_selector import build_two_source_crossfit
-from src.temporal_selector.dataset import SelectorWindow
+from src.temporal_selector import MASKED_TARGET, build_two_source_crossfit
+from src.temporal_selector.dataset import SelectorWindow, collate_selector_windows
 from src.temporal_selector.experiment import (
+    _binary_roc_auc,
+    _mask_candidate_inputs,
     NULL_SELECTION,
+    _TokenBucketBatchSampler,
+    _predict_window,
+    _predict_windows,
     compile_metrics,
     prepare_output_directory,
     resolve_retained_candidate,
     run_experiment,
+    select_device,
     windows_for_queue,
     windows_for_sources,
 )
+
+
+def test_device_selection_warns_when_mps_build_cannot_use_mps(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+    monkeypatch.setattr(torch.backends.mps, "is_built", lambda: True)
+    with pytest.warns(RuntimeWarning, match="training will use CPU"):
+        assert select_device() == torch.device("cpu")
 
 
 def _prediction(status, predicted, *, target=None, loss=None):
@@ -62,6 +77,12 @@ def test_metrics_cover_selection_null_scoring_and_zero_denominators():
     assert empty["null_selection"]["f1"] is None
 
 
+def test_binary_roc_auc_is_tie_aware_and_handles_single_class():
+    assert _binary_roc_auc([0, 0, 1, 1], [0.1, 0.4, 0.35, 0.8]) == pytest.approx(0.75)
+    assert _binary_roc_auc([0, 1], [0.5, 0.5]) == pytest.approx(0.5)
+    assert _binary_roc_auc([1, 1], [0.2, 0.8]) is None
+
+
 def _window(source, queue, target, status, candidate_id):
     return SelectorWindow(
         source_id=source,
@@ -94,6 +115,102 @@ def test_source_queue_filtering_and_retained_candidate_resolution():
         resolve_retained_candidate(windows[0], 0, 1)
 
 
+def test_token_bucket_sampler_is_deterministic_and_groups_similar_sizes():
+    windows = []
+    for count in range(1, 9):
+        base = _window("source", "dense", 0, "selected_retained", "c0")
+        windows.append(
+            replace(
+                base,
+                candidate_values=torch.zeros(count, 12),
+                candidate_validity=torch.ones(count, 12, dtype=torch.bool),
+                candidate_frame_indices=torch.zeros(count, dtype=torch.long),
+                candidate_ids=tuple(f"c{slot}" for slot in range(count)),
+            )
+        )
+    first = list(
+        _TokenBucketBatchSampler(
+            windows, batch_size=2, generator=torch.Generator().manual_seed(9)
+        )
+    )
+    second = list(
+        _TokenBucketBatchSampler(
+            windows, batch_size=2, generator=torch.Generator().manual_seed(9)
+        )
+    )
+    assert first == second
+    assert sorted(index for batch in first for index in batch) == list(range(8))
+    assert all(abs(len(windows[a].candidate_ids) - len(windows[b].candidate_ids)) <= 1 for a, b in first)
+    collated = collate_selector_windows((windows[0], windows[-1]))
+    assert collated.packed_token_count == 9
+    assert collated.packed_frame_indices.tolist() == [[0], [0]]
+    assert collated.packed_candidate_indices[1, :8].tolist() == list(range(1, 9))
+    assert collated.candidate_local_indices[1, :8].tolist() == list(range(8))
+
+
+def test_batched_prediction_matches_single_window_prediction():
+    windows = [
+        _window("malaysia", "adaptive", 0, "selected_retained", "m"),
+        _window("malaysia", "audit", -1, "null", "n"),
+    ]
+    fold = build_two_source_crossfit(("malaysia", "max-vs-nik"), seed=1729).folds[1]
+    from src.temporal_selector.model import TemporalShuttleSelector
+
+    model = TemporalShuttleSelector().eval()
+    expected = [
+        row
+        for window in windows
+        for row in _predict_window(
+            model, window, fold, device=torch.device("cpu")
+        )
+    ]
+    actual = _predict_windows(
+        model,
+        windows,
+        fold,
+        device=torch.device("cpu"),
+        batch_size=2,
+    )
+    numeric_fields = {"null_logit", "selection_loss", "inplay_logit", "in_play_probability", "inplay_loss"}
+    for batched, single in zip(actual, expected):
+        assert {
+            key: value for key, value in batched.items() if key not in numeric_fields | {"candidate_logits"}
+        } == {
+            key: value for key, value in single.items() if key not in numeric_fields | {"candidate_logits"}
+        }
+        assert batched["candidate_logits"] == pytest.approx(single["candidate_logits"])
+        for field in numeric_fields:
+            if single[field] is None:
+                assert batched[field] is None
+            else:
+                assert batched[field] == pytest.approx(single[field], abs=1e-6)
+
+
+def test_no_shuttle_input_mask_removes_candidates_from_model_and_predictions():
+    window = _window("malaysia", "adaptive", 0, "selected_retained", "m")
+    fold = build_two_source_crossfit(("malaysia", "max-vs-nik"), seed=1729).folds[1]
+    from src.temporal_selector.model import TemporalShuttleSelector
+
+    batch = _mask_candidate_inputs(collate_selector_windows([window]))
+    assert not bool(batch.candidate_mask.any())
+    assert bool((batch.candidate_frame_indices == -1).all())
+    assert bool((batch.targets == MASKED_TARGET).all())
+
+    rows = _predict_windows(
+        TemporalShuttleSelector().eval(),
+        [window],
+        fold,
+        device=torch.device("cpu"),
+        batch_size=1,
+        mask_candidates=True,
+    )
+    assert rows[0]["candidate_inputs_masked"] is True
+    assert rows[0]["candidate_count"] == 0
+    assert rows[0]["candidate_ids"] == []
+    assert rows[0]["candidate_logits"] == {}
+    assert rows[0]["selection_loss"] is None
+    assert rows[0]["true_status"] == "candidate_inputs_masked"
+    assert rows[0]["original_true_status"] == "selected_retained"
 def test_output_directory_refuses_nonempty_path(tmp_path: Path):
     output = prepare_output_directory(tmp_path / "run")
     (output / "existing").write_text("owned")

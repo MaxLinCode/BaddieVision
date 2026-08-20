@@ -25,11 +25,27 @@
         "calibration_path": "../features/court/malaysiamax.json"
       },
       {
+        "source_id": "malaysia_max_390s_to_ends",
+        "video_path": "../outputs/malaysia_max_390s_to_ends/malaysia_max_390s_to_ends_input.mp4",
+        "candidates_path": "../outputs/malaysia_max_390s_to_ends/shuttle_candidates_frozen.jsonl",
+        "assignments_path": "../outputs/malaysia_max_390s_to_ends/player_assignments.jsonl",
+        "pose_cache_path": "../outputs/malaysia_max_390s_to_ends/pose_cache.jsonl",
+        "calibration_path": "../features/court/malaysiamax.json"
+      },
+      {
         "source_id": "max_vs_nik_30s_to_120s",
         "video_path": "../outputs/max_vs_nik_30s_to_120s/max_vs_nik_30s_to_120s_input.mp4",
         "candidates_path": "../outputs/frozen/max_vs_nik_30s_to_120s-shuttle-candidates-frozen.jsonl",
         "assignments_path": "../outputs/max_vs_nik_30s_to_120s/player_assignments.jsonl",
         "pose_cache_path": "../outputs/max_vs_nik_30s_to_120s/pose_cache.jsonl",
+        "calibration_path": "../features/court/max_vs_nik_calibration.json"
+      },
+      {
+        "source_id": "max_vs_nik_120s_to_ends",
+        "video_path": "../outputs/max_vs_nik_120s_to_ends/max_vs_nik_120s_to_ends_input.mp4",
+        "candidates_path": "../outputs/max_vs_nik_120s_to_ends/shuttle_candidates_frozen.jsonl",
+        "assignments_path": "../outputs/max_vs_nik_120s_to_ends/player_assignments.jsonl",
+        "pose_cache_path": "../outputs/max_vs_nik_120s_to_ends/pose_cache.jsonl",
         "calibration_path": "../features/court/max_vs_nik_calibration.json"
       },
       {

@@ -5,6 +5,23 @@ from pathlib import Path
 import pytest
 
 from src.workflow.registry import SourceCatalog
+from src.workflow.identity import SourceIdentity
+
+
+@pytest.fixture(autouse=True)
+def stub_video_inspection(monkeypatch):
+    def inspect(source_id, video_path):
+        return SourceIdentity(
+            source_id=source_id,
+            video_sha256=hashlib.sha256(Path(video_path).read_bytes()).hexdigest(),
+            frame_count=90,
+            width=1280,
+            height=720,
+            fps_numerator=30,
+            fps_denominator=1,
+        )
+
+    monkeypatch.setattr("src.workflow.registry.inspect_source", inspect)
 
 
 def _touch_inputs(root: Path, source_id: str, *, ready: bool = False) -> Path:
@@ -14,16 +31,45 @@ def _touch_inputs(root: Path, source_id: str, *, ready: bool = False) -> Path:
     if ready:
         output = root / "outputs" / source_id
         output.mkdir(parents=True)
-        for name in (
-            "shuttle_candidates_pilot.jsonl",
-            "shuttle_candidates_frozen.jsonl",
-            "player_assignments.jsonl",
-            "pose_cache.jsonl",
-        ):
-            (output / name).write_text("{}\n")
-        calibration = root / "features" / "court" / f"{source_id}.json"
+        (output / "shuttle").mkdir()
+        (output / "players").mkdir()
+        candidate_metadata = json.dumps({
+            "type": "metadata", "schema": "shuttle_candidates",
+            "source_frame_count": 90, "source_frame_range": [0, 89],
+        }) + "\n"
+        (output / "shuttle" / "candidates.pilot.jsonl").write_text(candidate_metadata)
+        (output / "shuttle" / "candidates.frozen.jsonl").write_text(candidate_metadata)
+        (output / "players" / "assignments.jsonl").write_text("{}\n")
+        person_tracks = output / "players" / "person_tracks.jsonl"
+        person_tracks.write_text(json.dumps({
+            "type": "metadata", "schema": "person_tracks", "frame_count": 90,
+        }) + "\n")
+        (output / "players" / "poses.jsonl").write_text(json.dumps({
+            "type": "metadata", "schema": "pose_cache",
+            "raw_artifact_fingerprint": "sha256:" + hashlib.sha256(person_tracks.read_bytes()).hexdigest(),
+        }) + "\n")
+        calibration = output / "court" / "calibration.json"
         calibration.parent.mkdir(parents=True, exist_ok=True)
-        calibration.write_text(json.dumps({"image_size": [1280, 720]}))
+        identity = SourceIdentity(
+            source_id=source_id,
+            video_sha256=hashlib.sha256(video.read_bytes()).hexdigest(),
+            frame_count=90, width=1280, height=720,
+            fps_numerator=30, fps_denominator=1,
+        )
+        calibration.write_text(json.dumps({
+            "image_size": [1280, 720],
+            "artifact_metadata": {
+                "source_id": source_id,
+                "source_identity_sha256": identity.fingerprint,
+                "frame_indexing": "source_local_zero_based",
+            },
+        }))
+        (output / "players" / "assignments.jsonl").write_text(json.dumps({
+            "source_id": source_id,
+            "source_identity_sha256": identity.fingerprint,
+            "frame_indexing": "source_local_zero_based",
+            "calibration_sha256": hashlib.sha256(calibration.read_bytes()).hexdigest(),
+        }) + "\n")
     return video
 
 
@@ -36,10 +82,11 @@ def test_add_source_derives_paths_and_is_portable(tmp_path):
     source = catalog.add(video, source_id="match-a")
 
     assert source.output_dir == root / "outputs" / "match-a"
-    assert source.frozen_candidates_path.name == "shuttle_candidates_frozen.jsonl"
+    assert source.frozen_candidates_path.name == "candidates.frozen.jsonl"
     value = json.loads(catalog_path.read_text())
     assert value["sources"][0]["video_path"] == "../videos/match-a.mp4"
-    assert value["sources"][0]["video_sha256"] == hashlib.sha256(video.read_bytes()).hexdigest()
+    assert set(value["sources"][0]) == {"source_id", "enabled", "video_path", "artifact_root"}
+    assert SourceIdentity.read(source.identity_path).frame_range_end_inclusive == 89
     assert SourceCatalog.read(catalog_path).sources["match-a"] == source
 
 
@@ -62,24 +109,38 @@ def test_status_checks_readiness_and_calibration_schema(tmp_path):
     source.calibration_path.write_text("{}")
     status = catalog.status(source)
     assert not status.experiment_ready
-    assert status.problems == ("calibration has no image_size",)
+    assert "calibration has no image_size" in status.problems
+    assert "calibration source identity/geometry differs" in status.problems
+    assert "player assignments source/calibration lineage differs" in status.problems
+
+
+def test_rally_readiness_does_not_depend_on_shuttle_candidates(tmp_path):
+    video = _touch_inputs(tmp_path, "match-a", ready=True)
+    catalog = SourceCatalog(tmp_path / "config" / "sources.local.json")
+    source = catalog.add(video, source_id="match-a")
+    source.candidates_path.write_text("not json\n")
+    source.frozen_candidates_path.write_text("not json\n")
+
+    status = catalog.status(source)
+    assert status.rally_ready
+    assert not status.experiment_ready
 
 
 def test_annotation_config_prefers_frozen_and_falls_back_to_pilot(tmp_path):
     video = _touch_inputs(tmp_path, "match-a")
     catalog = SourceCatalog(tmp_path / "config" / "sources.local.json")
     source = catalog.add(video, source_id="match-a")
-    source.candidates_path.parent.mkdir(parents=True)
+    source.candidates_path.parent.mkdir(parents=True, exist_ok=True)
     source.candidates_path.write_text("{}\n")
 
     output = catalog.write_annotation_config(tmp_path / "runtime" / "sources.json")
     value = json.loads(output.read_text())
-    assert value["sources"][0]["candidates_path"].endswith("shuttle_candidates_pilot.jsonl")
+    assert value["sources"][0]["candidates_path"].endswith("shuttle/candidates.pilot.jsonl")
 
     source.frozen_candidates_path.write_text("{}\n")
     catalog.write_annotation_config(output)
     value = json.loads(output.read_text())
-    assert value["sources"][0]["candidates_path"].endswith("shuttle_candidates_frozen.jsonl")
+    assert value["sources"][0]["candidates_path"].endswith("shuttle/candidates.frozen.jsonl")
 
 
 def test_experiment_prepare_generates_hash_and_loso_manifest(tmp_path):

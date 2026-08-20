@@ -159,6 +159,7 @@ python3 -m src.annotation_platform --config config/annotation-sources.local.json
 
 python3 -m src.annotation_platform --config config/annotation-sources.local.json \
   --runtime .annotation-final serve --annotator NAME --queue refill
+
 ```
 
 The interval writer replaces only the named source and preserves other sources
@@ -170,6 +171,13 @@ After both queues are complete, add `shuttle-rally-audit.json` and
 `shuttle-refill.json` to the experiment config's `queue_paths` so metrics retain
 their audit/refill provenance. The dense joint dataset reads all active events
 even when a frame is not owned by an original queue.
+
+The rally labeler resumes existing labels. Put the cursor inside a rally and
+press `X` to remove it, then use `S`/`E` to enter the corrected interval. If a
+source begins while play is already underway, label the visible interval from
+frame 0 and press `P`; the manifest records that its serve boundary predates the
+source instead of pretending frame 0 is an observed serve contact. Partial-start
+rallies are blue on the labeler timeline.
 
 Labels are immutable JSONL revisions. Corrections supersede the current
 frame revision, while undo appends another revision and restores the preceding

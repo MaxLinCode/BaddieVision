@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import asdict
 from typing import Any
 
@@ -37,6 +38,36 @@ def candidate_click_matches_target(
     except (TypeError, ValueError):
         return False
     return triggered.get("source_id") == source_id and clicked_frame == int(frame)
+
+
+def missing_proposal_position(
+    value: Any, source_id: str, frame: int
+) -> dict[str, object]:
+    """Validate a browser image click and return its canonical position snapshot."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError("click the visible shuttle before marking a missing proposal") from exc
+    if not isinstance(value, dict):
+        raise ValueError("click the visible shuttle before marking a missing proposal")
+    try:
+        clicked_frame = int(value["frame"])
+        x, y = float(value["x"]), float(value["y"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("invalid missing-proposal image position") from exc
+    if value.get("source_id") != source_id or clicked_frame != int(frame):
+        raise ValueError("the missing-proposal click belongs to a different frame")
+    if not math.isfinite(x) or not math.isfinite(y) or not (0 <= x <= 1 and 0 <= y <= 1):
+        raise ValueError("missing-proposal image position must be normalized to [0, 1]")
+    point = [x, y]
+    return {
+        "coordinate_space": "normalized_image_xy",
+        "canonical_field": "peak_position_normalized",
+        "peak_position_normalized": point,
+        "weighted_centroid_normalized": point,
+        "center_normalized": point,
+    }
 
 
 def create_dash_app(
@@ -117,17 +148,39 @@ def create_dash_app(
             dcc.Store(id="session-state", data=asdict(durable)),
             dcc.Store(id="preview-frame"),
             dcc.Store(id="visible-suggestion"),
+            dcc.Input(id="missing-position", type="text", value="", style={"display": "none"}),
             html.H2(task_plugin.display_name),
             html.Div(id="progress"),
             html.Div(
                 [
                     html.Img(
                         id="center-image",
-                        style={"display": "block", "height": "auto", "width": "100%"},
+                        style={
+                            "cursor": "crosshair",
+                            "display": "block",
+                            "height": "auto",
+                            "width": "100%",
+                        },
+                    ),
+                    html.Div(
+                        id="missing-position-marker",
+                        style={
+                            "background": "#ff1744",
+                            "border": "2px solid white",
+                            "borderRadius": "50%",
+                            "boxShadow": "0 0 0 2px #111",
+                            "display": "none",
+                            "height": "12px",
+                            "pointerEvents": "none",
+                            "position": "absolute",
+                            "transform": "translate(-50%, -50%)",
+                            "width": "12px",
+                        },
                     ),
                 ],
                 style={
                     "background": "#111",
+                    "position": "relative",
                     "width": "100%",
                 },
             ),
@@ -135,7 +188,7 @@ def create_dash_app(
             html.Div(id="preview-status"),
             html.Small(
                 "Hold O for a clean image. I = inferable, N = no in-frame target, "
-                "M = missing proposal, U = unsure."
+                "click the visible shuttle then press M = missing proposal, U = unsure."
             ),
             dcc.Checklist(
                 id="verbose-candidate-labels",
@@ -211,6 +264,47 @@ def create_dash_app(
     let imageOnlyAnnotatedSrc = null;
     let imageOnlyCleanSrc = null;
 
+    function setMissingPosition(value) {
+      const input = document.getElementById('missing-position');
+      if (!input) return;
+      const setter = Object.getOwnPropertyDescriptor(
+        window.HTMLInputElement.prototype, 'value'
+      ).set;
+      setter.call(input, value);
+      input.dispatchEvent(new Event('input', {bubbles: true}));
+      input.dispatchEvent(new Event('change', {bubbles: true}));
+    }
+
+    function clearMissingPosition() {
+      setMissingPosition('');
+      const marker = document.getElementById('missing-position-marker');
+      if (marker) marker.style.display = 'none';
+    }
+
+    document.addEventListener('click', function(e) {
+      const image = e.target;
+      if (!image || image.id !== 'center-image') return;
+      const url = new URL(image.src, window.location.href);
+      const match = url.pathname.match(/\\/annotation\\/frame\\/([^/]+)\\/(\\d+)\\.jpg$/);
+      if (!match) return;
+      const rect = image.getBoundingClientRect();
+      if (!rect.width || !rect.height) return;
+      const x = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+      const y = Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height));
+      setMissingPosition(JSON.stringify({
+        source_id: decodeURIComponent(match[1]),
+        frame: Number(match[2]),
+        x: x,
+        y: y
+      }));
+      const marker = document.getElementById('missing-position-marker');
+      if (marker) {
+        marker.style.left = (x * 100) + '%';
+        marker.style.top = (y * 100) + '%';
+        marker.style.display = 'block';
+      }
+    });
+
     function activateAnnotationControl(element) {
       if (!element) return;
       const navigation = ['previous','next','preview-previous','preview-center','preview-next'];
@@ -280,6 +374,9 @@ def create_dash_app(
       restoreImageOnly();
     });
     window.addEventListener('blur', restoreImageOnly);
+    document.addEventListener('load', function(e) {
+      if (e.target && e.target.id === 'center-image') clearMissingPosition();
+    }, true);
     </script>
     """
     app.index_string = app.index_string.replace("</body>", keyboard_script + "</body>")
@@ -496,6 +593,7 @@ def create_dash_app(
             "n_clicks",
         ),
         State("session-state", "data"),
+        State("missing-position", "value"),
         prevent_initial_call=True,
     )
     def edit_target(
@@ -506,6 +604,7 @@ def create_dash_app(
         next_: int | None,
         candidate_clicks: list[int | None],
         raw_state: dict[str, Any],
+        raw_missing_position: str | None,
     ) -> tuple[dict[str, Any], str]:
         submitted = SessionState(**raw_state)
         triggered = callback_context.triggered_id
@@ -574,6 +673,7 @@ def create_dash_app(
             if label_kind is None:
                 return asdict(state), "No annotation action"
             annotation_metadata = None
+            canonical_position = None
             if label_kind == "selected":
                 source = registry.sources[burst.source_id]
                 overlays = getattr(task_plugin, "annotator_overlays", task_plugin.overlays)(source, frame)
@@ -595,6 +695,13 @@ def create_dash_app(
                     "grouping_version": selected_overlay.get("grouping_version"),
                     "representative_candidate_id": candidate_id,
                 }
+            elif label_kind == "missing_proposal":
+                try:
+                    canonical_position = missing_proposal_position(
+                        raw_missing_position, burst.source_id, frame
+                    )
+                except ValueError as exc:
+                    return asdict(state), str(exc)
             event = event_store.record(
                 task=burst.task,
                 source_id=burst.source_id,
@@ -606,6 +713,7 @@ def create_dash_app(
                 session_id=state.session_id,
                 annotation_suggestion=suggestion,
                 annotation_metadata=annotation_metadata,
+                canonical_position=canonical_position,
             )
             correction_cursors.discard(correction_cursor)
             state = session_manager.advance(state, queue)

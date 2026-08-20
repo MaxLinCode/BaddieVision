@@ -231,8 +231,40 @@ def test_validity_is_an_explicit_input_and_time_must_be_centered():
             model(batch).candidate_logits[0, 0], model(invalid).candidate_logits[0, 0]
         )
     batch.relative_time_seconds += 2
+    # Direct mutation invalidates the batch's validation provenance. Production
+    # batches are treated as immutable after CPU collation.
+    batch.validated = False
     with pytest.raises(ValueError, match="centered"):
         model(batch)
+
+
+def test_vectorized_selection_loss_matches_frame_local_reference():
+    batch = _batch(batch_size=2)
+    model = TemporalShuttleSelector(_small_config())
+    output = model(batch)
+    reference = []
+    for batch_index, frame_index in torch.nonzero(
+        batch.frame_mask & (batch.targets != -100), as_tuple=False
+    ).tolist():
+        slots = torch.nonzero(
+            batch.candidate_mask[batch_index]
+            & (batch.candidate_frame_indices[batch_index] == frame_index),
+            as_tuple=False,
+        ).flatten()
+        logits = torch.cat(
+            (
+                output.candidate_logits[batch_index, slots],
+                output.null_logits[batch_index, frame_index].view(1),
+            )
+        )
+        target = int(batch.targets[batch_index, frame_index])
+        resolved = len(slots) if target == -1 else target
+        reference.append(
+            torch.nn.functional.cross_entropy(
+                logits.view(1, -1), torch.tensor([resolved])
+            )
+        )
+    torch.testing.assert_close(model.loss(batch, output), torch.stack(reference).mean())
 
 
 def test_tiny_temporal_association_problem_can_overfit():

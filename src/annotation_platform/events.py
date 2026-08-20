@@ -67,8 +67,8 @@ class AnnotationEvent:
         candidate_position = value.get("candidate_position")
         if candidate_position is not None:
             candidate_position = _validate_candidate_position(candidate_position)
-            if value.get("label_kind") != "selected":
-                raise ValueError("only selected labels may carry candidate_position")
+            if value.get("label_kind") not in {"selected", "missing_proposal"}:
+                raise ValueError("only visible-target labels may carry candidate_position")
         return cls(
             revision_id=str(value["revision_id"]),
             task=str(value["task"]),
@@ -301,6 +301,7 @@ class EventStore:
         annotation_suggestion: AnnotationSuggestion | None = None,
         annotation_metadata: Mapping[str, Any] | None = None,
         review_action_override: str | None = None,
+        canonical_position: Mapping[str, Any] | None = None,
     ) -> AnnotationEvent:
         plugin, source = self.registry.resolve(task, source_id)
         annotator = str(annotator).strip()
@@ -329,7 +330,11 @@ class EventStore:
             candidate_id=candidate_id,
             candidate_artifact_sha256=candidate_artifact_sha256,
         )
-        candidate_position = None
+        candidate_position = (
+            _validate_candidate_position(canonical_position)
+            if canonical_position is not None
+            else None
+        )
         if label_kind == "selected":
             resolver = getattr(plugin, "resolve_candidate_position", None)
             if resolver is not None:
@@ -341,6 +346,14 @@ class EventStore:
                         candidate_artifact_sha256=candidate_artifact_sha256,
                     )
                 )
+        elif (
+            label_kind == "missing_proposal"
+            and candidate_position is None
+            and review_action_override not in {"migrated", "derived"}
+        ):
+            raise ValueError(
+                "new missing_proposal labels require a clicked canonical position"
+            )
         suggestion_mapping = asdict(annotation_suggestion) if annotation_suggestion else None
         if annotation_suggestion is not None:
             if not annotation_suggestion.verified:

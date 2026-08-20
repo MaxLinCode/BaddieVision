@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+from .identity import SourceIdentity, inspect_source, sha256_file
+
 CATALOG_SCHEMA = "baddievision_source_catalog"
 CATALOG_VERSION = 1
 DEFAULT_SEED = 1729
@@ -17,8 +19,7 @@ _SOURCE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 def _sha256(path: Path) -> str:
-    with path.open("rb") as handle:
-        return hashlib.file_digest(handle, "sha256").hexdigest()
+    return sha256_file(path)
 
 
 def _portable_path(path: Path, parent: Path) -> str:
@@ -55,14 +56,48 @@ def _loso_manifest(source_ids: list[str], seed: int) -> dict[str, Any]:
 class SourceEntry:
     source_id: str
     video_path: Path
-    output_dir: Path
-    candidates_path: Path
-    frozen_candidates_path: Path
-    assignments_path: Path
-    pose_cache_path: Path
-    calibration_path: Path
+    artifact_root: Path
     enabled: bool = True
-    video_sha256: str | None = None
+
+    @property
+    def identity_path(self) -> Path:
+        return self.artifact_root / "source.json"
+
+    @property
+    def output_dir(self) -> Path:
+        return self.artifact_root
+
+    @property
+    def candidates_path(self) -> Path:
+        return self.artifact_root / "shuttle" / "candidates.pilot.jsonl"
+
+    @property
+    def frozen_candidates_path(self) -> Path:
+        return self.artifact_root / "shuttle" / "candidates.frozen.jsonl"
+
+    @property
+    def person_tracks_path(self) -> Path:
+        return self.artifact_root / "players" / "person_tracks.jsonl"
+
+    @property
+    def assignments_path(self) -> Path:
+        return self.artifact_root / "players" / "assignments.jsonl"
+
+    @property
+    def pose_cache_path(self) -> Path:
+        return self.artifact_root / "players" / "poses.jsonl"
+
+    @property
+    def calibration_path(self) -> Path:
+        return self.artifact_root / "court" / "calibration.json"
+
+    @property
+    def rally_predictions_path(self) -> Path:
+        return self.artifact_root / "rallies" / "predictions.jsonl"
+
+    @property
+    def rally_proposals_path(self) -> Path:
+        return self.artifact_root / "rallies" / "proposals.json"
 
     def candidate_path(self, stage: str) -> Path:
         if stage == "pilot":
@@ -77,8 +112,10 @@ class SourceStatus:
     source_id: str
     enabled: bool
     video: bool
+    identity: bool
     candidates: bool
     frozen_candidates: bool
+    person_tracks: bool
     assignments: bool
     pose_cache: bool
     calibration: bool
@@ -86,17 +123,31 @@ class SourceStatus:
 
     @property
     def annotation_ready(self) -> bool:
-        return self.enabled and self.video and (self.frozen_candidates or self.candidates)
+        return self.enabled and self.video and self.identity and (self.frozen_candidates or self.candidates)
 
     @property
     def experiment_ready(self) -> bool:
         return (
             self.annotation_ready
             and self.frozen_candidates
+            and self.person_tracks
             and self.assignments
             and self.pose_cache
             and self.calibration
             and not self.problems
+        )
+
+    @property
+    def rally_ready(self) -> bool:
+        """Rally inference deliberately has no shuttle dependency."""
+        rally_problems = tuple(
+            problem for problem in self.problems
+            if not problem.startswith(("candidate artifact", "frozen candidate artifact"))
+        )
+        return (
+            self.enabled and self.video and self.identity and self.person_tracks
+            and self.assignments and self.pose_cache and self.calibration
+            and not rally_problems
         )
 
 
@@ -117,38 +168,18 @@ class SourceCatalog:
         sources = []
         for raw in raw_sources:
             source_id = str(raw["source_id"])
-            output_dir = _resolve(path.parent, raw["output_dir"])
-            artifacts = raw.get("artifacts", {})
+            # schema v1 originally allowed every artifact path to be specified.
+            # Read its output_dir as the artifact root, but never retain the
+            # competing per-artifact path authorities when writing again.
+            root_value = raw.get("artifact_root", raw.get("output_dir"))
+            if root_value is None:
+                raise ValueError(f"source {source_id} has no artifact_root")
             sources.append(
                 SourceEntry(
                     source_id=source_id,
                     video_path=_resolve(path.parent, raw["video_path"]),
-                    output_dir=output_dir,
-                    candidates_path=_resolve(
-                        path.parent,
-                        artifacts.get("candidates", output_dir / "shuttle_candidates_pilot.jsonl"),
-                    ),
-                    frozen_candidates_path=_resolve(
-                        path.parent,
-                        artifacts.get("frozen_candidates", output_dir / "shuttle_candidates_frozen.jsonl"),
-                    ),
-                    assignments_path=_resolve(
-                        path.parent,
-                        artifacts.get("assignments", output_dir / "player_assignments.jsonl"),
-                    ),
-                    pose_cache_path=_resolve(
-                        path.parent,
-                        artifacts.get("pose_cache", output_dir / "pose_cache.jsonl"),
-                    ),
-                    calibration_path=_resolve(
-                        path.parent,
-                        artifacts.get(
-                            "calibration",
-                            path.parent.parent / "features" / "court" / f"{source_id}.json",
-                        ),
-                    ),
+                    artifact_root=_resolve(path.parent, root_value),
                     enabled=bool(raw.get("enabled", True)),
-                    video_sha256=raw.get("video_sha256"),
                 )
             )
         if len({source.source_id for source in sources}) != len(sources):
@@ -161,7 +192,6 @@ class SourceCatalog:
         *,
         source_id: str | None = None,
         output_dir: str | Path | None = None,
-        calibration_path: str | Path | None = None,
     ) -> SourceEntry:
         video = Path(video_path).expanduser().resolve()
         if not video.is_file():
@@ -169,36 +199,33 @@ class SourceCatalog:
         source_id = source_id or video.stem
         if not _SOURCE_ID.fullmatch(source_id):
             raise ValueError("source ID may contain only letters, digits, '.', '_' and '-'")
-        digest = _sha256(video)
+        identity = inspect_source(source_id, video)
         if source_id in self.sources:
             current = self.sources[source_id]
-            if current.video_path == video and current.video_sha256 == digest:
+            if (
+                current.video_path == video
+                and current.identity_path.is_file()
+                and SourceIdentity.read(current.identity_path) == identity
+            ):
                 return current
             raise ValueError(f"source ID already refers to a different video: {source_id}")
         for current in self.sources.values():
-            if current.video_sha256 == digest:
+            if (
+                current.identity_path.is_file()
+                and SourceIdentity.read(current.identity_path).video_sha256 == identity.video_sha256
+            ):
                 raise ValueError(f"video is already registered as {current.source_id}")
         output = (
             Path(output_dir).expanduser().resolve()
             if output_dir is not None
             else (self.path.parent.parent / "outputs" / source_id).resolve()
         )
-        calibration = (
-            Path(calibration_path).expanduser().resolve()
-            if calibration_path is not None
-            else (self.path.parent.parent / "features" / "court" / f"{source_id}.json").resolve()
-        )
         entry = SourceEntry(
             source_id=source_id,
             video_path=video,
-            output_dir=output,
-            candidates_path=output / "shuttle_candidates_pilot.jsonl",
-            frozen_candidates_path=output / "shuttle_candidates_frozen.jsonl",
-            assignments_path=output / "player_assignments.jsonl",
-            pose_cache_path=output / "pose_cache.jsonl",
-            calibration_path=calibration,
-            video_sha256=digest,
+            artifact_root=output,
         )
+        identity.write(entry.identity_path)
         self.sources[source_id] = entry
         self.write()
         return entry
@@ -218,15 +245,7 @@ class SourceCatalog:
             "source_id": source.source_id,
             "enabled": source.enabled,
             "video_path": _portable_path(source.video_path, parent),
-            "video_sha256": source.video_sha256,
-            "output_dir": _portable_path(source.output_dir, parent),
-            "artifacts": {
-                "candidates": _portable_path(source.candidates_path, parent),
-                "frozen_candidates": _portable_path(source.frozen_candidates_path, parent),
-                "assignments": _portable_path(source.assignments_path, parent),
-                "pose_cache": _portable_path(source.pose_cache_path, parent),
-                "calibration": _portable_path(source.calibration_path, parent),
-            },
+            "artifact_root": _portable_path(source.artifact_root, parent),
         }
 
     def select(self, source_ids: Iterable[str] | None = None) -> list[SourceEntry]:
@@ -241,24 +260,105 @@ class SourceCatalog:
 
     def status(self, source: SourceEntry) -> SourceStatus:
         problems = []
-        if source.video_path.is_file() and source.video_sha256:
-            if _sha256(source.video_path) != source.video_sha256:
-                problems.append("video fingerprint changed")
+        identity = None
+        if source.identity_path.is_file():
+            try:
+                identity = SourceIdentity.read(source.identity_path)
+                if identity.source_id != source.source_id:
+                    problems.append("source identity ID differs from catalog")
+                if source.video_path.is_file() and _sha256(source.video_path) != identity.video_sha256:
+                    problems.append("video fingerprint changed")
+            except (OSError, ValueError, KeyError, json.JSONDecodeError):
+                problems.append("source identity is invalid")
         if source.calibration_path.is_file():
             try:
                 calibration = json.loads(source.calibration_path.read_text(encoding="utf-8"))
                 if "image_size" not in calibration:
                     problems.append("calibration has no image_size")
+                metadata = calibration.get("artifact_metadata", {})
+                if identity is not None and (
+                    calibration.get("image_size") != [identity.width, identity.height]
+                    or metadata.get("source_id") != source.source_id
+                    or metadata.get("source_identity_sha256") != identity.fingerprint
+                    or metadata.get("frame_indexing") != "source_local_zero_based"
+                ):
+                    problems.append("calibration source identity/geometry differs")
             except (OSError, json.JSONDecodeError):
                 problems.append("calibration is not valid JSON")
+        assignments_valid = source.assignments_path.is_file()
+        if assignments_valid and source.calibration_path.is_file():
+            try:
+                first_line = source.assignments_path.open(encoding="utf-8").readline()
+                assignment_metadata = json.loads(first_line)
+                if (
+                    assignment_metadata.get("source_id") != source.source_id
+                    or (
+                        identity is not None
+                        and assignment_metadata.get("source_identity_sha256")
+                        != identity.fingerprint
+                    )
+                    or assignment_metadata.get("frame_indexing")
+                    != "source_local_zero_based"
+                    or assignment_metadata.get("calibration_sha256")
+                    != _sha256(source.calibration_path)
+                ):
+                    assignments_valid = False
+                    problems.append("player assignments source/calibration lineage differs")
+            except (OSError, json.JSONDecodeError):
+                assignments_valid = False
+                problems.append("player assignments metadata is invalid")
+        candidates_valid = source.candidates_path.is_file()
+        frozen_valid = source.frozen_candidates_path.is_file()
+        for path, label in (
+            (source.candidates_path, "candidate artifact"),
+            (source.frozen_candidates_path, "frozen candidate artifact"),
+        ):
+            if not path.is_file():
+                continue
+            try:
+                metadata = json.loads(path.open(encoding="utf-8").readline())
+                artifact_count = metadata.get("source_frame_count", metadata.get("frame_count"))
+                if metadata.get("schema") != "shuttle_candidates":
+                    raise ValueError("wrong schema")
+                if identity is not None and artifact_count is not None and int(artifact_count) != identity.frame_count:
+                    raise ValueError("frame count differs")
+                if identity is not None and metadata.get("source_frame_range") not in (None, [0, identity.frame_count - 1]):
+                    raise ValueError("frame range differs")
+            except (OSError, ValueError, json.JSONDecodeError):
+                if path == source.candidates_path:
+                    candidates_valid = False
+                else:
+                    frozen_valid = False
+                problems.append(f"{label} metadata is invalid or stale")
+        person_tracks_valid = source.person_tracks_path.is_file()
+        if person_tracks_valid and identity is not None:
+            try:
+                metadata = json.loads(source.person_tracks_path.open(encoding="utf-8").readline())
+                if metadata.get("schema") != "person_tracks" or int(metadata.get("frame_count", -1)) != identity.frame_count:
+                    raise ValueError("person-track identity differs")
+            except (OSError, ValueError, json.JSONDecodeError):
+                person_tracks_valid = False
+                problems.append("person-track metadata is invalid or stale")
+        pose_valid = source.pose_cache_path.is_file()
+        if pose_valid and person_tracks_valid:
+            try:
+                metadata = json.loads(source.pose_cache_path.open(encoding="utf-8").readline())
+                expected = f"sha256:{_sha256(source.person_tracks_path)}"
+                if metadata.get("schema") != "pose_cache" or metadata.get("raw_artifact_fingerprint") != expected:
+                    raise ValueError("pose input fingerprint differs")
+            except (OSError, ValueError, json.JSONDecodeError):
+                pose_valid = False
+                problems.append("pose artifact metadata is invalid or stale")
         return SourceStatus(
             source_id=source.source_id,
             enabled=source.enabled,
             video=source.video_path.is_file(),
-            candidates=source.candidates_path.is_file(),
-            frozen_candidates=source.frozen_candidates_path.is_file(),
-            assignments=source.assignments_path.is_file(),
-            pose_cache=source.pose_cache_path.is_file(),
+            identity=identity is not None,
+            candidates=candidates_valid,
+            frozen_candidates=frozen_valid,
+            person_tracks=person_tracks_valid,
+            assignments=assignments_valid,
+            pose_cache=pose_valid,
             calibration=source.calibration_path.is_file(),
             problems=tuple(problems),
         )

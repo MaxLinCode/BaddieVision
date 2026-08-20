@@ -1,0 +1,77 @@
+{
+  "schema": "baddievision_real_source_golden",
+  "schema_version": 1,
+  "source": {
+    "source_id": "malaysia_max_30s_to_120s",
+    "video_sha256": "f6f7fc86f4c7567a85ca3de5c4f1a520b721dfe6963d0fa94d2e8cab21929756",
+    "frame_indexing": "source_local_zero_based",
+    "frame_range": [0, 2699],
+    "frame_count": 2700,
+    "width": 1920,
+    "height": 1080,
+    "fps": [30, 1],
+    "parent_provenance": {"start_time_seconds": 30, "end_time_seconds": 120}
+  },
+  "baseline_commit": "eafefe7",
+  "artifacts": {
+    "shuttle_candidates": {
+      "sha256": "89b7dab252b6ea26eb618451a00362a033dcc6211ccc93d98c97657d52832b1a",
+      "frame_records": 2700,
+      "candidate_records": 48215
+    },
+    "player_assignments": {
+      "sha256": "87fa9cf0e419f027e27d3afa4455c46ecd4d42b41198223f47b8eea18401ffb0",
+      "frame_records": 2700
+    },
+    "pose_cache": {
+      "sha256": "0ddd022cf978a0e31b9fe748874cd24c11840b5560094884b735e2e81946d9e0",
+      "pose_records": 4856,
+      "detected_records": 4842
+    },
+    "shuttle_annotations_sha256": "e8903886a49cf5d0fec4d0743befd98e05822ccc15247c762d756ab8e4e41425",
+    "rally_intervals_sha256": "ac1f638a366eb99c22122af163993be6d07f2d645b87bcf704e75003b3cfbbb5"
+  },
+  "labels": {
+    "rally_count": 6,
+    "rally_frame_count": 476,
+    "shuttle_event_counts": {
+      "selected": 247,
+      "missing_proposal": 127,
+      "occluded_inferable": 7,
+      "no_in_frame_target": 8,
+      "unsure": 1
+    }
+  },
+  "representative_compiled_window": {
+    "burst_id": "dense-malaysia_max_30s_to_120s-000000015",
+    "anchor_frame": 15,
+    "frame_range": [0, 45],
+    "owned_frame_count": 30,
+    "candidate_values_shape": [223, 12],
+    "frame_values_shape": [46, 154],
+    "candidate_values_sha256": "9502edd42b5aa7b59e5686fc0130276dc37a7d4adfb75b1cd1a5d7335ca07696",
+    "frame_values_sha256": "445e29773644d0d0d40ffacb2823a0d00eb3636535a66b2bec1bbe7ee5d6b48d",
+    "targets_sha256": "a478ef7bb15192f2927f53228243f788d81f852a9d06cd937bdba4cb3cf9c02c",
+    "inplay_targets_sha256": "a478ef7bb15192f2927f53228243f788d81f852a9d06cd937bdba4cb3cf9c02c"
+  },
+  "baseline_joint_output": {
+    "run": "joint-selector-loso-15ep-20260716",
+    "record_count": 2700,
+    "decoded_inplay_count": 1585,
+    "outcomes": {"selected": 1045, "no_shuttle": 540, "not_required": 1115}
+  },
+  "canonical_vertical_slice": {
+    "doctor_state": "experiment_ready",
+    "frozen_candidates_sha256": "89b7dab252b6ea26eb618451a00362a033dcc6211ccc93d98c97657d52832b1a",
+    "assignments_sha256": "9f8264db9848524f1eb7253bd3e77349c0ce71a10c56b9dd60bc91db2a14247f",
+    "assignments_records": 2700,
+    "pose_cache_sha256": "8bd106a2a348f2e9ab4b9172bcd599425a45657fcb63e2e17388bd916b48df60",
+    "pose_cache_records": 14568,
+    "legacy_artifacts_unchanged": true
+  },
+  "expected_material_differences": [
+    "Schema-v1 rally manifests do not prove non-rally coverage; their non-rally targets change from 0 to -100 until reviewed coverage is declared.",
+    "Selected shuttle targets are matched by normalized coordinate before the legacy candidate-ID fallback.",
+    "The unavailable historical pose-model file was replaced by the maintained downloaded model. During validation, a first-run fingerprint-ordering bug produced one path-only cache generation before the resolved model digest generation. The incremental cache preserved all generations; the implementation now resolves the model before fingerprinting so new sources do not repeat this transition. Player assignments were regenerated against the canonical calibration."
+  ]
+}

@@ -15,6 +15,7 @@ class InPlayDecoderConfig:
     threshold: float = 0.5
     max_gap_seconds: float = 0.2
     minimum_duration_seconds: float = 0.5
+    preserve_edge_runs: bool = False
 
     def __post_init__(self) -> None:
         if not 0 <= self.threshold <= 1:
@@ -56,6 +57,8 @@ def decode_inplay_probabilities(
                 decoded[gap_start : gap_end + 1] = [True] * (gap_end - gap_start + 1)
     minimum = max(1, round(config.minimum_duration_seconds * fps))
     for start, end in _runs(decoded):
+        if config.preserve_edge_runs and (start == 0 or end == len(decoded) - 1):
+            continue
         if end - start + 1 < minimum:
             decoded[start : end + 1] = [False] * (end - start + 1)
     return tuple(decoded)

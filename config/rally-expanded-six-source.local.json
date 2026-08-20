@@ -1,0 +1,71 @@
+{
+  "schema": "clean_rally_experiment_config",
+  "schema_version": 1,
+  "seed": 1729,
+  "camera_sources": {
+    "Malaysia": [
+      "malaysia_max_30s_to_120s",
+      "malaysia_max_390s_to_ends"
+    ],
+    "Max-vs-Nik": [
+      "max_vs_nik_30s_to_120s",
+      "max_vs_nik_120s_to_ends"
+    ],
+    "Bothell": [
+      "ff_bothell-seg3"
+    ],
+    "Max-vs-Lucas": [
+      "max_vs_lucas_6-19"
+    ]
+  },
+  "dataset": {
+    "pose_visibility_threshold": 0.5,
+    "rally_feature_view": "full",
+    "rally_intervals_path": "../.annotation-final/rallies.csv",
+    "rally_manifest_path": "../.annotation-final/rallies.manifest.json",
+    "sources": [
+      {
+        "source_id": "malaysia_max_30s_to_120s",
+        "video_path": "../outputs/malaysia_max_30s_to_120s/malaysia_max_30s_to_120s_input.mp4",
+        "assignments_path": "../outputs/malaysia_max_30s_to_120s/players/assignments.jsonl",
+        "pose_cache_path": "../outputs/malaysia_max_30s_to_120s/players/poses.jsonl",
+        "calibration_path": "../outputs/malaysia_max_30s_to_120s/court/calibration.json"
+      },
+      {
+        "source_id": "malaysia_max_390s_to_ends",
+        "video_path": "../outputs/malaysia_max_390s_to_ends/malaysia_max_390s_to_ends_input.mp4",
+        "assignments_path": "../outputs/malaysia_max_390s_to_ends/players/assignments.jsonl",
+        "pose_cache_path": "../outputs/malaysia_max_390s_to_ends/players/poses.jsonl",
+        "calibration_path": "../outputs/malaysia_max_390s_to_ends/court/calibration.json"
+      },
+      {
+        "source_id": "max_vs_nik_30s_to_120s",
+        "video_path": "../outputs/max_vs_nik_30s_to_120s/max_vs_nik_30s_to_120s_input.mp4",
+        "assignments_path": "../outputs/max_vs_nik_30s_to_120s/players/assignments.jsonl",
+        "pose_cache_path": "../outputs/max_vs_nik_30s_to_120s/players/poses.jsonl",
+        "calibration_path": "../outputs/max_vs_nik_30s_to_120s/court/calibration.json"
+      },
+      {
+        "source_id": "max_vs_nik_120s_to_ends",
+        "video_path": "../outputs/max_vs_nik_120s_to_ends/max_vs_nik_120s_to_ends_input.mp4",
+        "assignments_path": "../outputs/max_vs_nik_120s_to_ends/players/assignments.jsonl",
+        "pose_cache_path": "../outputs/max_vs_nik_120s_to_ends/players/poses.jsonl",
+        "calibration_path": "../outputs/max_vs_nik_120s_to_ends/court/calibration.json"
+      },
+      {
+        "source_id": "ff_bothell-seg3",
+        "video_path": "../outputs/ff_bothell-seg3/ff_bothell-seg3_input.mp4",
+        "assignments_path": "../outputs/ff_bothell-seg3/players/assignments.jsonl",
+        "pose_cache_path": "../outputs/ff_bothell-seg3/players/poses.jsonl",
+        "calibration_path": "../outputs/ff_bothell-seg3/court/calibration.json"
+      },
+      {
+        "source_id": "max_vs_lucas_6-19",
+        "video_path": "../outputs/max_vs_lucas_6-19/max_vs_lucas_6-19_input.mp4",
+        "assignments_path": "../outputs/max_vs_lucas_6-19/players/assignments.jsonl",
+        "pose_cache_path": "../outputs/max_vs_lucas_6-19/players/poses.jsonl",
+        "calibration_path": "../outputs/max_vs_lucas_6-19/court/calibration.json"
+      }
+    ]
+  }
+}

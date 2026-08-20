@@ -1,6 +1,7 @@
 import pytest
 
 from src.temporal_selector import (
+    build_leave_one_group_out,
     build_leave_one_source_out,
     build_two_source_crossfit,
     partition_metrics_by_queue,
@@ -87,3 +88,25 @@ def test_leave_one_source_out_holds_out_each_source_once():
     assert [fold.training_source_ids for fold in manifest.folds] == [
         ("two", "three"), ("one", "three"), ("one", "two")
     ]
+
+
+def test_leave_one_group_out_keeps_related_segments_together():
+    manifest = build_leave_one_group_out(
+        (("malaysia-short", "malaysia-end"), ("nik-short", "nik-end"), ("bothell",)),
+        seed=71,
+    )
+    assert manifest.folds[0].evaluation_source_ids == (
+        "malaysia-short", "malaysia-end"
+    )
+    assert manifest.folds[0].training_source_ids == (
+        "nik-short", "nik-end", "bothell"
+    )
+    assert manifest == build_leave_one_group_out(
+        (("malaysia-short", "malaysia-end"), ("nik-short", "nik-end"), ("bothell",)),
+        seed=71,
+    )
+
+
+def test_leave_one_group_out_rejects_overlapping_groups():
+    with pytest.raises(ValueError, match="disjoint"):
+        build_leave_one_group_out((("one", "two"), ("two", "three")))

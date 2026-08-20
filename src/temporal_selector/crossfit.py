@@ -73,6 +73,31 @@ def build_leave_one_source_out(
     return CrossFitManifest(int(seed), folds, fingerprint)
 
 
+def build_leave_one_group_out(
+    source_groups: Sequence[Sequence[str]], *, seed: int = 1729
+) -> CrossFitManifest:
+    """Build folds that hold out complete related-source groups together."""
+    groups = tuple(tuple(dict.fromkeys(map(str, group))) for group in source_groups)
+    if len(groups) < 2 or any(not group for group in groups):
+        raise ValueError("leave-one-group-out requires at least two non-empty groups")
+    flattened = tuple(source for group in groups for source in group)
+    if len(flattened) != len(set(flattened)):
+        raise ValueError("crossfit source groups must be disjoint")
+    folds = tuple(
+        CrossFitFold(
+            chr(ord("A") + index),
+            tuple(source for other in groups if other != held_out for source in other),
+            held_out,
+        )
+        for index, held_out in enumerate(groups)
+    )
+    payload = {"seed": int(seed), "folds": [vars(fold) for fold in folds]}
+    fingerprint = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return CrossFitManifest(int(seed), folds, fingerprint)
+
+
 def validate_out_of_source_predictions(
     manifest: CrossFitManifest, predictions: Iterable[Mapping[str, Any]]
 ) -> None:
