@@ -8,6 +8,7 @@ import pytest
 
 from src.single_video import (
     copy_model_tree,
+    load_track_models,
     load_track_rows,
     prepare_working_video,
     read_video_info,
@@ -178,6 +179,66 @@ def test_model_tree_copy_and_validation(tmp_path: Path) -> None:
     assert validate_model_root(target) == target
 
 
+def test_tracknet_only_model_bundle_is_valid_by_default(tmp_path: Path) -> None:
+    root = tmp_path / "bundle"
+    for relative in (
+        "models/TrackNet_torchscript.pt",
+        "InPlay/models/player.pt",
+        "src/TrackNetV3/ckpts/TrackNet_best.pt",
+    ):
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"model")
+
+    assert validate_model_root(root) == root
+    with pytest.raises(FileNotFoundError, match="InpaintNet"):
+        validate_model_root(root, use_inpaintnet=True)
+
+
+def test_load_track_models_loads_inpaintnet_only_when_enabled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import sys
+    import types
+    import torch
+
+    root = tmp_path / "bundle"
+    for relative in (
+        "models/TrackNet_torchscript.pt",
+        "models/InpaintNet_torchscript.pt",
+        "InPlay/models/player.pt",
+        "src/TrackNetV3/ckpts/TrackNet_best.pt",
+        "src/TrackNetV3/ckpts/InpaintNet_best.pt",
+    ):
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"model")
+
+    loaded_scripts: list[str] = []
+    predict_args = types.ModuleType("TrackNetV3.predictArgs")
+    predict_args.load_torchscript_model = lambda path: loaded_scripts.append(path) or path
+    monkeypatch.setitem(sys.modules, "TrackNetV3.predictArgs", predict_args)
+    monkeypatch.setattr(
+        torch,
+        "load",
+        lambda path, **_: {
+            "param_dict": {"seq_len": 8 if "InpaintNet" in str(path) else 9, "bg_mode": "average"}
+        },
+    )
+
+    tracknet_only = load_track_models(root)
+    assert tracknet_only["inpaintnet_enabled"] is False
+    assert tracknet_only["tracking_stage"] == "tracknet"
+    assert "inpaintnet" not in tracknet_only
+    assert all("InpaintNet" not in path for path in loaded_scripts)
+
+    legacy = load_track_models(root, use_inpaintnet=True)
+    assert legacy["inpaintnet_enabled"] is True
+    assert legacy["tracking_stage"] == "tracknet_inpaintnet"
+    assert legacy["inpaintnet_seq_len"] == 8
+    assert any("InpaintNet" in path for path in loaded_scripts)
+
+
 def test_manifest_and_zip_keep_existing_layout(tmp_path: Path) -> None:
     result_dir = tmp_path / "sample"
     result_dir.mkdir()
@@ -232,7 +293,7 @@ def test_preview_track_loading_and_metadata_schema(monkeypatch: pytest.MonkeyPat
 
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     info = read_video_info(video)
-    models = {"tracknet_checkpoint": "/models/track.pt", "inpaintnet_checkpoint": "/models/inpaint.pt"}
+    models = {"tracknet_checkpoint": "/models/track.pt"}
     pose_backend = {"name": "automatic-test-backend"}
     write_metadata(
         metadata_path,
@@ -251,7 +312,8 @@ def test_preview_track_loading_and_metadata_schema(monkeypatch: pytest.MonkeyPat
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     assert metadata["model_info"] == {
         "tracknet_checkpoint": "/models/track.pt",
-        "inpaintnet_checkpoint": "/models/inpaint.pt",
+        "inpaintnet_enabled": False,
+        "tracking_stage": "tracknet",
         "player_detector": "yolov8n.pt",
         "player_detector_class_id": 0,
         "player_detector_class_name": "person",
@@ -261,3 +323,53 @@ def test_preview_track_loading_and_metadata_schema(monkeypatch: pytest.MonkeyPat
     assert metadata["working_video"]["input_handling_mode"] == "byte-copy"
     assert metadata["working_video"]["stream_copy"] is False
     assert "color_management" not in metadata
+
+
+def test_metadata_includes_inpaintnet_provenance_only_when_enabled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import torch
+
+    video = tmp_path / "input.mp4"
+    metadata_path = tmp_path / "metadata.json"
+    _write_video(video, fps=30, frames=2)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    info = read_video_info(video)
+    write_metadata(
+        metadata_path, "sample", video, video, info, info,
+        {
+            "tracknet_checkpoint": "/models/track.pt",
+            "inpaintnet_checkpoint": "/models/inpaint.pt",
+            "inpaintnet_enabled": True,
+            "tracking_stage": "tracknet_inpaintnet",
+        },
+        None, None, None, player_detector="yolov8n.pt", pose_backend={"name": "test"},
+    )
+
+    model_info = json.loads(metadata_path.read_text())["model_info"]
+    assert model_info["inpaintnet_enabled"] is True
+    assert model_info["tracking_stage"] == "tracknet_inpaintnet"
+    assert model_info["inpaintnet_checkpoint"] == "/models/inpaint.pt"
+
+
+@pytest.mark.parametrize(
+    "notebook_name",
+    [
+        "Single_Video_Feature_Extraction_Colab.ipynb",
+        "Single_Video_Feature_Extraction_Kaggle.ipynb",
+        "Single_Video_Feature_Extraction_Local.ipynb",
+    ],
+)
+def test_supported_notebooks_default_to_tracknet_only(notebook_name: str) -> None:
+    notebook_path = Path(__file__).parents[1] / "notebooks" / notebook_name
+    notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
+    source = "".join(
+        line
+        for cell in notebook["cells"]
+        for line in cell.get("source", [])
+    )
+
+    assert "USE_INPAINTNET = False" in source
+    assert "load_track_models(REPO_DIR, use_inpaintnet=USE_INPAINTNET)" in source
+    assert 'models["inpaintnet"]' not in source
+    assert "reuse_models=models" in source

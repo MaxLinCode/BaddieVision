@@ -349,7 +349,8 @@ def write_metadata(
         "created_at": datetime.now(timezone.utc).isoformat(),
         "model_info": {
             "tracknet_checkpoint": models["tracknet_checkpoint"],
-            "inpaintnet_checkpoint": models["inpaintnet_checkpoint"],
+            "inpaintnet_enabled": bool(models.get("inpaintnet_enabled", False)),
+            "tracking_stage": models.get("tracking_stage", "tracknet"),
             "player_detector": player_detector,
             "player_detector_class_id": 0,
             "player_detector_class_name": "person",
@@ -362,6 +363,8 @@ def write_metadata(
             "device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
         },
     }
+    if metadata["model_info"]["inpaintnet_enabled"]:
+        metadata["model_info"]["inpaintnet_checkpoint"] = models["inpaintnet_checkpoint"]
     for section, info in (("original_video", original_video_info), ("working_video", working_video_info)):
         metadata[section]["color"] = {
             key: info.get(key) for key in (

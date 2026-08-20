@@ -1,0 +1,26 @@
+{
+  "schema": "temporal_selector_crossfit_manifest",
+  "schema_version": 1,
+  "seed": 1729,
+  "folds": [
+    {
+      "fold_id": "A",
+      "training_source_ids": [
+        "malaysia_max_30s_to_120s"
+      ],
+      "evaluation_source_ids": [
+        "max_vs_nik_30s_to_120s"
+      ]
+    },
+    {
+      "fold_id": "B",
+      "training_source_ids": [
+        "max_vs_nik_30s_to_120s"
+      ],
+      "evaluation_source_ids": [
+        "malaysia_max_30s_to_120s"
+      ]
+    }
+  ],
+  "fingerprint": "52592228bd8e50349cb3e9efa567ded97f80fff6b951e5edf7cf138799d9b0e5"
+}

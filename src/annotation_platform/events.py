@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import uuid
 from dataclasses import asdict, dataclass
@@ -35,6 +36,8 @@ class AnnotationEvent:
     superseded_revision: str | None
     review_action: str = "human_created"
     annotation_suggestion: Mapping[str, Any] | None = None
+    annotation_metadata: Mapping[str, Any] | None = None
+    candidate_position: Mapping[str, Any] | None = None
 
     @property
     def key(self) -> LabelKey:
@@ -61,6 +64,11 @@ class AnnotationEvent:
         if value.get("label_kind") == "skip":
             raise ValueError("unsupported annotation label kind: skip")
         candidate_id = value.get("candidate_id")
+        candidate_position = value.get("candidate_position")
+        if candidate_position is not None:
+            candidate_position = _validate_candidate_position(candidate_position)
+            if value.get("label_kind") != "selected":
+                raise ValueError("only selected labels may carry candidate_position")
         return cls(
             revision_id=str(value["revision_id"]),
             task=str(value["task"]),
@@ -84,10 +92,59 @@ class AnnotationEvent:
                 if isinstance(value.get("annotation_suggestion"), dict)
                 else None
             ),
+            annotation_metadata=(
+                value.get("annotation_metadata")
+                if isinstance(value.get("annotation_metadata"), dict)
+                else None
+            ),
+            candidate_position=candidate_position,
         )
 
     def to_mapping(self) -> dict[str, object]:
-        return asdict(self)
+        value = asdict(self)
+        if self.candidate_position is None:
+            value.pop("candidate_position")
+        return value
+
+
+_POSITION_FIELDS = (
+    "peak_position_normalized",
+    "weighted_centroid_normalized",
+    "center_normalized",
+)
+
+
+def _validate_candidate_position(value: object) -> dict[str, object]:
+    """Validate the self-contained coordinate snapshot used by new selections."""
+    if not isinstance(value, Mapping):
+        raise ValueError("candidate_position must be an object")
+    if value.get("coordinate_space") != "normalized_image_xy":
+        raise ValueError("candidate_position coordinate_space must be normalized_image_xy")
+    if value.get("canonical_field") != "peak_position_normalized":
+        raise ValueError("candidate_position canonical_field must be peak_position_normalized")
+    result: dict[str, object] = {
+        "coordinate_space": "normalized_image_xy",
+        "canonical_field": "peak_position_normalized",
+    }
+    for field in _POSITION_FIELDS:
+        point = value.get(field)
+        if not isinstance(point, (list, tuple)) or len(point) != 2:
+            raise ValueError(f"candidate_position {field} must be [x, y]")
+        coordinates: list[float] = []
+        for coordinate in point:
+            if isinstance(coordinate, bool):
+                raise ValueError(f"candidate_position {field} must contain finite coordinates in [0, 1]")
+            try:
+                number = float(coordinate)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"candidate_position {field} must contain finite coordinates in [0, 1]"
+                ) from exc
+            if not math.isfinite(number) or not 0.0 <= number <= 1.0:
+                raise ValueError(f"candidate_position {field} must contain finite coordinates in [0, 1]")
+            coordinates.append(number)
+        result[field] = coordinates
+    return result
 
 
 @dataclass(frozen=True)
@@ -242,6 +299,8 @@ class EventStore:
         revision_id: str | None = None,
         timestamp: str | None = None,
         annotation_suggestion: AnnotationSuggestion | None = None,
+        annotation_metadata: Mapping[str, Any] | None = None,
+        review_action_override: str | None = None,
     ) -> AnnotationEvent:
         plugin, source = self.registry.resolve(task, source_id)
         annotator = str(annotator).strip()
@@ -270,6 +329,18 @@ class EventStore:
             candidate_id=candidate_id,
             candidate_artifact_sha256=candidate_artifact_sha256,
         )
+        candidate_position = None
+        if label_kind == "selected":
+            resolver = getattr(plugin, "resolve_candidate_position", None)
+            if resolver is not None:
+                candidate_position = _validate_candidate_position(
+                    resolver(
+                        source,
+                        frame=int(frame),
+                        candidate_id=candidate_id,
+                        candidate_artifact_sha256=candidate_artifact_sha256,
+                    )
+                )
         suggestion_mapping = asdict(annotation_suggestion) if annotation_suggestion else None
         if annotation_suggestion is not None:
             if not annotation_suggestion.verified:
@@ -290,6 +361,12 @@ class EventStore:
             review_action = "human_confirmed" if agrees else "human_corrected"
         else:
             review_action = "human_created"
+        if review_action_override is not None:
+            if annotation_suggestion is not None:
+                raise ValueError("review_action_override cannot accompany a suggestion")
+            if review_action_override not in {"migrated", "derived"}:
+                raise ValueError("unsupported review_action_override")
+            review_action = review_action_override
         event = AnnotationEvent(
             revision_id=revision_id or str(uuid.uuid4()),
             task=task,
@@ -305,6 +382,8 @@ class EventStore:
             superseded_revision=head.revision_id if head else None,
             review_action=review_action,
             annotation_suggestion=suggestion_mapping,
+            annotation_metadata=dict(annotation_metadata) if annotation_metadata else None,
+            candidate_position=candidate_position,
         )
         # Validate the chain before touching disk.
         replay_events((*state.events, event))
@@ -354,8 +433,36 @@ class EventStore:
             for event in selected:
                 record = event.to_mapping()
                 record["type"] = "label"
+                if event.label_kind == "selected" and event.candidate_position is None:
+                    position = self._historical_candidate_position(event)
+                    if position is None:
+                        record["candidate_position"] = {
+                            "coordinate_space": "normalized_image_xy",
+                            "canonical_field": "peak_position_normalized",
+                            "coordinates_available": False,
+                        }
+                    else:
+                        record["candidate_position"] = position
                 output.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
         return output_path
+
+    def _historical_candidate_position(
+        self, event: AnnotationEvent
+    ) -> Mapping[str, object] | None:
+        """Resolve an old selection only when its exact artifact is still registered."""
+        try:
+            plugin, source = self.registry.resolve(event.task, event.source_id)
+            resolver = getattr(plugin, "resolve_candidate_position")
+            return _validate_candidate_position(
+                resolver(
+                    source,
+                    frame=event.frame,
+                    candidate_id=event.candidate_id,
+                    candidate_artifact_sha256=event.candidate_artifact_sha256,
+                )
+            )
+        except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+            return None
 
     def undo_last(self, *, annotator: str, session_id: str) -> AnnotationEvent:
         """Append an undo revision for this session's latest still-current edit."""

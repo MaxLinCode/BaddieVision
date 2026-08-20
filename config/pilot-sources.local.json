@@ -1,0 +1,14 @@
+{
+  "sources": [
+    {
+      "source_id": "malaysia_max_30s_to_120s",
+      "video_path": "../outputs/malaysia_max_30s_to_120s/malaysia_max_30s_to_120s_input.mp4",
+      "candidates_path": "../outputs/malaysia_max_30s_to_120s/shuttle_candidates_pilot.jsonl"
+    },
+    {
+      "source_id": "max_vs_nik_30s_to_120s",
+      "video_path": "../outputs/max_vs_nik_30s_to_120s/max_vs_nik_30s_to_120s_input.mp4",
+      "candidates_path": "../outputs/max_vs_nik_30s_to_120s/shuttle_candidates_pilot.jsonl"
+    }
+  ]
+}
