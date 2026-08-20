@@ -1,0 +1,969 @@
+"""Validated annotation-window adapter for the temporal selector."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+from collections import Counter
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Literal, Mapping, Sequence
+
+import numpy as np
+import torch
+import cv2
+from torch.utils.data import Dataset
+
+from src.annotation_platform.events import AnnotationEvent, replay_events
+from src.annotation_platform.queues import AnnotationQueue
+from src.annotation_platform.shuttle import GROUPING_VERSION
+from src.court_projection import HALF_LENGTH, HALF_WIDTH
+from src.single_video.shuttle import (
+    CANDIDATE_RETENTION_POLICY,
+    read_shuttle_candidates,
+)
+from src.workflow.labels import canonicalize_shuttle_event, match_candidate_by_position
+
+from .batch import MASKED_TARGET, NULL_TARGET, SelectorBatch
+from .rally_intervals import RallyInterval, read_rally_intervals
+
+FrameView = Literal["candidates_only", "players_court", "full_context"]
+PoseCoordinateMode = Literal["image", "player_relative"]
+FRAME_DIMS = {"candidates_only": 0, "players_court": 22, "full_context": 154}
+POSE_REPRESENTATION_VERSION = {
+    "image": "image-normalized-v1",
+    "player_relative": "pelvis-root-shoulder-torso-bbox-scale-v1",
+}
+MASKED_LABELS = {
+    "missing_proposal",
+    "occluded_inferable",
+    "unsure",
+    "no_shuttle",
+    "dropped_by_k",
+}
+
+
+def _frozen_candidate_frames(
+    metadata: Mapping[str, Any],
+    records: Sequence[Mapping[str, Any]],
+    *,
+    retention_k: int,
+) -> dict[int, tuple[Mapping[str, Any], ...]]:
+    """Validate and return the artifact-owned grouped/ranked candidate view."""
+    view = metadata.get("frozen_candidate_view")
+    expected_view = {
+        "schema_version": 1,
+        "record_field": "frozen_candidates",
+        "grouping_version": GROUPING_VERSION,
+        "ordering_policy": list(CANDIDATE_RETENTION_POLICY),
+        "retention_k": retention_k,
+    }
+    if view != expected_view:
+        raise ValueError("candidate artifact has no compatible frozen candidate view")
+
+    output: dict[int, tuple[Mapping[str, Any], ...]] = {}
+    seen_group_ids: set[str] = set()
+    for record in records:
+        frame = int(record["frame"])
+        raw = record.get("candidates")
+        frozen = record.get("frozen_candidates")
+        if not isinstance(raw, list) or not isinstance(frozen, list):
+            raise ValueError(f"frame {frame} has an incomplete frozen candidate view")
+        if len(frozen) > retention_k:
+            raise ValueError(f"frame {frame} exceeds frozen retention K={retention_k}")
+        raw_ids = {str(item.get("candidate_id", "")) for item in raw}
+        if "" in raw_ids or len(raw_ids) != len(raw):
+            raise ValueError(
+                f"frame {frame} has invalid or duplicate raw candidate IDs"
+            )
+        covered_raw_ids: set[str] = set()
+        for group in frozen:
+            group_id = str(group.get("candidate_id", ""))
+            members = group.get("raw_member_ids")
+            if (
+                not group_id
+                or group_id in seen_group_ids
+                or group.get("grouping_version") != GROUPING_VERSION
+                or not isinstance(members, list)
+                or not members
+            ):
+                raise ValueError(f"frame {frame} has an invalid frozen candidate group")
+            member_ids = [str(item) for item in members]
+            if len(set(member_ids)) != len(member_ids):
+                raise ValueError(f"frame {frame} has duplicate frozen group members")
+            if group_id not in member_ids or not set(member_ids) <= raw_ids:
+                raise ValueError(
+                    f"frame {frame} frozen group does not match raw candidates"
+                )
+            if covered_raw_ids.intersection(member_ids):
+                raise ValueError(
+                    f"frame {frame} assigns a raw candidate more than once"
+                )
+            covered_raw_ids.update(member_ids)
+            seen_group_ids.add(group_id)
+        if covered_raw_ids != raw_ids:
+            raise ValueError(
+                f"frame {frame} frozen view does not cover retained raw candidates"
+            )
+        output[frame] = tuple(frozen)
+    return output
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _jsonl(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    records = [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    if not records or records[0].get("type") != "metadata":
+        raise ValueError(f"artifact has no metadata record: {path}")
+    return records[0], records[1:]
+
+
+@dataclass(frozen=True)
+class SelectorSourceConfig:
+    source_id: str
+    video_path: Path
+    candidates_path: Path
+    assignments_path: Path
+    pose_cache_path: Path
+    calibration_path: Path
+
+    def __post_init__(self) -> None:
+        for name in (
+            "video_path",
+            "candidates_path",
+            "assignments_path",
+            "pose_cache_path",
+            "calibration_path",
+        ):
+            object.__setattr__(
+                self, name, Path(getattr(self, name)).expanduser().resolve()
+            )
+
+
+@dataclass(frozen=True)
+class SelectorDataConfig:
+    sources: tuple[SelectorSourceConfig, ...]
+    queue_paths: tuple[Path, ...]
+    annotations_path: Path
+    context_mode: FrameView = "full_context"
+    minimum_cutoff: float = 0.05
+    retention_k: int = 8
+    pose_visibility_threshold: float = 0.5
+    pose_coordinate_mode: PoseCoordinateMode = "image"
+    expected_annotation_sha256: str | None = None
+    rally_intervals_path: Path | None = None
+    rally_manifest_path: Path | None = None
+
+    def __post_init__(self) -> None:
+        if self.context_mode not in FRAME_DIMS:
+            raise ValueError(f"unsupported context mode: {self.context_mode}")
+        if self.pose_coordinate_mode not in POSE_REPRESENTATION_VERSION:
+            raise ValueError(f"unsupported pose coordinate mode: {self.pose_coordinate_mode}")
+        if not math.isclose(float(self.minimum_cutoff), 0.05) or self.retention_k != 8:
+            raise ValueError("this dataset version is frozen at cutoff 0.05 and K=8")
+        if len({source.source_id for source in self.sources}) != len(self.sources):
+            raise ValueError("selector source IDs must be unique")
+        object.__setattr__(
+            self,
+            "queue_paths",
+            tuple(Path(p).expanduser().resolve() for p in self.queue_paths),
+        )
+        object.__setattr__(
+            self, "annotations_path", Path(self.annotations_path).expanduser().resolve()
+        )
+        if (self.rally_intervals_path is None) != (self.rally_manifest_path is None):
+            raise ValueError("rally interval CSV and manifest must be configured together")
+        for name in ("rally_intervals_path", "rally_manifest_path"):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, Path(value).expanduser().resolve())
+
+
+@dataclass(frozen=True)
+class SelectorWindow:
+    source_id: str
+    burst_id: str
+    queue_kind: str
+    anchor_frame: int
+    frame_indices: tuple[int, ...]
+    owned_frames: frozenset[int]
+    relative_time_seconds: torch.Tensor
+    candidate_values: torch.Tensor
+    candidate_validity: torch.Tensor
+    candidate_frame_indices: torch.Tensor
+    candidate_ids: tuple[str, ...]
+    frame_values: torch.Tensor
+    frame_validity: torch.Tensor
+    targets: torch.Tensor
+    target_status: tuple[str, ...]
+    inplay_targets: torch.Tensor | None = None
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+    rally_start_targets: torch.Tensor | None = None
+    rally_end_targets: torch.Tensor | None = None
+
+
+def rally_boundary_targets(
+    intervals: Sequence[RallyInterval],
+    partial_start_rally_ids: frozenset[str],
+    frame_indices: Sequence[int],
+    owned_frames: frozenset[int],
+    inplay_targets: Sequence[int],
+    *,
+    fps: float,
+    taper_seconds: float = 0.25,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Derive owned/reviewed soft boundary targets from strict intervals."""
+    if fps <= 0 or taper_seconds <= 0:
+        raise ValueError("boundary target FPS and taper must be positive")
+    starts: list[float] = []
+    ends: list[float] = []
+    for frame, inplay in zip(frame_indices, inplay_targets):
+        if frame not in owned_frames or int(inplay) not in (0, 1):
+            starts.append(float(MASKED_TARGET))
+            ends.append(float(MASKED_TARGET))
+            continue
+        start = end = 0.0
+        for interval in intervals:
+            if interval.rally_id not in partial_start_rally_ids:
+                start = max(
+                    start,
+                    max(0.0, 1.0 - abs(frame - interval.start_frame) / (fps * taper_seconds)),
+                )
+            end = max(
+                end,
+                max(0.0, 1.0 - abs(frame - interval.end_frame) / (fps * taper_seconds)),
+            )
+        starts.append(start)
+        ends.append(end)
+    return torch.tensor(starts), torch.tensor(ends)
+
+
+def _candidate_values(candidate: Mapping[str, Any]) -> tuple[list[float], list[bool]]:
+    fields = (
+        ("weighted_centroid_normalized", 2),
+        ("peak_position_normalized", 2),
+        ("bbox_normalized", 4),
+        ("area_normalized", 1),
+        ("peak_activation_normalized", 1),
+        ("mean_activation_normalized", 1),
+        ("total_activation_normalized", 1),
+    )
+    values: list[float] = []
+    valid: list[bool] = []
+    for name, width in fields:
+        raw = candidate.get(name)
+        if width == 1:
+            raw = [candidate.get(name, candidate.get(name.replace("_normalized", "")))]
+        ok = isinstance(raw, (list, tuple)) and len(raw) == width
+        parsed = [float(item) for item in raw] if ok else [0.0] * width
+        ok = ok and all(math.isfinite(item) for item in parsed)
+        values.extend(parsed if ok else [0.0] * width)
+        valid.extend([ok] * width)
+    return values, valid
+
+
+def _validate_calibration(path: Path, image_size: tuple[int, int]) -> None:
+    """Validate source calibration without exposing camera geometry to the model."""
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if tuple(value.get("image_size", ())) != image_size:
+        raise ValueError("calibration image_size does not match source artifacts")
+    matrix = np.asarray(value.get("image_to_court"), dtype=float)
+    if (
+        matrix.shape != (3, 3)
+        or not np.isfinite(matrix).all()
+        or abs(np.linalg.det(matrix)) < 1e-12
+    ):
+        raise ValueError("calibration homography is invalid")
+
+
+def _frame_context(
+    assignment: Mapping[str, Any],
+    poses: Mapping[tuple[int, int], Mapping[str, Any]],
+    frame: int,
+    image_size: tuple[int, int],
+    mode: FrameView,
+    visibility_threshold: float,
+    pose_coordinate_mode: PoseCoordinateMode,
+) -> tuple[list[float], list[bool]]:
+    if mode == "candidates_only":
+        return [], []
+    width, height = image_size
+    values, validity = [], []
+    player_poses: list[tuple[list[float], list[bool]]] = []
+    for role in ("P1", "P2"):
+        slot = assignment.get("slots", {}).get(role, {})
+        item = slot.get("assignment")
+        if not isinstance(item, Mapping):
+            values.extend([0.0] * 11)
+            validity.extend([False] * 11)
+            player_poses.append(([0.0] * 66, [False] * 66))
+            continue
+        bbox, foot = item.get("bbox"), item.get("foot")
+        player = [
+            float(bbox[0]) / width,
+            float(bbox[1]) / height,
+            float(bbox[2]) / width,
+            float(bbox[3]) / height,
+            float(foot[0]) / width,
+            float(foot[1]) / height,
+            float(item["court_x"]) / HALF_WIDTH,
+            float(item["court_y"]) / HALF_LENGTH,
+            float(item["detection_confidence"]),
+            float(slot["confidence"]),
+            float(item["activity"]),
+        ]
+        if not all(math.isfinite(value) for value in player):
+            raise ValueError(f"non-finite player assignment at frame {frame}")
+        values.extend(player)
+        validity.extend([True] * 11)
+        pose = poses.get((frame, int(item["track_id"])))
+        pose_values, pose_valid = [0.0] * 66, [False] * 66
+        if (
+            pose is not None
+            and pose.get("status") == "detected"
+            and len(pose.get("pose_landmarks", ())) == 33
+        ):
+            pb = pose.get("pose_bbox")
+            if not isinstance(pb, list) or len(pb) != 4:
+                raise ValueError("accepted pose record has no pose_bbox")
+            points: list[tuple[float, float]] = []
+            point_valid: list[bool] = []
+            for landmark in pose["pose_landmarks"]:
+                x = (
+                    float(pb[0]) + float(landmark["x"]) * (float(pb[2]) - float(pb[0]))
+                )
+                y = (
+                    float(pb[1]) + float(landmark["y"]) * (float(pb[3]) - float(pb[1]))
+                )
+                visible = (
+                    math.isfinite(x)
+                    and math.isfinite(y)
+                    and float(landmark.get("visibility", 0)) >= visibility_threshold
+                )
+                points.append((x, y))
+                point_valid.append(visible)
+            if pose_coordinate_mode == "image":
+                normalized = [(x / width, y / height) for x, y in points]
+            else:
+                hips = [index for index in (23, 24) if point_valid[index]]
+                root = (
+                    tuple(
+                        sum(points[index][axis] for index in hips) / len(hips)
+                        for axis in (0, 1)
+                    )
+                    if hips
+                    else (
+                        (float(pb[0]) + float(pb[2])) / 2,
+                        (float(pb[1]) + float(pb[3])) / 2,
+                    )
+                )
+                scales: list[float] = []
+                if point_valid[11] and point_valid[12]:
+                    scales.append(math.dist(points[11], points[12]))
+                shoulders = [index for index in (11, 12) if point_valid[index]]
+                if shoulders and hips:
+                    shoulder_mid = tuple(
+                        sum(points[index][axis] for index in shoulders) / len(shoulders)
+                        for axis in (0, 1)
+                    )
+                    scales.append(math.dist(shoulder_mid, root))
+                scale = next(
+                    (value for value in scales if value > 1.0),
+                    max(1.0, float(pb[3]) - float(pb[1])),
+                )
+                normalized = [
+                    ((x - root[0]) / scale, (y - root[1]) / scale)
+                    for x, y in points
+                ]
+            pose_values, pose_valid = [], []
+            for (x, y), visible in zip(normalized, point_valid):
+                pose_values.extend([x if visible else 0.0, y if visible else 0.0])
+                pose_valid.extend([visible, visible])
+        player_poses.append((pose_values, pose_valid))
+    if mode == "full_context":
+        for pose_values, pose_valid in player_poses:
+            values.extend(pose_values)
+            validity.extend(pose_valid)
+    return values, validity
+
+
+class SelectorWindowDataset(Dataset[SelectorWindow]):
+    """Eagerly validate sparse selector or dense joint rally windows."""
+
+    def __init__(self, config: SelectorDataConfig):
+        self.config = config
+        self.rally_index = (
+            read_rally_intervals(
+                config.rally_intervals_path, config.rally_manifest_path
+            )
+            if config.rally_intervals_path is not None
+            and config.rally_manifest_path is not None
+            else None
+        )
+        self.windows = self._compile()
+        identity = {
+            "schema": "selector_window_dataset",
+            "schema_version": 3 if self.rally_index is not None else 1,
+            "inplay_coverage_policy": (
+                "reviewed_coverage_minus_strict_rallies"
+                if self.rally_index is not None else None
+            ),
+            "minimum_cutoff": config.minimum_cutoff,
+            "retention_k": config.retention_k,
+            "pose_coordinate_mode": config.pose_coordinate_mode,
+            "pose_representation_version": POSE_REPRESENTATION_VERSION[
+                config.pose_coordinate_mode
+            ],
+            "annotation_sha256": _sha256(config.annotations_path),
+            "queue_sha256": [_sha256(path) for path in config.queue_paths],
+            "rally_intervals_sha256": (
+                self.rally_index.intervals_sha256 if self.rally_index else None
+            ),
+            "rally_manifest_sha256": (
+                _sha256(config.rally_manifest_path)
+                if config.rally_manifest_path is not None
+                else None
+            ),
+            "candidate_sha256": {
+                source.source_id: _sha256(source.candidates_path)
+                for source in config.sources
+            },
+            "bursts": [
+                [window.queue_kind, window.source_id, window.burst_id]
+                for window in self.windows
+            ],
+        }
+        fingerprint = hashlib.sha256(
+            json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        statuses = [
+            status
+            for window in self.windows
+            for frame, status in zip(window.frame_indices, window.target_status)
+            if frame in window.owned_frames
+        ]
+        status_counts = dict(sorted(Counter(statuses).items()))
+        inplay_targets = [
+            int(window.inplay_targets[index])
+            for window in self.windows
+            if window.inplay_targets is not None
+            for index, frame in enumerate(window.frame_indices)
+            if frame in window.owned_frames
+        ]
+        self.manifest = {
+            **identity,
+            "dataset_fingerprint": fingerprint,
+            "window_count": len(self.windows),
+            "source_window_counts": {
+                source.source_id: sum(
+                    window.source_id == source.source_id for window in self.windows
+                )
+                for source in config.sources
+            },
+            "target_counts": {
+                "selected_retained": statuses.count("selected_retained"),
+                "null": statuses.count("null"),
+                "masked": sum(
+                    status not in {"selected_retained", "null"} for status in statuses
+                ),
+                "dropped_by_k": statuses.count("dropped_by_k"),
+            },
+            "target_reason_counts": status_counts,
+            "inplay_target_counts": {
+                "negative": inplay_targets.count(0),
+                "positive": inplay_targets.count(1),
+            },
+        }
+
+    def __len__(self) -> int:
+        return len(self.windows)
+
+    def __getitem__(self, index: int) -> SelectorWindow:
+        return self.windows[index]
+
+    def _compile(self) -> tuple[SelectorWindow, ...]:
+        if (
+            self.config.expected_annotation_sha256
+            and _sha256(self.config.annotations_path)
+            != self.config.expected_annotation_sha256
+        ):
+            raise ValueError("annotation fingerprint mismatch")
+        events = [
+            AnnotationEvent.from_mapping(json.loads(line))
+            for line in self.config.annotations_path.read_text().splitlines()
+        ]
+        active = replay_events(events).active
+        queues = [AnnotationQueue.read(path) for path in self.config.queue_paths]
+        bursts = [(queue.kind, burst) for queue in queues for burst in queue.bursts]
+        queue_kind_by_frame = {
+            (burst.source_id, frame): kind
+            for kind, burst in bursts
+            for frame in burst.frames
+        }
+        if len({burst.burst_id for _, burst in bursts}) != len(bursts):
+            raise ValueError("duplicate burst IDs across selector queues")
+        source_map = {source.source_id: source for source in self.config.sources}
+        windows = []
+        for source_id in source_map:
+            source_bursts = [
+                (kind, burst) for kind, burst in bursts if burst.source_id == source_id
+            ]
+            windows.extend(
+                self._compile_source(
+                    source_map[source_id],
+                    source_bursts,
+                    active,
+                    queue_kind_by_frame,
+                )
+            )
+        unknown = {burst.source_id for _, burst in bursts} - set(source_map)
+        if unknown and self.rally_index is None:
+            raise ValueError(f"queue references unknown source IDs: {sorted(unknown)}")
+        return tuple(windows)
+
+    @staticmethod
+    def _dense_specs(
+        *,
+        source_id: str,
+        frame_count: int,
+        fps: float,
+    ) -> list[tuple[str, object]]:
+        """Create one-second ownership regions with two-sided context."""
+        ownership = max(1, math.floor(fps + 0.5))
+        specs: list[tuple[str, object]] = []
+        for start in range(0, frame_count, ownership):
+            frames = tuple(range(start, min(frame_count, start + ownership)))
+            anchor = frames[len(frames) // 2]
+            specs.append(
+                (
+                    "dense",
+                    type(
+                        "DenseBurst",
+                        (),
+                        {
+                            "burst_id": f"dense-{source_id}-{anchor:09d}",
+                            "source_id": source_id,
+                            "anchor_frame": anchor,
+                            "frames": frames,
+                            "candidate_artifact_sha256": None,
+                            "source_video_sha256": None,
+                        },
+                    )(),
+                )
+            )
+        return specs
+
+    def _compile_source(
+        self, source: SelectorSourceConfig, bursts, active, queue_kind_by_frame
+    ) -> list[SelectorWindow]:
+        candidate_sha256 = _sha256(source.candidates_path)
+        source_video_sha256 = _sha256(source.video_path)
+        candidate_meta, candidate_records = read_shuttle_candidates(
+            source.candidates_path
+        )
+        if not math.isclose(
+            float(candidate_meta.get("frozen_minimum_cutoff", -1)),
+            self.config.minimum_cutoff,
+        ):
+            raise ValueError("candidate artifact does not carry the frozen cutoff")
+        if int(candidate_meta.get("frozen_retention_k", -1)) != self.config.retention_k:
+            raise ValueError("candidate artifact does not carry frozen K")
+        if candidate_meta.get("grouping_version") != GROUPING_VERSION:
+            raise ValueError("candidate grouping version mismatch")
+        fps = float(candidate_meta["fps"])
+        image_size = tuple(map(int, candidate_meta["image_size"]))
+        candidate_frames = _frozen_candidate_frames(
+            candidate_meta,
+            candidate_records,
+            retention_k=self.config.retention_k,
+        )
+        expected_frames = list(range(len(candidate_records)))
+        if int(candidate_meta.get("source_frame_count", len(candidate_records))) != len(
+            candidate_records
+        ):
+            raise ValueError("candidate metadata frame count mismatch")
+        if sorted(candidate_frames) != expected_frames:
+            raise ValueError(
+                "candidate frame alignment is not a complete zero-based sequence"
+            )
+        capture = cv2.VideoCapture(str(source.video_path))
+        try:
+            video_fps = float(capture.get(cv2.CAP_PROP_FPS))
+            video_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+            video_size = (
+                int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+            )
+        finally:
+            capture.release()
+        if (
+            not math.isclose(video_fps, fps, rel_tol=0, abs_tol=1e-6)
+            or video_count != len(candidate_records)
+            or video_size != image_size
+        ):
+            raise ValueError(
+                "video FPS/frame count/image size does not align with candidate artifact"
+            )
+        if self.rally_index is not None:
+            rally_source = self.rally_index.sources.get(source.source_id)
+            if rally_source is None:
+                raise ValueError(
+                    f"rally manifest is missing selector source {source.source_id}"
+                )
+            if (
+                rally_source.video_sha256 != source_video_sha256
+                or not math.isclose(rally_source.fps, fps, rel_tol=0, abs_tol=1e-6)
+                or rally_source.frame_count != len(candidate_records)
+            ):
+                raise ValueError("rally interval source provenance mismatch")
+        assignment_meta, assignment_records = _jsonl(source.assignments_path)
+        if (
+            float(assignment_meta["fps"]) != fps
+            or tuple(assignment_meta["frame_size"]) != image_size
+            or int(assignment_meta["frame_count"]) != len(candidate_records)
+        ):
+            raise ValueError("player assignment geometry/frame alignment mismatch")
+        assignments = {int(record["frame"]): record for record in assignment_records}
+        if sorted(assignments) != expected_frames:
+            raise ValueError("player assignment frames are incomplete or misaligned")
+        pose_meta, pose_records = _jsonl(source.pose_cache_path)
+        if pose_meta.get("raw_artifact_fingerprint") != assignment_meta.get(
+            "raw_artifact_fingerprint"
+        ):
+            raise ValueError("pose-cache lineage does not match player assignments")
+        for key in ("pose_model_fingerprint", "preprocessing_fingerprint"):
+            if not str(pose_meta.get(key, "")).startswith("sha256:"):
+                raise ValueError(f"pose cache has invalid {key}")
+        poses = {
+            (int(record["frame"]), int(record["track_id"])): record
+            for record in pose_records
+        }
+        _validate_calibration(source.calibration_path, image_size)
+        if self.rally_index is not None:
+            bursts = self._dense_specs(
+                source_id=source.source_id,
+                frame_count=len(candidate_records),
+                fps=fps,
+            )
+        windows = []
+        for kind, burst in bursts:
+            if (
+                burst.candidate_artifact_sha256 is not None
+                and burst.candidate_artifact_sha256 != candidate_sha256
+            ):
+                raise ValueError("queue candidate fingerprint mismatch")
+            if (
+                burst.source_video_sha256 is not None
+                and burst.source_video_sha256 != source_video_sha256
+            ):
+                raise ValueError("queue video fingerprint mismatch")
+            radius = int(math.floor(fps + 0.5))
+            start = max(0, burst.anchor_frame - radius)
+            end = min(len(candidate_records) - 1, burst.anchor_frame + radius)
+            frame_indices = tuple(range(start, end + 1))
+            owned = frozenset(burst.frames)
+            candidate_values = []
+            candidate_validity = []
+            candidate_indices = []
+            candidate_ids = []
+            frame_values = []
+            frame_validity = []
+            targets = []
+            statuses = []
+            inplay_targets = []
+            rally_start_targets = []
+            rally_end_targets = []
+            derived_reasons: dict[str, str] = {}
+            for local_frame, frame in enumerate(frame_indices):
+                groups = candidate_frames[frame]
+                for group in groups:
+                    value, valid = _candidate_values(group)
+                    candidate_values.append(value)
+                    candidate_validity.append(valid)
+                    candidate_indices.append(local_frame)
+                    candidate_ids.append(str(group["candidate_id"]))
+                values, valid = _frame_context(
+                    assignments[frame],
+                    poses,
+                    frame,
+                    image_size,
+                    self.config.context_mode,
+                    self.config.pose_visibility_threshold,
+                    self.config.pose_coordinate_mode,
+                )
+                frame_values.append(values)
+                frame_validity.append(valid)
+                event = (
+                    active.get(("shuttle_selection", source.source_id, frame))
+                    if frame in owned
+                    else None
+                )
+                target, status = MASKED_TARGET, "context"
+                inplay = (
+                    self.rally_index.target(source.source_id, frame)
+                    if self.rally_index is not None and frame in owned
+                    else MASKED_TARGET
+                )
+                if inplay in (0, 1):
+                    status = "unlabeled_inplay" if inplay else "out_of_play"
+                if event is not None:
+                    if (
+                        event.candidate_artifact_sha256
+                        != candidate_sha256
+                        or event.source_video_sha256 != source_video_sha256
+                    ):
+                        raise ValueError("annotation fingerprint mismatch")
+                    if inplay == 0:
+                        status = "out_of_play"
+                    elif event.label_kind == "no_in_frame_target":
+                        target, status = NULL_TARGET, "null"
+                    elif event.label_kind in MASKED_LABELS:
+                        status = event.label_kind
+                        derived_reason = (event.annotation_metadata or {}).get(
+                            "derived_reason"
+                        )
+                        if derived_reason is not None:
+                            derived_reasons[str(frame)] = str(derived_reason)
+                    elif event.label_kind == "selected":
+                        canonical = canonicalize_shuttle_event(event)
+                        matched = match_candidate_by_position(canonical, groups)
+                        # Historical selected labels may predate coordinate
+                        # snapshots. Their exact fingerprinted candidate IDs
+                        # remain a compatibility fallback, never the new target
+                        # contract.
+                        if matched is None and canonical.coordinate_status == "legacy_unavailable":
+                            members = set(
+                                (event.annotation_metadata or {}).get(
+                                    "raw_member_ids", (event.candidate_id,)
+                                )
+                            )
+                            matched = next(
+                                (
+                                    i
+                                    for i, group in enumerate(groups)
+                                    if members.intersection(group["raw_member_ids"])
+                                ),
+                                None,
+                            )
+                        if matched is None:
+                            status = "dropped_by_k"
+                        else:
+                            target, status = matched, "selected_retained"
+                    else:
+                        raise ValueError(
+                            f"unsupported selector label {event.label_kind!r}"
+                        )
+                targets.append(target)
+                statuses.append(status)
+                inplay_targets.append(inplay)
+            if self.rally_index is not None:
+                start_tensor, end_tensor = rally_boundary_targets(
+                    self.rally_index.for_source(source.source_id),
+                    self.rally_index.partial_start_rally_ids,
+                    frame_indices,
+                    owned,
+                    inplay_targets,
+                    fps=fps,
+                )
+                rally_start_targets = start_tensor.tolist()
+                rally_end_targets = end_tensor.tolist()
+            cv = torch.tensor(candidate_values, dtype=torch.float32).reshape(-1, 12)
+            valid = torch.tensor(candidate_validity, dtype=torch.bool).reshape(-1, 12)
+            windows.append(
+                SelectorWindow(
+                    source.source_id,
+                    burst.burst_id,
+                    kind,
+                    burst.anchor_frame,
+                    frame_indices,
+                    owned,
+                    torch.tensor(
+                        [(frame - burst.anchor_frame) / fps for frame in frame_indices],
+                        dtype=torch.float32,
+                    ),
+                    cv,
+                    valid,
+                    torch.tensor(candidate_indices, dtype=torch.long),
+                    tuple(candidate_ids),
+                    torch.tensor(frame_values, dtype=torch.float32).reshape(
+                        len(frame_indices), FRAME_DIMS[self.config.context_mode]
+                    ),
+                    torch.tensor(frame_validity, dtype=torch.bool).reshape(
+                        len(frame_indices), FRAME_DIMS[self.config.context_mode]
+                    ),
+                    torch.tensor(targets, dtype=torch.long),
+                    tuple(statuses),
+                    (
+                        torch.tensor(inplay_targets, dtype=torch.long)
+                        if self.rally_index is not None
+                        else None
+                    ),
+                    {
+                        "minimum_cutoff": self.config.minimum_cutoff,
+                        "retention_k": self.config.retention_k,
+                        "candidate_sha256": candidate_sha256,
+                        "fps": fps,
+                        "annotation_sha256": _sha256(self.config.annotations_path),
+                        "target_derived_reasons": derived_reasons,
+                        "rally_intervals_sha256": (
+                            self.rally_index.intervals_sha256
+                            if self.rally_index is not None
+                            else None
+                        ),
+                        "owns_rally_boundary": any(
+                            frame in owned
+                            and (
+                                rally_start_targets[index] == 1.0
+                                or rally_end_targets[index] == 1.0
+                            )
+                            for index, frame in enumerate(frame_indices)
+                        ),
+                        "owns_short_rally": any(
+                            frame in owned
+                            and interval.contains(frame)
+                            and (interval.end_frame - interval.start_frame + 1) / fps <= 1.0
+                            for frame in frame_indices
+                            for interval in (
+                                self.rally_index.for_source(source.source_id)
+                                if self.rally_index is not None else ()
+                            )
+                        ),
+                        "label_queue_by_frame": {
+                            str(frame): queue_kind_by_frame[(source.source_id, frame)]
+                            for frame in owned
+                            if (source.source_id, frame) in queue_kind_by_frame
+                        },
+                    },
+                    (
+                        torch.tensor(rally_start_targets, dtype=torch.float32)
+                        if self.rally_index is not None else None
+                    ),
+                    (
+                        torch.tensor(rally_end_targets, dtype=torch.float32)
+                        if self.rally_index is not None else None
+                    ),
+                )
+            )
+        return windows
+
+
+def collate_selector_windows(windows: Sequence[SelectorWindow]) -> SelectorBatch:
+    if not windows:
+        raise ValueError("cannot collate an empty selector batch")
+    batch, max_frames = (
+        len(windows),
+        max(len(window.frame_indices) for window in windows),
+    )
+    max_candidates = max((len(window.candidate_ids) for window in windows), default=0)
+    frame_dim = windows[0].frame_values.shape[1]
+    if any(window.frame_values.shape[1] != frame_dim for window in windows):
+        raise ValueError("cannot collate mixed frame views")
+    candidate_values = torch.zeros(batch, max_candidates, 12)
+    candidate_validity = torch.zeros(batch, max_candidates, 12, dtype=torch.bool)
+    candidate_frame_indices = torch.full((batch, max_candidates), -1, dtype=torch.long)
+    candidate_mask = torch.zeros(batch, max_candidates, dtype=torch.bool)
+    frame_values = torch.zeros(batch, max_frames, frame_dim)
+    frame_validity = torch.zeros(batch, max_frames, frame_dim, dtype=torch.bool)
+    frame_mask = torch.zeros(batch, max_frames, dtype=torch.bool)
+    times = torch.zeros(batch, max_frames)
+    targets = torch.full((batch, max_frames), MASKED_TARGET, dtype=torch.long)
+    has_inplay = any(window.inplay_targets is not None for window in windows)
+    if has_inplay and any(window.inplay_targets is None for window in windows):
+        raise ValueError("cannot collate mixed legacy and joint rally windows")
+    inplay_targets = (
+        torch.full((batch, max_frames), MASKED_TARGET, dtype=torch.long)
+        if has_inplay
+        else None
+    )
+    has_boundaries = any(window.rally_start_targets is not None for window in windows)
+    if has_boundaries and any(
+        window.rally_start_targets is None or window.rally_end_targets is None
+        for window in windows
+    ):
+        raise ValueError("cannot collate mixed boundary-target windows")
+    rally_start_targets = (
+        torch.full((batch, max_frames), float(MASKED_TARGET)) if has_boundaries else None
+    )
+    rally_end_targets = (
+        torch.full((batch, max_frames), float(MASKED_TARGET)) if has_boundaries else None
+    )
+    packed_frame_indices = torch.full((batch, max_frames), -1, dtype=torch.long)
+    packed_candidate_indices = torch.full(
+        (batch, max_candidates), -1, dtype=torch.long
+    )
+    candidate_local_indices = torch.full(
+        (batch, max_candidates), -1, dtype=torch.long
+    )
+    packed_token_count = max(
+        len(window.frame_indices) + len(window.candidate_ids) for window in windows
+    )
+    for index, window in enumerate(windows):
+        nc, nf = len(window.candidate_ids), len(window.frame_indices)
+        candidate_values[index, :nc] = window.candidate_values
+        candidate_validity[index, :nc] = window.candidate_validity
+        candidate_frame_indices[index, :nc] = window.candidate_frame_indices
+        candidate_mask[index, :nc] = True
+        frame_values[index, :nf] = window.frame_values
+        frame_validity[index, :nf] = window.frame_validity
+        frame_mask[index, :nf] = True
+        times[index, :nf] = window.relative_time_seconds
+        targets[index, :nf] = window.targets
+        if inplay_targets is not None and window.inplay_targets is not None:
+            inplay_targets[index, :nf] = window.inplay_targets
+        if rally_start_targets is not None:
+            rally_start_targets[index, :nf] = window.rally_start_targets
+            rally_end_targets[index, :nf] = window.rally_end_targets
+    safe_candidate_frames = candidate_frame_indices.clamp(0, max_frames - 1)
+    candidate_counts = torch.zeros((batch, max_frames), dtype=torch.long)
+    candidate_counts.scatter_add_(
+        1, safe_candidate_frames, candidate_mask.to(torch.long)
+    )
+    group_sizes = (candidate_counts + 1) * frame_mask.to(torch.long)
+    frame_positions = group_sizes.cumsum(dim=1) - group_sizes
+    packed_frame_indices.copy_(frame_positions.masked_fill(~frame_mask, -1))
+    candidate_to_frame = candidate_mask.unsqueeze(-1) & (
+        safe_candidate_frames.unsqueeze(-1)
+        == torch.arange(max_frames).view(1, 1, -1)
+    )
+    candidate_ranks = (
+        candidate_to_frame.to(torch.long)
+        .cumsum(dim=1)
+        .gather(2, safe_candidate_frames.unsqueeze(-1))
+        .squeeze(-1)
+        - 1
+    )
+    packed_candidate_indices.copy_(
+        (
+            frame_positions.gather(1, safe_candidate_frames)
+            + 1
+            + candidate_ranks
+        ).masked_fill(~candidate_mask, -1)
+    )
+    candidate_local_indices.copy_(
+        candidate_ranks.masked_fill(~candidate_mask, -1)
+    )
+    return SelectorBatch(
+        candidate_values,
+        candidate_validity,
+        candidate_frame_indices,
+        candidate_mask,
+        frame_values,
+        frame_validity,
+        frame_mask,
+        times,
+        targets,
+        inplay_targets,
+        packed_frame_indices,
+        packed_candidate_indices,
+        candidate_local_indices,
+        packed_token_count,
+        rally_start_targets=rally_start_targets,
+        rally_end_targets=rally_end_targets,
+    ).validate(frame_feature_dim=frame_dim)

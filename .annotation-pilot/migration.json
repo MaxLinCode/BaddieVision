@@ -1,0 +1,18 @@
+{
+  "artifact_hashes": {
+    "malaysia_max_30s_to_120s": "fb5f4b1d4f31daf5d72dae57b1d0e4e9d14843ce364f5f7a7bf8ea50ae8b8b2c",
+    "max_vs_nik_30s_to_120s": "98a3e2241095124c3cdd877ddfe4a55e4c19205b8848cdc1d999ba6c7cdc1dfa"
+  },
+  "grouping_version": "peak-contained-high-to-low-v1",
+  "kind": "v1_to_threshold_pilot",
+  "migrated_selected_count": 408,
+  "parent_file_sha256": {
+    "events/shuttle.jsonl": "f5500e83c9298dbeea5da9106b9266ac790df967f83791b837ff43bb8a56fcc6",
+    "queues/shuttle-adaptive.json": "9848a1bd45c6a9dee7bac8237fcf81efea55f9b66ec07e51771b27958789f1b4",
+    "queues/shuttle-audit.json": "5e1768c85644a77835d170c2241a3d86f1d1ec7b98a4a66cea1d4ecd9f230997"
+  },
+  "rereview_count": 102,
+  "v1_event_log_sha256": "f5500e83c9298dbeea5da9106b9266ac790df967f83791b837ff43bb8a56fcc6",
+  "v1_revision_count": 713,
+  "v1_runtime": "/Users/maxlin/Code/BaddieVision/.annotation-two-folders"
+}

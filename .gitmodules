@@ -1,4 +1,4 @@
 [submodule "src/TrackNetV3"]
 	path = src/TrackNetV3
 	url = https://github.com/MaxLinCode/TrackNetV3.git
-	branch = codex/badminton-integration
+	branch = codex/shuttle-pilot-recovery

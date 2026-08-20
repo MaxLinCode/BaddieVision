@@ -1,0 +1,66 @@
+{
+  "seed": 1729,
+  "folds": [
+    {
+      "fold_id": "A",
+      "training_source_ids": [
+        "malaysia_max_390s_to_ends",
+        "max_vs_nik_30s_to_120s",
+        "max_vs_nik_120s_to_ends",
+        "ff_bothell-seg3"
+      ],
+      "evaluation_source_ids": [
+        "malaysia_max_30s_to_120s"
+      ]
+    },
+    {
+      "fold_id": "B",
+      "training_source_ids": [
+        "malaysia_max_30s_to_120s",
+        "max_vs_nik_30s_to_120s",
+        "max_vs_nik_120s_to_ends",
+        "ff_bothell-seg3"
+      ],
+      "evaluation_source_ids": [
+        "malaysia_max_390s_to_ends"
+      ]
+    },
+    {
+      "fold_id": "C",
+      "training_source_ids": [
+        "malaysia_max_30s_to_120s",
+        "malaysia_max_390s_to_ends",
+        "max_vs_nik_120s_to_ends",
+        "ff_bothell-seg3"
+      ],
+      "evaluation_source_ids": [
+        "max_vs_nik_30s_to_120s"
+      ]
+    },
+    {
+      "fold_id": "D",
+      "training_source_ids": [
+        "malaysia_max_30s_to_120s",
+        "malaysia_max_390s_to_ends",
+        "max_vs_nik_30s_to_120s",
+        "ff_bothell-seg3"
+      ],
+      "evaluation_source_ids": [
+        "max_vs_nik_120s_to_ends"
+      ]
+    },
+    {
+      "fold_id": "E",
+      "training_source_ids": [
+        "malaysia_max_30s_to_120s",
+        "malaysia_max_390s_to_ends",
+        "max_vs_nik_30s_to_120s",
+        "max_vs_nik_120s_to_ends"
+      ],
+      "evaluation_source_ids": [
+        "ff_bothell-seg3"
+      ]
+    }
+  ],
+  "fingerprint": "6d970307884d39027d1ca98c58a48daef34bc65146472ce6299d7c0eca6a01af"
+}

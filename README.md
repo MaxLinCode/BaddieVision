@@ -186,13 +186,74 @@ The former `InPlay.heuristic.players` command remains as a deprecated
 compatibility wrapper. Court calibration is required only for interpretation;
 missing, ambiguous, or image-size-mismatched calibration is an explicit error.
 
-Extract and train in-play features:
+The following feature-array workflow is retained for legacy reproduction, not
+as the maintained data pipeline:
 
 ```bash
 python InPlay/extract_features.py
 python InPlay/extract_combined_features.py
 python InPlay/train_lstm_model.py
 ```
+
+The maintained joint experiment predicts strict rally state and publishes
+shuttle selections only inside decoded rallies. After labeling fingerprinted
+rally intervals and completing the refill queue documented in
+[`docs/annotation-platform.md`](docs/annotation-platform.md), set
+`dataset.rally_intervals_path` and `dataset.rally_manifest_path` in the selector
+experiment config and run:
+
+```bash
+python3 -m src.temporal_selector.experiment \
+  --config config/selector-experiment.local.json \
+  --output-dir outputs/joint-selector-run \
+  --context-mode full_context
+```
+
+For the matched `InPlay`-only ablation, keep the same config, seed, batch size,
+device, and epoch count and add `--inplay-only`. This sets the shuttle-selection
+loss weight to zero and removes all shuttle-candidate tokens during training,
+per-epoch held-out evaluation, decoder calibration, and final inference. The
+architecture, non-shuttle inputs, and folds remain unchanged:
+
+```bash
+python3 -m src.temporal_selector.experiment \
+  --config config/selector-experiment.local.json \
+  --output-dir outputs/inplay-only-ablation \
+  --context-mode full_context --inplay-only
+```
+
+Joint runs also write `epoch_metrics.json` and
+`epoch-inplay-diagnostics.png` with held-out per-epoch binary and boundary
+diagnostics for every fold.
+
+For the leakage-safe single-camera representation diagnostic, see
+[`docs/within-camera-inplay.md`](docs/within-camera-inplay.md).
+
+To test tapered boundary supervision without changing sampling, add for example
+`--boundary-weight 3 --boundary-window-seconds 1`. The per-frame BCE multiplier
+peaks at 3x at a true state transition, decays linearly to 1x over one second,
+and is normalized by the total effective weight. A boundary weight of 1 is the
+baseline behavior.
+
+Joint runs write per-frame `rally_shuttle_predictions.jsonl` and strict
+`rallies.csv`. Frames outside decoded rallies have shuttle outcome
+`not_required`; clip padding remains an exporter concern.
+
+Register maintained sources through the local workflow catalog. The catalog
+contains only the local video and artifact root; readiness is always derived:
+
+```bash
+python3 -m src.workflow source add --video outputs/example/example_input.mp4 \
+  --source-id example --artifact-root outputs/example
+python3 -m src.workflow source doctor
+python3 -m src.workflow stage import-calibration --source example \
+  --from features/court/example.json
+```
+
+All source artifacts and annotations use source-local frames from zero through
+`frame_count - 1`. Calibration is discovered only at
+`ARTIFACT_ROOT/court/calibration.json`. The `features/court/calibrations.json`
+registry remains relevant only to the separate shot-classifier clip workflow.
 
 Train the YOLO shuttle detector:
 

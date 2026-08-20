@@ -18,7 +18,7 @@ TRACKLET_SCHEMA = "shuttle_tracklets"
 HYPOTHESES_SCHEMA = "shuttle_hypotheses"
 CANDIDATE_SCHEMA_VERSION = 2
 CANDIDATE_EXTRACTION_VERSION = "tracknet-components-v2.0"
-CANDIDATE_THRESHOLDS = (0.2, 0.3, 0.4, 0.5)
+CANDIDATE_THRESHOLDS = (0.05, 0.10, 0.15, 0.20, 0.30, 0.40, 0.50)
 CANDIDATE_RETENTION_KS: tuple[int | None, ...] = (1, 2, 3, 5, 8, 12, None)
 CANDIDATE_RETENTION_POLICY = (
     "peak_activation_desc",
@@ -235,6 +235,10 @@ class ShuttleCandidateCollector:
 
     def write(self, path: str | Path) -> Path:
         path = Path(path)
+        if path.exists():
+            raise FileExistsError(
+                f"candidate artifact already exists; choose a non-overwriting output path: {path}"
+            )
         image_w, image_h = self.image_size
         heatmap_h, heatmap_w = self.heatmap_size
         observed_range = [min(self._frames), max(self._frames)] if self._frames else None
@@ -295,7 +299,7 @@ class ShuttleCandidateCollector:
             },
         }
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w", encoding="utf-8") as output:
+        with path.open("x", encoding="utf-8") as output:
             output.write(json.dumps(metadata, sort_keys=True, separators=(",", ":")) + "\n")
             for frame in sorted(self._frames):
                 output.write(json.dumps({"type": "frame", "frame": frame, "candidates": self._frames[frame]}, sort_keys=True, separators=(",", ":")) + "\n")
@@ -367,7 +371,8 @@ def evaluate_candidate_retention_recall(
 
     Labels must be resolved, one-per-frame records with ``frame`` and a
     ``label_kind``/``outcome`` of ``selected``, ``missing_proposal``,
-    ``no_shuttle``, or ``unsure``. Selected records also carry ``candidate_id``.
+    ``occluded_inferable``, ``no_in_frame_target``, or ``unsure``. Legacy
+    ``no_shuttle`` remains readable. Selected records also carry ``candidate_id``.
 
     This deliberately measures whether the exact human-selected proposal
     survives the production K ranking. It is *not* a threshold-comparison
@@ -391,7 +396,8 @@ def evaluate_candidate_retention_recall(
             normalized_ks.append(k)
 
     hits = {k: 0 for k in normalized_ks}
-    present_frames = missing_frames = no_shuttle_frames = unsure_frames = 0
+    present_frames = selected_frames = missing_frames = 0
+    occluded_frames = no_target_frames = legacy_no_shuttle_frames = unsure_frames = 0
     seen_frames: set[int] = set()
     for label in labels:
         frame = int(label["frame"])
@@ -399,9 +405,13 @@ def evaluate_candidate_retention_recall(
             raise ValueError(f"multiple resolved recall labels for frame {frame}")
         seen_frames.add(frame)
         kind = str(label.get("label_kind", label.get("outcome", ""))).lower()
-        if kind in {"no_shuttle", "unsure"}:
+        if kind in {"no_shuttle", "no_in_frame_target", "occluded_inferable", "unsure"}:
             if kind == "no_shuttle":
-                no_shuttle_frames += 1
+                legacy_no_shuttle_frames += 1
+            elif kind == "no_in_frame_target":
+                no_target_frames += 1
+            elif kind == "occluded_inferable":
+                occluded_frames += 1
             else:
                 unsure_frames += 1
             continue
@@ -419,6 +429,7 @@ def evaluate_candidate_retention_recall(
         if selected_id not in candidate_ids:
             raise ValueError(f"selected candidate {selected_id!r} is not present at frame {frame}")
         present_frames += 1
+        selected_frames += 1
         ranked_ids = [str(candidate["candidate_id"]) for candidate in rank_shuttle_candidates(candidates)]
         selected_rank = ranked_ids.index(selected_id) + 1
         for k in normalized_ks:
@@ -436,8 +447,17 @@ def evaluate_candidate_retention_recall(
         "label_equivalence": "exact_candidate_id",
         "threshold_comparison_valid": False,
         "present_shuttle_frames": present_frames,
+        "observed_target_frames": present_frames,
+        "selected_frames": selected_frames,
         "missing_proposal_frames": missing_frames,
-        "no_shuttle_frames": no_shuttle_frames,
+        "observed_proposal_recall": (
+            selected_frames / present_frames if present_frames else None
+        ),
+        "occluded_inferable_frames": occluded_frames,
+        "no_in_frame_target_frames": no_target_frames,
+        "legacy_no_shuttle_frames": legacy_no_shuttle_frames,
+        # Backward-compatible report key; only legacy labels contribute.
+        "no_shuttle_frames": legacy_no_shuttle_frames,
         "unsure_frames": unsure_frames,
         "recall_at_k": recall_at_k,
         "candidates_per_frame": (

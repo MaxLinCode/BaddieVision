@@ -1,0 +1,9 @@
+{
+  "sources": [
+    {
+      "source_id": "ff_bothell-seg3",
+      "video_path": "../outputs/ff_bothell-seg3/ff_bothell-seg3_input.mp4",
+      "candidates_path": "../outputs/ff_bothell-seg3/shuttle_candidates.jsonl"
+    }
+  ]
+}

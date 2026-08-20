@@ -1,0 +1,84 @@
+{
+  "seed": 1729,
+  "folds": [
+    {
+      "fold_id": "A",
+      "training_source_ids": [
+        "malaysia_max_390s_to_ends",
+        "max_vs_nik_30s_to_120s",
+        "max_vs_nik_120s_to_ends",
+        "ff_bothell-seg3",
+        "max_vs_lucas_6-19"
+      ],
+      "evaluation_source_ids": [
+        "malaysia_max_30s_to_120s"
+      ]
+    },
+    {
+      "fold_id": "B",
+      "training_source_ids": [
+        "malaysia_max_30s_to_120s",
+        "max_vs_nik_30s_to_120s",
+        "max_vs_nik_120s_to_ends",
+        "ff_bothell-seg3",
+        "max_vs_lucas_6-19"
+      ],
+      "evaluation_source_ids": [
+        "malaysia_max_390s_to_ends"
+      ]
+    },
+    {
+      "fold_id": "C",
+      "training_source_ids": [
+        "malaysia_max_30s_to_120s",
+        "malaysia_max_390s_to_ends",
+        "max_vs_nik_120s_to_ends",
+        "ff_bothell-seg3",
+        "max_vs_lucas_6-19"
+      ],
+      "evaluation_source_ids": [
+        "max_vs_nik_30s_to_120s"
+      ]
+    },
+    {
+      "fold_id": "D",
+      "training_source_ids": [
+        "malaysia_max_30s_to_120s",
+        "malaysia_max_390s_to_ends",
+        "max_vs_nik_30s_to_120s",
+        "ff_bothell-seg3",
+        "max_vs_lucas_6-19"
+      ],
+      "evaluation_source_ids": [
+        "max_vs_nik_120s_to_ends"
+      ]
+    },
+    {
+      "fold_id": "E",
+      "training_source_ids": [
+        "malaysia_max_30s_to_120s",
+        "malaysia_max_390s_to_ends",
+        "max_vs_nik_30s_to_120s",
+        "max_vs_nik_120s_to_ends",
+        "max_vs_lucas_6-19"
+      ],
+      "evaluation_source_ids": [
+        "ff_bothell-seg3"
+      ]
+    },
+    {
+      "fold_id": "F",
+      "training_source_ids": [
+        "malaysia_max_30s_to_120s",
+        "malaysia_max_390s_to_ends",
+        "max_vs_nik_30s_to_120s",
+        "max_vs_nik_120s_to_ends",
+        "ff_bothell-seg3"
+      ],
+      "evaluation_source_ids": [
+        "max_vs_lucas_6-19"
+      ]
+    }
+  ],
+  "fingerprint": "481c4d931aa69e27e5b22251951377f47168a7137a7db515334e821b1485510c"
+}

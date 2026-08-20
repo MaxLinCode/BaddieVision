@@ -17,8 +17,9 @@ from tqdm.auto import tqdm
 
 from InPlay.heuristic.person_tracks import load_person_tracks, raw_artifact_fingerprint
 from src.court_projection import HALF_LENGTH, HALF_WIDTH, CourtHomography
-from src.pose_estimator import create_pose_estimator, pose_backend_info
+from src.pose_estimator import create_pose_estimator, ensure_pose_model_asset, pose_backend_info
 from src.single_video.video import read_video_info
+from src.workflow.identity import SourceIdentity
 
 COURT_MARGIN_METERS = 0.3
 REASSIGN_INTERVAL_SECONDS = 0.5
@@ -327,10 +328,22 @@ def pose_model_fingerprint(backend: dict[str, Any]) -> str:
     normalized = dict(backend)
     model_path = Path(str(normalized.get("model_asset_path", "")))
     if model_path.is_file():
-        # Relative and absolute references to the same model must share a cache key.
-        normalized["model_asset_path"] = str(model_path.resolve())
+        # Model bytes, backend, and package version define inference identity.
+        # Absolute host paths are provenance only and must not invalidate an
+        # otherwise identical imported cache.
+        normalized.pop("model_asset_path", None)
         digest = hashlib.sha256(model_path.read_bytes()).hexdigest()
         normalized["model_asset_sha256"] = digest
+    payload = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _legacy_path_pose_model_fingerprint(
+    backend: dict[str, Any], model_asset_sha256: str
+) -> str:
+    """Reconstruct the pre-portability cache key for a verified model digest."""
+    normalized = dict(backend)
+    normalized["model_asset_sha256"] = model_asset_sha256
     payload = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
     return "sha256:" + hashlib.sha256(payload.encode()).hexdigest()
 
@@ -431,7 +444,15 @@ def enrich_pose_cache(
 ) -> tuple[dict[tuple[int, int, tuple[float, ...]], dict[str, Any]], int]:
     """Compute only selected observation keys absent for this raw/model fingerprint."""
     raw_fingerprint = raw_artifact_fingerprint(person_tracks_path)
-    backend = pose_backend_info(pose_model_asset)
+    # Resolve/download the production asset before hashing it. Previously the
+    # first run fingerprinted a missing path and the second run fingerprinted
+    # the downloaded bytes, forcing an unnecessary full recomputation.
+    resolved_model_asset = (
+        ensure_pose_model_asset(pose_model_asset)
+        if estimator_factory is create_pose_estimator
+        else pose_model_asset
+    )
+    backend = pose_backend_info(resolved_model_asset)
     model_fingerprint = pose_model_fingerprint(backend)
     preprocessing_fingerprint = pose_preprocessing_fingerprint(pose_crop_padding)
     metadata, records = load_pose_cache(pose_cache_path)
@@ -441,12 +462,36 @@ def enrich_pose_cache(
         # result directory, so retaining this cache would attach poses to the
         # wrong detections.  Discard only the derived cache and rebuild it.
         metadata, records = None, []
+    cache_needs_upgrade = False
+    if metadata is not None and metadata.get("pose_model_fingerprint") != model_fingerprint:
+        asset_path = Path(str(backend.get("model_asset_path", "")))
+        imported_backend = metadata.get("pose_backend")
+        imported_fingerprint = str(metadata.get("pose_model_fingerprint", ""))
+        if asset_path.is_file() and isinstance(imported_backend, dict):
+            asset_digest = hashlib.sha256(asset_path.read_bytes()).hexdigest()
+            verified_legacy = _legacy_path_pose_model_fingerprint(
+                imported_backend, asset_digest
+            )
+            comparable_backend = {
+                key: value
+                for key, value in imported_backend.items()
+                if key != "model_asset_path"
+            }
+            active_backend = {
+                key: value for key, value in backend.items() if key != "model_asset_path"
+            }
+            if verified_legacy == imported_fingerprint and comparable_backend == active_backend:
+                for item in records:
+                    if item.get("pose_model_fingerprint") == imported_fingerprint:
+                        item["pose_model_fingerprint"] = model_fingerprint
+                metadata["pose_model_fingerprint"] = model_fingerprint
+                metadata["pose_backend"] = backend
+                cache_needs_upgrade = True
     legacy_cache_matches_active_preprocessing = bool(
         metadata is not None
         and int(metadata.get("schema_version", 1)) < POSE_CACHE_SCHEMA_VERSION
         and metadata.get("pose_model_fingerprint") == model_fingerprint
     )
-    cache_needs_upgrade = False
     existing = {
         (int(item["frame"]), int(item["track_id"]), _bbox_key(item["bbox"]),
          item.get("pose_model_fingerprint"),
@@ -476,7 +521,9 @@ def enrich_pose_cache(
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
             raise RuntimeError(f"failed to open pose source: {video_path}")
-        estimator = estimator_factory(model_asset_path=pose_model_asset, running_mode="image")
+        estimator = estimator_factory(
+            model_asset_path=resolved_model_asset, running_mode="image"
+        )
         try:
             last_frame = max(missing_by_frame)
             progress = tqdm(
@@ -515,7 +562,7 @@ def enrich_pose_cache(
                     record = {
                         "type": "pose", "frame": key[0], "track_id": key[1],
                         "bbox": list(key[2]), "raw_artifact_fingerprint": raw_fingerprint,
-                        "pose_bbox": pose_bbox, "raw_artifact_fingerprint": raw_fingerprint,
+                        "pose_bbox": pose_bbox,
                         "pose_model_fingerprint": model_fingerprint,
                         "preprocessing_fingerprint": preprocessing_fingerprint,
                         "status": status, "temporal_status": "original",
@@ -602,6 +649,7 @@ def derive_activity_and_rows(
     assignments: list[dict[str, Any]],
     pose_cache: dict[tuple[int, int, tuple[float, ...]], dict[str, Any]],
     frame_size: tuple[int, int],
+    homography: CourtHomography,
 ) -> list[dict[str, Any]]:
     width, height = frame_size
     diagonal = float(np.hypot(width, height))
@@ -646,6 +694,9 @@ def derive_activity_and_rows(
             previous_foot[slot_number] = foot
             assignment["activity"] = activity
             assignment["foot"] = [float(foot[0]), float(foot[1])]
+            court_x, court_y = homography.project_to_court([foot])[0]
+            assignment["court_x"] = float(court_x)
+            assignment["court_y"] = float(court_y)
             assignment["pose_status"] = cache.get("status") if cache else "missing"
             row.update({
                 f"player{slot_number}_track_id": track_id, f"player{slot_number}_valid": 1,
@@ -704,6 +755,26 @@ def interpret_players(
     if frame_count != int(info["frame_count"]):
         raise ValueError("person tracks frame_count does not match video")
     homography = load_calibration(calibration_path, frame_size)
+    calibration_path = Path(calibration_path).expanduser().resolve()
+    identity_path = calibration_path.parent.parent / "source.json"
+    if calibration_path.name != "calibration.json" or calibration_path.parent.name != "court":
+        raise ValueError("player assignment requires canonical court/calibration.json")
+    if not identity_path.is_file():
+        raise FileNotFoundError(f"source identity is required: {identity_path}")
+    identity = SourceIdentity.read(identity_path)
+    calibration_value = json.loads(calibration_path.read_text(encoding="utf-8"))
+    calibration_metadata = calibration_value.get("artifact_metadata", {})
+    if (
+        calibration_metadata.get("source_id") != identity.source_id
+        or calibration_metadata.get("source_identity_sha256") != identity.fingerprint
+    ):
+        raise ValueError("canonical calibration does not match source identity")
+    if (
+        identity.video_sha256 != hashlib.sha256(Path(video_path).read_bytes()).hexdigest()
+        or identity.frame_count != frame_count
+        or (identity.width, identity.height) != frame_size
+    ):
+        raise ValueError("source identity does not match player-processing video")
     assignments = assign_singles_slots(
         observations, homography, frame_count, float(info["fps"]), frame_size=frame_size,
     )
@@ -724,11 +795,16 @@ def interpret_players(
                         and item.get("pose_model_fingerprint") == active_item.get("pose_model_fingerprint")):
                     item = active_item
                 handle.write(json.dumps(item, separators=(",", ":")) + "\n")
-    rows = derive_activity_and_rows(assignments, cache, frame_size)
+    rows = derive_activity_and_rows(assignments, cache, frame_size, homography)
     assignment_metadata = {
         "type": "metadata", "schema": "player_assignments", "schema_version": 3,
+        "source_id": identity.source_id,
+        "source_identity_sha256": identity.fingerprint,
+        "frame_indexing": "source_local_zero_based",
         "raw_artifact_fingerprint": raw_artifact_fingerprint(person_tracks_path),
-        "calibration": str(calibration_path), "frame_size": list(frame_size),
+        "calibration": str(calibration_path),
+        "calibration_sha256": hashlib.sha256(calibration_path.read_bytes()).hexdigest(),
+        "frame_size": list(frame_size),
         "fps": float(info["fps"]), "frame_count": frame_count,
         "roles": {"P1": "near", "P2": "far"},
         "parameters": {
