@@ -1,12 +1,27 @@
-# Badminton AI
+# BaddieVision
 
-Computer-vision experiments for analyzing badminton video:
+BaddieVision is a research project for turning static-camera badminton video
+into structured match data. It combines player pose estimation, shuttle
+tracking, court calibration, shot classification, and rally segmentation.
+
+![Rally segmentation diagnostic showing the source frame, in-play probability, and decoded interval](outputs/share/rally-segmentation-demo-poster.jpg)
+
+The maintained rally segmenter reached **0.718 macro frame F1** and **0.890
+macro ROC-AUC** in leave-one-camera-group-out evaluation across four camera
+groups (126 rallies and 52,012 labeled frames). These are research results on a
+small private dataset, not a public benchmark. See the
+[evaluation protocol and full metric summary](docs/independent-rally-segmenter.md#expanded-maintained-baseline).
+
+The project includes:
 
 - player pose extraction with MediaPipe;
 - shuttle tracking with TrackNetV3 and YOLO;
 - badminton-shot classification from pose and shuttle features;
-- in-play/rally detection with frame-level and LSTM classifiers.
+- in-play/rally detection with frame-level and LSTM classifiers;
 - metric court projection for static-camera footage.
+
+This is an actively developed research prototype. Source videos, trained
+weights, and generated features are not committed to the repository.
 
 ## Repository layout
 
@@ -25,19 +40,20 @@ Large and generated assets stay on each development machine and are intentionall
 ignored by Git. This includes videos, extracted clips/features, model weights,
 checkpoints, inference output, and NumPy training arrays.
 
-## Set up on WSL/Linux or macOS
+## Quick start
 
 Python 3.11 is recommended because it has reliable wheel availability across the
 computer-vision stack.
 
 ```bash
-git clone --recurse-submodules <your-github-repository-url>
-cd badminton
+git clone --recurse-submodules https://github.com/MaxLinCode/BaddieVision.git
+cd BaddieVision
 
 python3.11 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements-dev.txt
+python -m pytest -q
 ```
 
 If `python3.11` is not available on macOS, install it first with Homebrew:
@@ -264,18 +280,15 @@ A planar homography is valid for points on the floor (player foot positions and
 shuttle landing/contact points). Projecting an airborne shuttle gives only its
 vertical image-ray intersection with the court plane, not its true 3D position.
 
-## Publish to GitHub
+## Contributing
 
-Once you have created an empty repository on GitHub:
+Issues and focused pull requests are welcome. Before submitting a change, run:
 
 ```bash
-git add .
-git status
-git commit -m "Initial project cleanup"
-git branch -M main
-git remote add origin git@github.com:<your-user>/<your-repo>.git
-git push -u origin main
+python -m pytest -q
 ```
 
-Review `git status` before committing. The ignored multi-gigabyte local assets
-should not appear in the staged file list.
+## License
+
+This project is available under the [MIT License](LICENSE). The TrackNetV3
+submodule retains its own license.

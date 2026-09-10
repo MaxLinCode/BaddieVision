@@ -12,6 +12,7 @@ htmlcov/
 .venv/
 venv/
 env/
+.worktrees/
 .env
 .env.*
 !.env.example
@@ -34,7 +35,10 @@ InPlay/videos/
 # Generated features and training arrays
 features/
 clip_features/
-outputs/
+outputs/*
+!outputs/share/
+outputs/share/*
+!outputs/share/rally-segmentation-demo-poster.jpg
 InPlay/features/
 InPlay/clip_features/
 InPlay/data/
@@ -70,3 +74,7 @@ runs/
 # Portable data packages for Colab/Kaggle/Drive
 data_packages/*.zip
 .annotation/
+.annotation-*/
+config/sources.local.json
+config/selector-experiment.generated.json
+config/selector-experiment.generated-loso-manifest.json
