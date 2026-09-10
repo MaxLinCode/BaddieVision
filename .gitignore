@@ -12,6 +12,7 @@ htmlcov/
 .venv/
 venv/
 env/
+.worktrees/
 .env
 .env.*
 !.env.example
@@ -34,7 +35,10 @@ InPlay/videos/
 # Generated features and training arrays
 features/
 clip_features/
-outputs/
+outputs/*
+!outputs/share/
+outputs/share/*
+!outputs/share/rally-segmentation-demo-poster.jpg
 InPlay/features/
 InPlay/clip_features/
 InPlay/data/
@@ -72,19 +76,6 @@ runs/
 data_packages/*.zip
 .annotation/
 .annotation-*/
-!.annotation-final/
-.annotation-final/*
-!.annotation-final/events/
-.annotation-final/events/*
-!.annotation-final/events/shuttle.jsonl
-!.annotation-final/queues/
-.annotation-final/queues/*
-!.annotation-final/queues/shuttle-adaptive.json
-!.annotation-final/queues/shuttle-audit.json
-!.annotation-final/queues/shuttle-refill.json
-!.annotation-final/migration.json
-!.annotation-final/rallies.csv
-!.annotation-final/rallies.manifest.json
 config/sources.local.json
 config/selector-experiment.generated.json
 config/selector-experiment.generated-loso-manifest.json
