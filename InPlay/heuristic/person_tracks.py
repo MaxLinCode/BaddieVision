@@ -73,9 +73,11 @@ def extract_person_tracks(
             source=str(video), classes=[PERSON_CLASS_ID], tracker="bytetrack.yaml",
             stream=True, persist=True, verbose=False,
         )
+        processed_frames = 0
         for frame_index, result in enumerate(
             tqdm(results, total=int(info["frame_count"]) or None, desc="YOLO person tracking")
         ):
+            processed_frames = frame_index + 1
             if result.boxes.id is None:
                 continue
             ids = result.boxes.id.int().cpu().tolist()
@@ -86,6 +88,8 @@ def extract_person_tracks(
                     "type": "observation", "frame": frame_index, "track_id": int(track_id),
                     "bbox": [float(value) for value in bbox], "confidence": float(confidence),
                 }, separators=(",", ":")) + "\n")
+        if processed_frames != int(info["frame_count"]):
+            raise ValueError("person tracking did not decode every source frame")
 
 
 def import_legacy_player_poses(

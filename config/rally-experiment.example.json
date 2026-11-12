@@ -1,0 +1,35 @@
+{
+  "schema": "clean_rally_experiment_config",
+  "schema_version": 1,
+  "seed": 1729,
+  "camera_sources": {
+    "Camera A": [
+      "camera-a-segment-1"
+    ],
+    "Camera B": [
+      "camera-b-segment-1"
+    ]
+  },
+  "dataset": {
+    "pose_visibility_threshold": 0.5,
+    "rally_feature_view": "full",
+    "rally_intervals_path": "../.annotation-final/rallies.csv",
+    "rally_manifest_path": "../.annotation-final/rallies.manifest.json",
+    "sources": [
+      {
+        "source_id": "camera-a-segment-1",
+        "video_path": "../outputs/camera-a-segment-1/camera-a-segment-1_input.mp4",
+        "assignments_path": "../outputs/camera-a-segment-1/players/assignments.jsonl",
+        "pose_cache_path": "../outputs/camera-a-segment-1/players/poses.jsonl",
+        "calibration_path": "../outputs/camera-a-segment-1/court/calibration.json"
+      },
+      {
+        "source_id": "camera-b-segment-1",
+        "video_path": "../outputs/camera-b-segment-1/camera-b-segment-1_input.mp4",
+        "assignments_path": "../outputs/camera-b-segment-1/players/assignments.jsonl",
+        "pose_cache_path": "../outputs/camera-b-segment-1/players/poses.jsonl",
+        "calibration_path": "../outputs/camera-b-segment-1/court/calibration.json"
+      }
+    ]
+  }
+}

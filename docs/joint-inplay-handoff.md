@@ -1,5 +1,10 @@
 # Joint InPlay and Shuttle Selection Handoff
 
+This is a historical research handoff. Its pilot counts and unfinished-data notes
+are superseded by the six-source [independent rally baseline](independent-rally-segmenter.md).
+The maintained inference path is the candidate-free [single-model video workflow](rally-inference.md);
+new shuttle-fusion or model-accuracy experiments belong in a separate PR.
+
 ## Summary
 
 The shuttle task was redefined so continuous localization is no longer required
@@ -110,14 +115,14 @@ Build this before the refill queue so audit frames remain uncontaminated.
 
 ```bash
 python3 -m src.annotation_platform \
-  --config config/annotation-sources.local.json \
+  --config config/annotation-sources.example.json \
   --runtime .annotation-final \
   build-rally-audit \
   --intervals .annotation-final/rallies.csv \
   --interval-manifest .annotation-final/rallies.manifest.json
 
 python3 -m src.annotation_platform \
-  --config config/annotation-sources.local.json \
+  --config config/annotation-sources.example.json \
   --runtime .annotation-final \
   serve --annotator NAME --queue rally-audit
 ```
@@ -126,21 +131,21 @@ python3 -m src.annotation_platform \
 
 ```bash
 python3 -m src.annotation_platform \
-  --config config/annotation-sources.local.json \
+  --config config/annotation-sources.example.json \
   --runtime .annotation-final \
   build-rally-refill \
   --intervals .annotation-final/rallies.csv \
   --interval-manifest .annotation-final/rallies.manifest.json
 
 python3 -m src.annotation_platform \
-  --config config/annotation-sources.local.json \
+  --config config/annotation-sources.example.json \
   --runtime .annotation-final \
   serve --annotator NAME --queue refill
 ```
 
 ### 4. Update the experiment configuration
 
-Set these currently null fields in `config/selector-experiment.local.json`:
+Set these currently null fields in `config/selector-experiment.example.json`:
 
 ```json
 "rally_intervals_path": "../.annotation-final/rallies.csv",
@@ -158,7 +163,7 @@ Also add these completed queues to `dataset.queue_paths`:
 
 ```bash
 python3 -m src.temporal_selector.experiment \
-  --config config/selector-experiment.local.json \
+  --config config/selector-experiment.example.json \
   --output-dir outputs/joint-selector-run \
   --context-mode full_context
 ```

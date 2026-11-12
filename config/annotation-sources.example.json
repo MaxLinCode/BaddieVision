@@ -1,0 +1,14 @@
+{
+  "sources": [
+    {
+      "source_id": "camera-a-segment-1",
+      "video_path": "../outputs/camera-a-segment-1/camera-a-segment-1_input.mp4",
+      "candidates_path": "../outputs/camera-a-segment-1/shuttle_candidates.jsonl"
+    },
+    {
+      "source_id": "camera-b-segment-1",
+      "video_path": "../outputs/camera-b-segment-1/camera-b-segment-1_input.mp4",
+      "candidates_path": "../outputs/camera-b-segment-1/shuttle_candidates.jsonl"
+    }
+  ]
+}

@@ -97,7 +97,7 @@ automatic selection:
 
 ```bash
 .venv/bin/python -m src.temporal_selector.experiment \
-  --config config/selector-experiment.local.json \
+  --config config/selector-experiment.example.json \
   --output-dir outputs/selector-benchmark-b8 \
   --context-mode full_context --epochs 3 --batch-size 8 --device mps
 ```

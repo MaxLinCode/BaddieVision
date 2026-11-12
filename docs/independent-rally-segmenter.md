@@ -24,7 +24,7 @@ Run the experiment on the host so Apple MPS is visible:
 ```bash
 PYTHONPATH=. .venv/bin/python \
   -m src.temporal_selector.rally_experiment \
-  --config config/selector-experiment.local.json \
+  --config config/selector-experiment.example.json \
   --output-dir outputs/independent-rally-camera-held-out-v1 \
   --device mps
 ```
@@ -33,7 +33,7 @@ The recipe is frozen in code: seed 1729, 25 epochs, batch size 16,
 boundary-balanced sampling, start/end auxiliary weight 0.25, AdamW at `3e-4`,
 and gradient clipping at 1.0.
 
-Each of Malaysia, Max-vs-Nik, and Bothell is held out once. Within a fold, every
+Each of camera A, camera B, and camera C is held out once. Within a fold, every
 training camera is split independently at 80% chronology. One-second guard
 bands and whole-window containment keep temporal context out of the other
 partition. Validation selects the lowest raw-BCE epoch and searches the fixed
@@ -64,13 +64,13 @@ be trained.
 
 ## Expanded maintained baseline
 
-The subsequent maintained run uses six reviewed sources grouped into Malaysia,
-Max-vs-Nik, Bothell, and Max-vs-Lucas cameras:
+The subsequent maintained run uses six reviewed sources grouped into camera A,
+camera B, camera C, and camera D cameras:
 
 ```bash
 PYTHONPATH=. .venv/bin/python \
   -m src.temporal_selector.rally_experiment \
-  --config config/rally-expanded-six-source.local.json \
+  --config config/rally-experiment.example.json \
   --output-dir outputs/clean-rally-expanded-six-source-v1 \
   --device mps
 ```

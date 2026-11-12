@@ -26,14 +26,8 @@ from .shuttle import GROUPING_VERSION, SHUTTLE_TASK, group_shuttle_candidates
 
 
 PILOT_THRESHOLDS = (0.05, 0.10, 0.15, 0.20, 0.30, 0.40, 0.50)
-DEFAULT_REVIEW_KEYS = frozenset(
-    {
-        ("malaysia_max_30s_to_120s", 2341),
-        ("max_vs_nik_30s_to_120s", 27),
-        ("max_vs_nik_30s_to_120s", 725),
-        ("max_vs_nik_30s_to_120s", 726),
-    }
-)
+# Source-specific review selections belong in private local configuration.
+DEFAULT_REVIEW_KEYS: frozenset[tuple[str, int]] = frozenset()
 PROVENANCE_FIELDS = (
     "checkpoint_sha256",
     "inference_model_sha256",

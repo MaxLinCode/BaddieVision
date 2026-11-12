@@ -33,7 +33,7 @@ from .experiment import (
 )
 from .model import JointRallyShuttleModel
 from .within_camera_decoder import calibrate_validation_decoder, decode_rows
-from .within_camera_experiment import DEFAULT_SOURCE_ORDER, _select_threshold
+from .within_camera_experiment import _select_threshold
 
 MATCHED_ANNOTATION_SHA256 = (
     "8c19f8d7cebc458fcd1b1138fd503231c9a3f3bea551e807e07e8beb5792c4d5"
@@ -472,10 +472,8 @@ def run_partial_oracle_experiment(
         context_mode="full_context",
         pose_coordinate_mode="player_relative",
     )
-    allowed = set(DEFAULT_SOURCE_ORDER)
     config = replace(
         config,
-        sources=tuple(source for source in config.sources if source.source_id in allowed),
         annotations_path=snapshot,
         expected_annotation_sha256=annotation_sha,
     )

@@ -14,17 +14,8 @@ from .joint_inference import InPlayDecoderConfig, decode_inplay_probabilities
 from .rally_dataset import RallyWindow
 
 
-DEFAULT_CAMERA_SOURCES: Mapping[str, tuple[str, ...]] = {
-    "Malaysia": (
-        "malaysia_max_30s_to_120s",
-        "malaysia_max_390s_to_ends",
-    ),
-    "Max-vs-Nik": (
-        "max_vs_nik_30s_to_120s",
-        "max_vs_nik_120s_to_ends",
-    ),
-    "Bothell": ("ff_bothell-seg3",),
-}
+# Real recording identities are provided by the local experiment config.
+DEFAULT_CAMERA_SOURCES: Mapping[str, tuple[str, ...]] = {}
 DECODER_THRESHOLDS = tuple(value / 100 for value in range(5, 96, 5))
 DECODER_GAPS_SECONDS = (0.0, 0.1, 0.2, 0.3, 0.5)
 DECODER_MINIMUM_SECONDS = (0.0, 0.1, 0.2, 0.3)

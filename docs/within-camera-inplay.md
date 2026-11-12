@@ -2,7 +2,7 @@
 
 This experiment asks whether the temporal model can learn rally state within one
 clean camera before testing cross-camera transfer. It uses the two maintained
-Max-vs-Nik source sequences in parent chronology without merging their
+camera B source sequences in parent chronology without merging their
 source-local frame indices.
 
 The runner assigns the first 60% of chronological frames to training, the next
@@ -19,13 +19,13 @@ Start with the two candidate-free pose representations:
 
 ```bash
 .venv/bin/python -m src.temporal_selector.within_camera_experiment \
-  --config config/selector-experiment.local.json \
+  --config config/selector-experiment.example.json \
   --output-dir outputs/within-maxnik-image-pose-v1 \
   --context-mode full_context --pose-coordinate-mode image \
   --epochs 25 --batch-size 8 --seed 1729 --device mps
 
 .venv/bin/python -m src.temporal_selector.within_camera_experiment \
-  --config config/selector-experiment.local.json \
+  --config config/selector-experiment.example.json \
   --output-dir outputs/within-maxnik-player-relative-pose-v1 \
   --context-mode full_context --pose-coordinate-mode player_relative \
   --epochs 25 --batch-size 8 --seed 1729 --device mps
@@ -53,7 +53,7 @@ retraining or consulting test labels:
 
 ```bash
 .venv/bin/python -m src.temporal_selector.within_camera_decoder \
-  --config config/selector-experiment.local.json \
+  --config config/selector-experiment.example.json \
   --checkpoint outputs/within-maxnik-relative-pose-with-candidates-v2/model.pt \
   --output-dir outputs/within-maxnik-relative-pose-with-candidates-decoded-v1 \
   --batch-size 16 --device mps

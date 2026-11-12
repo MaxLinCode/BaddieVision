@@ -1,9 +1,7 @@
 # Inference script for in-play shuttle classification
-import os
 import numpy as np
 import torch
 from pathlib import Path
-from torch.nn.functional import sigmoid
 from train_lstm_model import LSTMClassifier  # Assuming model definition is in train_lstm_model.py
 from extract_combined_features import extract_combined_features  # Using the shared feature extractor
 from scipy.ndimage import uniform_filter1d
@@ -13,7 +11,7 @@ import matplotlib.pyplot as plt
 SEQUENCE_LENGTH = 15
 INPLAY_DIR = Path(__file__).resolve().parent
 POSE_PATH = INPLAY_DIR / "features" / "pose" / "img_3218_pose.json"
-SHUTTLE_PATH = INPLAY_DIR / "features" / "shuttle" / "IMG_3218_ball.csv"
+SHUTTLE_PATH = INPLAY_DIR / "features" / "shuttle" / "example_match_ball.csv"
 MODEL_PATH = INPLAY_DIR / "models" / "best_model-6-12-0524.pt"
 MIN_FRAMES_RALLY_LENGTH = 40  # Minimum number of frames to qualify as a rally
 GRACE_FRAMES = 3

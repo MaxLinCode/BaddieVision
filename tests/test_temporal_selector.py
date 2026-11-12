@@ -267,8 +267,9 @@ def test_vectorized_selection_loss_matches_frame_local_reference():
     torch.testing.assert_close(model.loss(batch, output), torch.stack(reference).mean())
 
 
-def test_tiny_temporal_association_problem_can_overfit():
-    torch.manual_seed(12)
+@pytest.mark.parametrize("seed", [12, 71])
+def test_tiny_temporal_association_problem_can_overfit(seed):
+    torch.manual_seed(seed)
     # Each frame has two ambiguous observations. Across time the selected
     # observations form the smooth left-to-right path (local slots 0, 1, 0).
     candidate_values = torch.zeros(1, 6, 12)
@@ -297,9 +298,14 @@ def test_tiny_temporal_association_problem_can_overfit():
         _small_config(token_size=16, num_attention_heads=2, feed_forward_size=32)
     )
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    for _ in range(300):
+    # CPU attention kernels converge at different rates across supported
+    # platforms. Keep the same fit requirement and optimizer; allow a bounded
+    # convergence budget instead of assuming convergence by exactly step 300.
+    for _ in range(1000):
         optimizer.zero_grad()
         loss = model.loss(batch)
         loss.backward()
         optimizer.step()
+        if loss.item() < 0.01:
+            break
     assert model.loss(batch).item() < 0.03

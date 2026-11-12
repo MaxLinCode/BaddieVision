@@ -38,7 +38,6 @@ clip_features/
 outputs/*
 !outputs/share/
 outputs/share/*
-!outputs/share/rally-segmentation-demo-poster.jpg
 InPlay/features/
 InPlay/clip_features/
 InPlay/data/
@@ -59,8 +58,7 @@ src/TrackNetV3/exp/
 *.torchscript
 *.tflite
 
-# YOLO generated/downloaded artifacts. The small curated images and labels
-# under images/ and labels/ remain versioned.
+# Private YOLO datasets and generated/downloaded artifacts.
 yolov8/shuttle-yolo-dataset/export/
 yolov8/shuttle-yolo-dataset/inference/
 yolov8/shuttle-yolo-dataset/runs/
@@ -79,3 +77,15 @@ data_packages/*.zip
 config/sources.local.json
 config/selector-experiment.generated.json
 config/selector-experiment.generated-loso-manifest.json
+
+# Private annotations, recording metadata, and model assets remain local.
+config/*.local*.json
+config/*-manifest.json
+InPlay/in_play_frame_labels.csv
+tests/fixtures/golden/
+yolov8/shuttle-yolo-dataset/images/
+yolov8/shuttle-yolo-dataset/labels/
+*.task
+*.private-provenance.json
+release/
+InPlay/*.local.json

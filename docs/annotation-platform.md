@@ -27,9 +27,9 @@ Build the separately seeded immutable audit queue and adaptive queue, then run
 the app:
 
 ```bash
-python3 -m src.annotation_platform --config config/annotation-sources.local.json build-queues \
+python3 -m src.annotation_platform --config config/annotation-sources.example.json build-queues \
   --audit-seed 1729 --audit-count 100 --adaptive-count 200
-python3 -m src.annotation_platform --config config/annotation-sources.local.json serve \
+python3 -m src.annotation_platform --config config/annotation-sources.example.json serve \
   --annotator alice --queue adaptive
 ```
 
@@ -118,7 +118,7 @@ Create a pilot runtime without modifying the v1 runtime:
 python3 -m src.annotation_platform --config config/pilot-sources.local.json \
   --runtime .annotation-pilot migrate-v1 \
   --v1-runtime .annotation-two-folders \
-  --v1-config config/annotation-sources.local.json
+  --v1-config config/annotation-sources.example.json
 ```
 
 Migration validates source/video/model hashes, geometry, extraction semantics,
@@ -132,10 +132,10 @@ Other commands:
 
 ```bash
 # Decode and render one center-frame smoke image for every registered source.
-python3 -m src.annotation_platform --config config/annotation-sources.local.json smoke
+python3 -m src.annotation_platform --config config/annotation-sources.example.json smoke
 
 # Export the current replayed labels without replacing the canonical event log.
-python3 -m src.annotation_platform --config config/annotation-sources.local.json export \
+python3 -m src.annotation_platform --config config/annotation-sources.example.json export \
   --output .annotation/exports/shuttle-labels.jsonl
 ```
 
@@ -147,17 +147,17 @@ python3 -m InPlay.heuristic.label_intervals \
   --output .annotation-final/rallies.csv \
   --manifest .annotation-final/rallies.manifest.json
 
-python3 -m src.annotation_platform --config config/annotation-sources.local.json \
+python3 -m src.annotation_platform --config config/annotation-sources.example.json \
   --runtime .annotation-final build-rally-audit \
   --intervals .annotation-final/rallies.csv \
   --interval-manifest .annotation-final/rallies.manifest.json
 
-python3 -m src.annotation_platform --config config/annotation-sources.local.json \
+python3 -m src.annotation_platform --config config/annotation-sources.example.json \
   --runtime .annotation-final build-rally-refill \
   --intervals .annotation-final/rallies.csv \
   --interval-manifest .annotation-final/rallies.manifest.json
 
-python3 -m src.annotation_platform --config config/annotation-sources.local.json \
+python3 -m src.annotation_platform --config config/annotation-sources.example.json \
   --runtime .annotation-final serve --annotator NAME --queue refill
 
 ```

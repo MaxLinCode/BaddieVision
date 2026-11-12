@@ -33,12 +33,6 @@ from .experiment import (
 from .model import JointRallyShuttleModel
 
 
-DEFAULT_SOURCE_ORDER = (
-    "max_vs_nik_30s_to_120s",
-    "max_vs_nik_120s_to_ends",
-)
-
-
 def chronological_window_split(
     windows: Sequence[SelectorWindow],
     source_order: Sequence[str],
@@ -125,7 +119,7 @@ def run_within_camera_experiment(
     dataset: SelectorWindowDataset,
     output_dir: Path,
     *,
-    source_order: Sequence[str] = DEFAULT_SOURCE_ORDER,
+    source_order: Sequence[str] | None = None,
     context_mode: ContextMode = "full_context",
     mask_candidates: bool = True,
     epochs: int = 25,
@@ -144,6 +138,8 @@ def run_within_camera_experiment(
     output_dir = prepare_output_directory(output_dir)
     device = device or select_device()
     _seed_everything(seed)
+    if source_order is None:
+        source_order = tuple(dict.fromkeys(window.source_id for window in dataset.windows))
     train, validation, test, split = chronological_window_split(
         dataset.windows, source_order, guard_seconds=guard_seconds
     )
@@ -274,6 +270,7 @@ def run_within_camera_experiment(
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--source-order", nargs="+", help="chronological source IDs; defaults to config order")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--context-mode", choices=tuple(FRAME_DIMS), default="full_context")
     parser.add_argument("--pose-coordinate-mode", choices=("image", "player_relative"), default="image")
@@ -312,7 +309,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         context_mode=args.context_mode,
         pose_coordinate_mode=args.pose_coordinate_mode,
     )
-    allowed = set(DEFAULT_SOURCE_ORDER)
+    source_order = tuple(args.source_order or (source.source_id for source in config.sources))
+    allowed = set(source_order)
     config = replace(
         config, sources=tuple(source for source in config.sources if source.source_id in allowed)
     )
@@ -321,6 +319,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     metrics = run_within_camera_experiment(
         dataset,
         args.output_dir,
+        source_order=source_order,
         context_mode=args.context_mode,
         mask_candidates=not args.with_candidates,
         epochs=args.epochs,

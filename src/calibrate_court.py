@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -13,7 +14,10 @@ from urllib.parse import parse_qs, urlparse
 
 import cv2
 
-from court_projection import (
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from src.court_projection import (
     COURT_CALIBRATION_LINES,
     COURT_LANDMARKS,
     CourtHomography,

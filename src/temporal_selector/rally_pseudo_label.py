@@ -6,16 +6,24 @@ import argparse
 import hashlib
 import json
 import math
+from collections.abc import Mapping, Sequence
+from itertools import pairwise
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 import torch
 
-from .joint_inference import InPlayDecoderConfig, decode_inplay_probabilities, decoded_intervals
-from .rally import RallySegmenter
-from .rally_dataset import RallyDataConfig, RallySourceConfig, RallyWindow, RallyWindowDataset, collate_rally_windows
-from .rally_features import FULL_RALLY_FEATURE_NAMES
 from src.workflow.identity import SourceIdentity, sha256_file
+
+from .joint_inference import (
+    InPlayDecoderConfig,
+    decode_inplay_probabilities,
+    decoded_intervals,
+)
+from .rally import RallySegmenter
+from .rally_dataset import RallyDataConfig, RallySourceConfig, RallyWindowDataset
+from .rally_features import FULL_RALLY_FEATURE_NAMES
+from .rally_inference import predict_windows
 
 SNAP_RADII_SECONDS = (0.0, 0.25, 0.5, 1.0)
 SNAP_CONFIDENCE_FLOORS = (0.0, 0.25, 0.5, 0.75)
@@ -139,7 +147,7 @@ def boundary_snap_diagnostic(
         for source_rows in by_source.values():
             source_rows.sort(key=lambda row: int(row["frame"]))
             frames = [int(row["frame"]) for row in source_rows]
-            if any(right != left + 1 for left, right in zip(frames, frames[1:])):
+            if any(right != left + 1 for left, right in pairwise(frames)):
                 raise ValueError("diagnostic rows must be contiguous within each source")
             probabilities = [float(row["inplay_probability"]) for row in source_rows]
             states = decode_inplay_probabilities(probabilities, fps=fps, config=decoder)
@@ -366,28 +374,6 @@ def _load_teacher(path: Path) -> dict[str, Any]:
     return value
 
 
-def _predict(model: RallySegmenter, windows: Sequence[RallyWindow], device: torch.device,
-             batch_size: int = 16) -> list[dict[str, float]]:
-    rows: list[dict[str, float]] = []
-    model.eval()
-    for offset in range(0, len(windows), batch_size):
-        group = windows[offset:offset + batch_size]
-        batch = collate_rally_windows(group).to(device)
-        with torch.no_grad():
-            output = model(batch)
-        for batch_index, window in enumerate(group):
-            for local, frame in enumerate(window.frame_indices):
-                if frame in window.owned_frames:
-                    rows.append({
-                        "frame": int(frame),
-                        "inplay_probability": float(torch.sigmoid(output.inplay_logits[batch_index, local]).cpu()),
-                        "rally_start_probability": float(torch.sigmoid(output.rally_start_logits[batch_index, local]).cpu()),
-                        "rally_end_probability": float(torch.sigmoid(output.rally_end_logits[batch_index, local]).cpu()),
-                    })
-    rows.sort(key=lambda row: int(row["frame"]))
-    return rows
-
-
 def pseudo_label_source(source: RallySourceConfig, teacher_path: Path, *, device: str = "cpu",
                         output_dir: Path | None = None, batch_size: int = 16) -> tuple[Path, Path]:
     """Run three independent decoders and emit majority-vote review proposals."""
@@ -409,7 +395,7 @@ def pseudo_label_source(source: RallySourceConfig, teacher_path: Path, *, device
         if checkpoint.get("rally_feature_view") != "full":
             raise ValueError("teacher checkpoint is not full-view")
         model = RallySegmenter.from_checkpoint(checkpoint).to(torch_device)
-        raw = _predict(model, dataset.windows, torch_device, batch_size)
+        raw = predict_windows(model, dataset.windows, torch_device, batch_size)
         if [int(row["frame"]) for row in raw] != list(range(identity.frame_count)):
             raise ValueError("rally inference predictions do not cover every source frame exactly once")
         decoder = InPlayDecoderConfig(**model_entry["decoder"])

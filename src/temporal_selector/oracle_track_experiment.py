@@ -36,7 +36,6 @@ from .partial_oracle_experiment import (
     _negative_split_frame,
     _run_variant,
 )
-from .within_camera_experiment import DEFAULT_SOURCE_ORDER
 
 
 SCHEMA = "oracle_track_xy_v1"
@@ -446,7 +445,6 @@ def run_oracle_track_audit(
     config, _ = load_dataset_config(config_path, context_mode="full_context", pose_coordinate_mode="player_relative")
     config = replace(
         config,
-        sources=tuple(s for s in config.sources if s.source_id in set(DEFAULT_SOURCE_ORDER)),
         annotations_path=snapshot,
         expected_annotation_sha256=annotation_sha,
     )

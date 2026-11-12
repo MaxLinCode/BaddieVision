@@ -1,5 +1,9 @@
 # Source workflow
 
+For end-to-end single-model video inference, use `python -m src.workflow rally predict`
+and follow [the inference guide](rally-inference.md). The pseudo-label commands
+below are a separate three-teacher annotation-review workflow.
+
 The workflow CLI keeps source paths in one local catalog and generates the
 annotation and selector-experiment configurations from it. It does not weaken
 the annotation platform's video, candidate, queue, or label fingerprint checks.
@@ -11,8 +15,8 @@ a new segment with:
 
 ```bash
 python3 -m src.workflow source add \
-  --video outputs/ff-bothell-seg4/ff-bothell-seg4_input.mp4 \
-  --source-id ff-bothell-seg4
+  --video outputs/camera_c_segment_2/camera_c_segment_2_input.mp4 \
+  --source-id camera_c_segment_2
 
 python3 -m src.workflow source status
 ```
@@ -90,11 +94,11 @@ before the source.
 For one new source, no config or runtime path is required:
 
 ```bash
-python3 -m src.workflow annotate --annotator max --source ff-bothell-seg4
+python3 -m src.workflow annotate --annotator max --source camera_c_segment_2
 ```
 
 It writes a generated annotation catalog and uses the source-scoped runtime
-`.annotation-ff-bothell-seg4`. This avoids modifying older immutable combined
+`.annotation-camera_c_segment_2`. This avoids modifying older immutable combined
 queues. Frozen candidates are preferred; if they do not exist, pilot candidates
 are used. Select them explicitly with `--stage pilot` or `--stage frozen`.
 

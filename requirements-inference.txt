@@ -1,0 +1,16 @@
+# Tested Python 3.11 inference runtime. Install FFmpeg separately.
+# On Linux, install the CPU torch wheels first when CUDA is not required.
+torch==2.7.1
+torchvision==0.22.1
+numpy==2.4.6
+opencv-python==5.0.0.93
+opencv-contrib-python==5.0.0.93
+mediapipe==0.10.35
+ultralytics==8.4.211
+pandas==2.3.3
+scipy==1.17.1
+scikit-learn==1.9.1
+matplotlib==3.11.2
+Pillow==11.3.0
+PyYAML==6.0.3
+tqdm==4.70.1

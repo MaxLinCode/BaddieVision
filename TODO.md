@@ -31,7 +31,7 @@ camera groups, 126 strict rally intervals, and 52,012 owned dense targets
 0.88974, PR AUC 0.82313, and interval F1 0.41915; interval fragmentation and
 camera-transfer calibration remain the main limitations.
 
-- [x] Run the predeclared within-camera learning sequence for the Max-vs-Nik
+- [x] Run the predeclared within-camera learning sequence for the camera B
   chronological split (seed 1729, 25 epochs, batch size 16, relative pose plus
   candidates, and no InPlay boundary weighting):
   1. checkpoint control: uniform sampling, no auxiliary heads, restore the
@@ -48,7 +48,7 @@ camera-transfer calibration remain the main limitations.
   matched, no false splits or merges, and 13.93-frame mean absolute boundary
   error.
 
-- [ ] Run the leakage-safe Max-vs-Nik within-camera ablation matrix documented
+- [ ] Run the leakage-safe camera B within-camera ablation matrix documented
   in `docs/within-camera-inplay.md`; compare temporal-only, player/court,
   image-pose, player-relative-pose, candidates-only, and candidates-plus-pose
   using the fixed chronological test block.
