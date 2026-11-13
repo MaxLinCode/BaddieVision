@@ -42,7 +42,14 @@ def select_device(requested: str) -> str:
 def _runtime() -> dict[str, str]:
     return {
         name: importlib.metadata.version(name)
-        for name in ("torch", "numpy", "opencv-python", "mediapipe", "ultralytics")
+        for name in (
+            "torch",
+            "numpy",
+            "opencv-python",
+            "mediapipe",
+            "ultralytics",
+            "lap",
+        )
     }
 
 
@@ -321,7 +328,11 @@ def run_pipeline(
         if person_extractor is None:
             from InPlay.heuristic.person_tracks import extract_person_tracks
 
-            person_extractor = extract_person_tracks
+            def person_extractor(video, output, model):
+                return extract_person_tracks(
+                    video, output, model, device=resolved_device
+                )
+
         print(f"{source.source_id}: extracting person tracks", flush=True)
         with tempfile.TemporaryDirectory(
             prefix=".person-", dir=players_root

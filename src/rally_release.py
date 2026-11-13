@@ -136,7 +136,15 @@ def validate_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
     if (
         not isinstance(versions, dict)
         or set(versions)
-        != {"python", "torch", "ultralytics", "mediapipe", "numpy", "opencv-python"}
+        != {
+            "python",
+            "torch",
+            "ultralytics",
+            "mediapipe",
+            "numpy",
+            "opencv-python",
+            "lap",
+        }
         or any(
             not isinstance(v, str) or not v or len(v) > 100 for v in versions.values()
         )
@@ -377,6 +385,7 @@ def export_release(
                     "mediapipe",
                     "numpy",
                     "opencv-python",
+                    "lap",
                 )
             },
         },

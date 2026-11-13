@@ -14,3 +14,4 @@ matplotlib==3.11.2
 Pillow==11.3.0
 PyYAML==6.0.3
 tqdm==4.70.1
+lap==0.5.12
