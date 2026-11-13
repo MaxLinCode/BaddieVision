@@ -29,6 +29,14 @@ class SelectorBatch:
     frame_mask: Tensor
     relative_time_seconds: Tensor
     targets: Tensor
+    inplay_targets: Tensor | None = None
+    packed_frame_indices: Tensor | None = None
+    packed_candidate_indices: Tensor | None = None
+    candidate_local_indices: Tensor | None = None
+    packed_token_count: int | None = None
+    validated: bool = False
+    rally_start_targets: Tensor | None = None
+    rally_end_targets: Tensor | None = None
 
     def validate(self, *, candidate_feature_dim: int = 12, frame_feature_dim: int | None = None) -> "SelectorBatch":
         cv, fv = self.candidate_values, self.frame_values
@@ -57,11 +65,57 @@ class SelectorBatch:
             raise ValueError("relative_time_seconds must have shape [batch, frames]")
         if self.targets.shape != expected_frames or self.targets.dtype not in (torch.int32, torch.int64):
             raise ValueError("targets must be an integer tensor with shape [batch, frames]")
+        if self.inplay_targets is not None:
+            if self.inplay_targets.shape != expected_frames or self.inplay_targets.dtype not in (
+                torch.int32,
+                torch.int64,
+            ):
+                raise ValueError(
+                    "inplay_targets must be an integer tensor with shape [batch, frames]"
+                )
+            allowed = (
+                (self.inplay_targets == MASKED_TARGET)
+                | (self.inplay_targets == 0)
+                | (self.inplay_targets == 1)
+            )
+            if not bool(torch.all(allowed)):
+                raise ValueError("inplay_targets must contain only -100, 0, or 1")
+        boundary_targets = (self.rally_start_targets, self.rally_end_targets)
+        if any(value is not None for value in boundary_targets):
+            if any(value is None for value in boundary_targets):
+                raise ValueError("rally start/end targets must be supplied together")
+            for name, value in zip(("start", "end"), boundary_targets):
+                if value.shape != expected_frames or not value.is_floating_point():
+                    raise ValueError(f"rally {name} targets must be floating point with shape [batch, frames]")
+                valid = (value == MASKED_TARGET) | ((value >= 0) & (value <= 1))
+                if not bool(torch.all(valid)):
+                    raise ValueError(f"rally {name} targets must contain -100 or values in [0, 1]")
+        packing = (
+            self.packed_frame_indices,
+            self.packed_candidate_indices,
+            self.candidate_local_indices,
+        )
+        if any(value is not None for value in packing):
+            if any(value is None for value in packing) or self.packed_token_count is None:
+                raise ValueError("packing metadata must be supplied as a complete set")
+            if self.packed_frame_indices.shape != expected_frames:
+                raise ValueError("packed_frame_indices must match frame slots")
+            expected_candidates = (batch_size, candidate_count)
+            if self.packed_candidate_indices.shape != expected_candidates:
+                raise ValueError("packed_candidate_indices must match candidate slots")
+            if self.candidate_local_indices.shape != expected_candidates:
+                raise ValueError("candidate_local_indices must match candidate slots")
+            if self.packed_token_count <= 0:
+                raise ValueError("packed_token_count must be positive")
         tensors = (
             self.candidate_validity, self.candidate_frame_indices, self.candidate_mask,
             self.frame_values, self.frame_validity, self.frame_mask,
             self.relative_time_seconds, self.targets,
         )
+        if self.inplay_targets is not None:
+            tensors = (*tensors, self.inplay_targets)
+        tensors = (*tensors, *(value for value in boundary_targets if value is not None))
+        tensors = (*tensors, *(value for value in packing if value is not None))
         if any(t.device != cv.device for t in tensors):
             raise ValueError("all SelectorBatch tensors must be on the same device")
         if not torch.isfinite(cv[self.candidate_mask]).all():
@@ -87,6 +141,13 @@ class SelectorBatch:
                     raise ValueError("a real candidate references padding or a nonexistent frame")
             if torch.any(self.targets[batch_index, ~real_frames] != MASKED_TARGET):
                 raise ValueError("padding frames must use target -100")
+            if self.inplay_targets is not None and torch.any(
+                self.inplay_targets[batch_index, ~real_frames] != MASKED_TARGET
+            ):
+                raise ValueError("padding frames must use InPlay target -100")
+            for value in boundary_targets:
+                if value is not None and torch.any(value[batch_index, ~real_frames] != MASKED_TARGET):
+                    raise ValueError("padding frames must use boundary target -100")
             for frame_index in torch.nonzero(real_frames, as_tuple=False).flatten().tolist():
                 target = int(self.targets[batch_index, frame_index])
                 if target < MASKED_TARGET or target not in (MASKED_TARGET, NULL_TARGET) and target < 0:
@@ -99,7 +160,13 @@ class SelectorBatch:
                     raise ValueError(
                         f"target {target} references no candidate in batch {batch_index}, frame {frame_index}"
                     )
+        self.validated = True
         return self
 
     def to(self, device: torch.device | str) -> "SelectorBatch":
-        return SelectorBatch(**{name: value.to(device) for name, value in vars(self).items()})
+        return SelectorBatch(
+            **{
+                name: value.to(device) if isinstance(value, Tensor) else value
+                for name, value in vars(self).items()
+            }
+        )

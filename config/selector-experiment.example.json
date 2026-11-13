@@ -1,0 +1,35 @@
+{
+  "schema": "temporal_selector_experiment_config",
+  "schema_version": 1,
+  "seed": 1729,
+  "dataset": {
+    "minimum_cutoff": 0.05,
+    "retention_k": 8,
+    "pose_visibility_threshold": 0.5,
+    "annotations_path": "../.annotation-final/events/shuttle.jsonl",
+    "rally_intervals_path": "../.annotation-final/rallies.csv",
+    "rally_manifest_path": "../.annotation-final/rallies.manifest.json",
+    "queue_paths": [
+      "../.annotation-final/queues/shuttle-adaptive.json",
+      "../.annotation-final/queues/shuttle-audit.json"
+    ],
+    "sources": [
+      {
+        "source_id": "camera-a-segment-1",
+        "video_path": "../outputs/camera-a-segment-1/camera-a-segment-1_input.mp4",
+        "candidates_path": "../outputs/frozen/camera-a-segment-1-shuttle-candidates-frozen.jsonl",
+        "assignments_path": "../outputs/camera-a-segment-1/player_assignments.jsonl",
+        "pose_cache_path": "../outputs/camera-a-segment-1/pose_cache.jsonl",
+        "calibration_path": "../features/court/malaysiamax.json"
+      },
+      {
+        "source_id": "camera-b-segment-1",
+        "video_path": "../outputs/camera-b-segment-1/camera-b-segment-1_input.mp4",
+        "candidates_path": "../outputs/camera-b-segment-1/shuttle_candidates_frozen.jsonl",
+        "assignments_path": "../outputs/camera-b-segment-1/player_assignments.jsonl",
+        "pose_cache_path": "../outputs/camera-b-segment-1/pose_cache.jsonl",
+        "calibration_path": "../features/court/malaysiamax.json"
+      }
+    ]
+  }
+}

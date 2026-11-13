@@ -1,0 +1,12 @@
+{
+  "schema": "baddievision_source_catalog",
+  "schema_version": 1,
+  "sources": [
+    {
+      "source_id": "match-a-static-camera",
+      "enabled": true,
+      "video_path": "../outputs/match-a-static-camera/match-a-static-camera_input.mp4",
+      "artifact_root": "../outputs/match-a-static-camera"
+    }
+  ]
+}

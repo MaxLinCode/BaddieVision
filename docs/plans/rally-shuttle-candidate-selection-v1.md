@@ -1,5 +1,10 @@
 # Candidate Selection Transformer V1
 
+> Superseded for production task semantics by
+> `docs/plans/joint-inplay-conditional-shuttle.md`. This document remains the
+> provenance record for candidate extraction, freezing, and the initial
+> selector implementation.
+
 ## Summary
 
 Build a high-recall TrackNet proposal pipeline, reusable Dash annotation platform, proposal-recall evaluation, and small temporal selector.

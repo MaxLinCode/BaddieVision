@@ -16,17 +16,27 @@ from src.annotation_platform import (
     LabelOption,
     ShuttleSelectionPlugin,
     build_adaptive_queue,
+    build_rally_audit_extension_queue,
+    build_rally_refill_queue,
     build_playback_view,
     build_uniform_audit_queue,
     draw_candidates,
     native_fps_burst,
     render_center_frame,
     replay_events,
+    validate_queue,
+)
+from src.temporal_selector.rally_intervals import (
+    RallyCoverageSpan,
+    RallyInterval,
+    RallyIntervalIndex,
+    RallySourceManifest,
 )
 from src.annotation_platform.__main__ import _parser, _print_session_status, _queues
 from src.annotation_platform.dash_app import (
     candidate_click_matches_target,
     create_dash_app,
+    missing_proposal_position,
     step_preview_frame,
 )
 from src.annotation_platform.sessions import SessionConflictError, SessionManager
@@ -174,6 +184,42 @@ def test_general_registry_accepts_a_second_task_plugin(tmp_path: Path) -> None:
     assert resolved.overlays(source, 3) == ()
 
 
+def test_rally_refill_and_audit_extension_queues(tmp_path: Path) -> None:
+    registry, _, _, _ = _registry(tmp_path, frame_count=20, fps=4.0)
+    source = registry.sources["match"]
+    source_manifest = RallySourceManifest(
+        "match", source.video_sha256, source.fps, source.frame_count
+    )
+    rally_index = RallyIntervalIndex(
+        (RallyInterval("match", "match-0001", 4, 15),),
+        {"match": source_manifest},
+        "c" * 64,
+        "revision",
+        (RallyCoverageSpan("match", 0, 19),),
+    )
+    audit = build_rally_audit_extension_queue(
+        registry,
+        "shuttle_selection",
+        rally_index,
+        existing_audit_frames=set(),
+        excluded_frames=set(),
+    )
+    assert audit.kind == "audit"
+    validate_queue(registry, audit)
+    refill = build_rally_refill_queue(
+        registry,
+        "shuttle_selection",
+        rally_index,
+        already_labeled={("match", 4), ("match", 15)},
+        excluded_frames=audit.frame_keys(),
+    )
+    assert refill.kind == "refill"
+    assert ("match", 4) not in refill.frame_keys()
+    assert ("match", 15) not in refill.frame_keys()
+    assert audit.frame_keys().isdisjoint(refill.frame_keys())
+    validate_queue(registry, refill)
+
+
 @pytest.mark.parametrize("schema_version", [1, 2])
 def test_shuttle_plugin_reads_v1_and_v2_candidate_artifacts(tmp_path: Path, schema_version: int) -> None:
     registry, plugin, _, candidates = _registry(tmp_path, schema_version=schema_version)
@@ -309,7 +355,7 @@ def test_selected_position_validation_rejects_malformed_and_nonselected_values()
 
     nonselected = json.loads(json.dumps(base))
     nonselected.update({"label_kind": "no_in_frame_target", "candidate_id": None})
-    with pytest.raises(ValueError, match="only selected"):
+    with pytest.raises(ValueError, match="only visible-target"):
         AnnotationEvent.from_mapping(nonselected)
 
 
@@ -478,6 +524,13 @@ def test_repeated_undo_walks_back_session_edits_instead_of_toggling(tmp_path: Pa
         candidate_artifact_sha256=fingerprint,
         annotator="alice",
         session_id="session",
+        canonical_position={
+            "coordinate_space": "normalized_image_xy",
+            "canonical_field": "peak_position_normalized",
+            "peak_position_normalized": [0.5, 0.5],
+            "weighted_centroid_normalized": [0.5, 0.5],
+            "center_normalized": [0.5, 0.5],
+        },
     )
 
     undo_second = store.undo_last(annotator="alice", session_id="session")
@@ -750,6 +803,40 @@ def test_candidate_click_must_belong_to_current_target() -> None:
 
     assert candidate_click_matches_target(current, "video", 328)
     assert not candidate_click_matches_target(stale, "video", 328)
+
+
+def test_missing_proposal_click_builds_canonical_position_for_current_frame() -> None:
+    position = missing_proposal_position(
+        json.dumps({"source_id": "video", "frame": 328, "x": 0.25, "y": 0.75}),
+        "video",
+        328,
+    )
+    assert position == {
+        "coordinate_space": "normalized_image_xy",
+        "canonical_field": "peak_position_normalized",
+        "peak_position_normalized": [0.25, 0.75],
+        "weighted_centroid_normalized": [0.25, 0.75],
+        "center_normalized": [0.25, 0.75],
+    }
+    with pytest.raises(ValueError, match="different frame"):
+        missing_proposal_position(
+            {"source_id": "video", "frame": 327, "x": 0.25, "y": 0.75},
+            "video",
+            328,
+        )
+    with pytest.raises(ValueError, match=r"\[0, 1\]"):
+        missing_proposal_position(
+            {"source_id": "video", "frame": 328, "x": 1.1, "y": 0.75},
+            "video",
+            328,
+        )
+
+
+def test_shuttle_plugin_exposes_missing_proposal_hotkey() -> None:
+    options = {
+        option.kind: option.hotkey for option in ShuttleSelectionPlugin().label_options
+    }
+    assert options["missing_proposal"] == "m"
 
 
 def test_candidate_palette_is_deterministic_tab20_and_wraps() -> None:
@@ -1061,8 +1148,10 @@ def test_duplicate_dash_submission_records_and_advances_exactly_once(tmp_path: P
         triggered_inputs=[{"prop_id": "accept-suggestion.n_clicks", "value": 1}]
     ))
     try:
-        first_state, _ = edit([], None, 1, None, None, [], asdict(initial))
-        duplicate_state, duplicate_status = edit([], None, 1, None, None, [], asdict(initial))
+        first_state, _ = edit([], None, 1, None, None, [], asdict(initial), "")
+        duplicate_state, duplicate_status = edit(
+            [], None, 1, None, None, [], asdict(initial), ""
+        )
     finally:
         context_value.reset(token)
 
@@ -1094,7 +1183,7 @@ def test_previous_navigation_allows_one_superseding_correction(tmp_path: Path) -
         ))
         try:
             return edit([], None, 1 if trigger == "accept-suggestion" else None,
-                        1 if trigger == "previous" else None, None, [], raw)[0]
+                        1 if trigger == "previous" else None, None, [], raw, "")[0]
         finally:
             context_value.reset(token)
 
@@ -1137,7 +1226,9 @@ def test_callback_retry_reconciles_event_saved_before_cursor_write(tmp_path: Pat
         triggered_inputs=[{"prop_id": "accept-suggestion.n_clicks", "value": 1}]
     ))
     try:
-        recovered, status = edit([], None, 1, None, None, [], asdict(initial))
+        recovered, status = edit(
+            [], None, 1, None, None, [], asdict(initial), ""
+        )
     finally:
         context_value.reset(token)
 
@@ -1145,3 +1236,39 @@ def test_callback_retry_reconciles_event_saved_before_cursor_write(tmp_path: Pat
     assert sessions.position(sessions.load(initial.session_id), queue) == 1
     assert recovered["cursor_revision"] == 1
     assert "Ignored stale action" in status
+
+
+def test_missing_proposal_callback_records_clicked_position(tmp_path: Path) -> None:
+    from dash._callback_context import context_value
+    from dash._utils import AttributeDict
+
+    registry, _, _, _ = _registry(tmp_path)
+    queue = build_adaptive_queue(registry, "shuttle_selection", anchor_count=1)
+    sessions = SessionManager(tmp_path / "sessions")
+    initial = sessions.create("alice", queue)
+    events = EventStore(tmp_path / "events.jsonl", registry)
+    app = create_dash_app(registry, queue, events, sessions, initial)
+    edit = next(
+        callback["callback"].__wrapped__
+        for callback in app.callback_map.values()
+        if callback["callback"].__wrapped__.__name__ == "edit_target"
+    )
+    burst, frame = sessions.current(initial, queue)
+    clicked = json.dumps(
+        {"source_id": burst.source_id, "frame": frame, "x": 0.25, "y": 0.75}
+    )
+    token = context_value.set(AttributeDict(triggered_inputs=[{
+        "prop_id": (
+            '{"kind":"missing_proposal","type":"label-option"}.n_clicks'
+        ),
+        "value": 1,
+    }]))
+    try:
+        _, status = edit([], None, None, None, None, [], asdict(initial), clicked)
+    finally:
+        context_value.reset(token)
+
+    event = events.replay().active[(burst.task, burst.source_id, frame)]
+    assert event.label_kind == "missing_proposal"
+    assert event.candidate_position["peak_position_normalized"] == [0.25, 0.75]
+    assert "missing_proposal" in status

@@ -331,7 +331,10 @@ def test_v1_migration_is_transactional_preserves_queue_order_and_classifies_labe
     }
     store.record(**common, frame=0, label_kind="selected", candidate_id="f0-shared")
     store.record(**common, frame=1, label_kind="selected", candidate_id="f1-shared")
-    store.record(**common, frame=2, label_kind="missing_proposal")
+    store.record(
+        **common, frame=2, label_kind="missing_proposal",
+        review_action_override="migrated",
+    )
     source = old_registry.sources["source"]
     burst = QueueBurst(
         burst_id="adaptive-source-0",

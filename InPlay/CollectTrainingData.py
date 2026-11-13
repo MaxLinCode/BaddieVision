@@ -1,4 +1,3 @@
-import os
 from extract_combined_features import extract_combined_features
 import cv2
 import numpy as np
@@ -32,37 +31,22 @@ def split_all_sequences(features: List[np.ndarray], labels: List[int], sequence_
     return sequences
 
 # === CONFIGURATION ===
-rally_intervals = [
-    (356, 427),
-    (612, 982),
-    (1463, 1814),
-    (2032, 2167),
-    (2398, 2697),
-    (2941, 3128),
-    (3384, 3541),
-    (3376, 3814),
-    (4035, 4155),
-    (4339, 4948),
-    (5172, 5382),
-    (5621, 5799),
-    (6036, 6202),
-    (6411, 6604),
-    (6884, 6999),
-    (7228, 7338),
-    (7645, 7918),
-    (8210, 8263),
-    (8469, 8743),
-    (8971, 9128),
-    (9346, 9451),
-    (9722, 9844),
-]
+# Recording annotations are local data, never embedded in source code.
+INPLAY_DIR = Path(__file__).resolve().parent
+INTERVALS_PATH = INPLAY_DIR / "rally_intervals.local.json"
+if not INTERVALS_PATH.is_file():
+    raise FileNotFoundError(
+        "Supply private rally labels at InPlay/rally_intervals.local.json "
+        "as a JSON list of [start_frame, end_frame] pairs."
+    )
+rally_intervals = json.loads(INTERVALS_PATH.read_text(encoding="utf-8"))
 sequence_len = 36
-max_frame = 9844
+max_frame = max(end for _, end in rally_intervals) + 1
 # Paths – change these for each new video
 INPLAY_DIR = Path(__file__).resolve().parent
-VIDEO_PATH = INPLAY_DIR / "videos" / "IMG_3218.mp4"
-POSE_PATH = INPLAY_DIR / "features" / "pose" / "img_3218_pose.json"
-SHUTTLE_PATH = INPLAY_DIR / "features" / "shuttle" / "IMG_3218_ball.csv"
+VIDEO_PATH = INPLAY_DIR / "videos" / "example_match.mp4"
+POSE_PATH = INPLAY_DIR / "features" / "pose" / "example_match_pose.json"
+SHUTTLE_PATH = INPLAY_DIR / "features" / "shuttle" / "example_match_ball.csv"
 OUTPUT_PATH = INPLAY_DIR / "outputs"
 OUTPUT_PATH.mkdir(parents=True, exist_ok=True)
 
@@ -86,7 +70,7 @@ sequences = split_all_sequences(features, labels, sequence_len)
 X = np.array([x for x, _ in sequences])
 Y = np.array([y for _, y in sequences])
 
-np.save(OUTPUT_PATH / "img_3418_X.npy", X)
-np.save(OUTPUT_PATH / "img_3418_Y.npy", Y)
+np.save(OUTPUT_PATH / "example_match_X.npy", X)
+np.save(OUTPUT_PATH / "example_match_Y.npy", Y)
 
-print(f"✅ Saved {len(sequences)} LSTM sequences to img_3418_X.npy and img_3418_Y.npy")
+print(f"✅ Saved {len(sequences)} LSTM sequences to example_match_X.npy and example_match_Y.npy")

@@ -1,9 +1,7 @@
-import os
 import json
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from tqdm import tqdm
 
 # Constants
 POSE_NUM_KEYPOINTS = 33
@@ -13,7 +11,7 @@ FRAME_HEIGHT = 720
 # Paths – change these for each new video
 INPLAY_DIR = Path(__file__).resolve().parent
 POSE_PATH = INPLAY_DIR / "features" / "pose" / "img_3218_pose.json"
-SHUTTLE_PATH = INPLAY_DIR / "features" / "shuttle" / "IMG_3218_ball.csv"
+SHUTTLE_PATH = INPLAY_DIR / "features" / "shuttle" / "example_match_ball.csv"
 OUTPUT_PATH = INPLAY_DIR / "inference_features.npy"
 
 # Frame sampling strategy
@@ -103,7 +101,7 @@ def extract_combined_features(pose_path, shuttle_path, frame_indices, label_path
 if __name__ == "__main__":
     # Training mode
     POSE_PATH = INPLAY_DIR / "features" / "pose" / "img_3218_pose.json"
-    SHUTTLE_PATH = INPLAY_DIR / "features" / "shuttle" / "IMG_3218_ball.csv"
+    SHUTTLE_PATH = INPLAY_DIR / "features" / "shuttle" / "example_match_ball.csv"
     LABELS_PATH = INPLAY_DIR / "in_play_frame_labels.csv"
     OUTPUT_PATH = INPLAY_DIR / "combined_features.npy"
 

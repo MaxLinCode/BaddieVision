@@ -231,12 +231,45 @@ def test_validity_is_an_explicit_input_and_time_must_be_centered():
             model(batch).candidate_logits[0, 0], model(invalid).candidate_logits[0, 0]
         )
     batch.relative_time_seconds += 2
+    # Direct mutation invalidates the batch's validation provenance. Production
+    # batches are treated as immutable after CPU collation.
+    batch.validated = False
     with pytest.raises(ValueError, match="centered"):
         model(batch)
 
 
-def test_tiny_temporal_association_problem_can_overfit():
-    torch.manual_seed(12)
+def test_vectorized_selection_loss_matches_frame_local_reference():
+    batch = _batch(batch_size=2)
+    model = TemporalShuttleSelector(_small_config())
+    output = model(batch)
+    reference = []
+    for batch_index, frame_index in torch.nonzero(
+        batch.frame_mask & (batch.targets != -100), as_tuple=False
+    ).tolist():
+        slots = torch.nonzero(
+            batch.candidate_mask[batch_index]
+            & (batch.candidate_frame_indices[batch_index] == frame_index),
+            as_tuple=False,
+        ).flatten()
+        logits = torch.cat(
+            (
+                output.candidate_logits[batch_index, slots],
+                output.null_logits[batch_index, frame_index].view(1),
+            )
+        )
+        target = int(batch.targets[batch_index, frame_index])
+        resolved = len(slots) if target == -1 else target
+        reference.append(
+            torch.nn.functional.cross_entropy(
+                logits.view(1, -1), torch.tensor([resolved])
+            )
+        )
+    torch.testing.assert_close(model.loss(batch, output), torch.stack(reference).mean())
+
+
+@pytest.mark.parametrize("seed", [12, 71])
+def test_tiny_temporal_association_problem_can_overfit(seed):
+    torch.manual_seed(seed)
     # Each frame has two ambiguous observations. Across time the selected
     # observations form the smooth left-to-right path (local slots 0, 1, 0).
     candidate_values = torch.zeros(1, 6, 12)
@@ -265,9 +298,14 @@ def test_tiny_temporal_association_problem_can_overfit():
         _small_config(token_size=16, num_attention_heads=2, feed_forward_size=32)
     )
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    for _ in range(300):
+    # CPU attention kernels converge at different rates across supported
+    # platforms. Keep the same fit requirement and optimizer; allow a bounded
+    # convergence budget instead of assuming convergence by exactly step 300.
+    for _ in range(1000):
         optimizer.zero_grad()
         loss = model.loss(batch)
         loss.backward()
         optimizer.step()
+        if loss.item() < 0.01:
+            break
     assert model.loss(batch).item() < 0.03

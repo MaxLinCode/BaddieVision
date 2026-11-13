@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -13,7 +14,10 @@ from urllib.parse import parse_qs, urlparse
 
 import cv2
 
-from court_projection import (
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from src.court_projection import (
     COURT_CALIBRATION_LINES,
     COURT_LANDMARKS,
     CourtHomography,
@@ -282,7 +286,7 @@ def collect_browser_selection(
     return result["selection"], read_frame(source, selected_index), selected_index
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Fit image-to-court homography from draggable lines or points."
     )
@@ -321,11 +325,11 @@ def parse_args() -> argparse.Namespace:
         help="line-mode guides (at least two sidelines and two cross-court lines)",
     )
     parser.add_argument("--preview", type=Path, help="optional overlay image output")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
     if args.mode == "points" and len(args.landmarks) < 4:
         raise ValueError("point mode requires at least four landmarks")
     if args.mode == "lines":
@@ -388,6 +392,7 @@ def main() -> None:
         args.preview.parent.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(args.preview), draw_court_overlay(frame, homography))
         print(f"Saved preview {args.preview}")
+    return int(selected_frame_index)
 
 
 if __name__ == "__main__":

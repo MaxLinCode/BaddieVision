@@ -1,294 +1,126 @@
 # BaddieVision
 
-BaddieVision is a research project for turning static-camera badminton video
-into structured match data. It combines player pose estimation, shuttle
-tracking, court calibration, shot classification, and rally segmentation.
+BaddieVision turns static-camera singles badminton video into structured rally
+intervals. It also contains research tooling for player pose, court projection,
+shuttle tracking, annotation, and shot classification.
 
-![Rally segmentation diagnostic showing the source frame, in-play probability, and decoded interval](outputs/share/rally-segmentation-demo-poster.jpg)
+The maintained RallySegmenter uses player/court observations and player-relative
+pose. It does not need shuttle candidates, training labels, or an annotation
+teacher at inference time. It is an offline model with centered temporal context.
 
-The maintained rally segmenter reached **0.718 macro frame F1** and **0.890
-macro ROC-AUC** in leave-one-camera-group-out evaluation across four camera
-groups (126 rallies and 52,012 labeled frames). These are research results on a
-small private dataset, not a public benchmark. See the
-[evaluation protocol and full metric summary](docs/independent-rally-segmenter.md#expanded-maintained-baseline).
+The six-source, four-camera research baseline reports macro frame F1 **0.718**,
+ROC AUC **0.890**, interval F1 **0.41915**, and boundary MAE **26.11 frames**
+on 126 rallies / 52,012 labeled frames. These results come from a small private
+dataset; they are not a public benchmark or a production accuracy guarantee.
+See [the evaluation protocol](docs/independent-rally-segmenter.md).
 
-The project includes:
+## Install
 
-- player pose extraction with MediaPipe;
-- shuttle tracking with TrackNetV3 and YOLO;
-- badminton-shot classification from pose and shuttle features;
-- in-play/rally detection with frame-level and LSTM classifiers;
-- metric court projection for static-camera footage.
-
-This is an actively developed research prototype. Source videos, trained
-weights, and generated features are not committed to the repository.
-
-## Repository layout
-
-```text
-.
-├── src/                         Main feature extraction and shot classifier
-│   └── TrackNetV3/              Vendored TrackNetV3 implementation
-├── InPlay/                      Rally/in-play labeling, training, and inference
-├── yolov8/shuttle-yolo-dataset/ YOLO config plus the small curated dataset
-├── notebooks/                   Research and data-preparation notebooks
-├── requirements.txt             Runtime dependencies
-└── requirements-dev.txt         Notebook and development dependencies
-```
-
-Large and generated assets stay on each development machine and are intentionally
-ignored by Git. This includes videos, extracted clips/features, model weights,
-checkpoints, inference output, and NumPy training arrays.
-
-## Quick start
-
-Python 3.11 is recommended because it has reliable wheel availability across the
-computer-vision stack.
+Use Python 3.11 and install FFmpeg on your system.
 
 ```bash
 git clone --recurse-submodules https://github.com/MaxLinCode/BaddieVision.git
 cd BaddieVision
-
 python3.11 -m venv .venv
 source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements-dev.txt
-python -m pytest -q
+python -m pip install -r requirements-inference.txt
 ```
 
-If `python3.11` is not available on macOS, install it first with Homebrew:
+For Linux CPU-only installations, first install the matching CPU wheels:
 
 ```bash
-brew install python@3.11
+python -m pip install torch==2.7.1 torchvision==0.22.1 \
+  --index-url https://download.pytorch.org/whl/cpu
+python -m pip install -r requirements-inference.txt
 ```
 
-PyTorch automatically uses CUDA where available. On Apple Silicon, training code
-uses Apple's MPS backend when supported and otherwise falls back to CPU.
+For development, install `requirements-dev.txt` with the inference pins as
+constraints, then run tests:
 
-The single-video notebooks accept `.mp4` source videos only. Full inputs are
-byte-copied into the portable result bundle when their frame rate is already at
-or below the configured working FPS. Higher-frame-rate inputs use FFmpeg's FPS
-filter, preferring fast NVIDIA NVENC encoding and falling back to ultrafast CPU
-encoding. Trim-only operations use stream copy, so their boundaries are
-keyframe-aligned and may not be frame-exact. No Python FFmpeg package is required.
+```bash
+python -m pip install -r requirements-dev.txt -r requirements-inference.txt
+python -m pytest -q
+python scripts/check_private_assets.py
+```
 
-Single-video result bundles retain the legacy selected `tracks.csv` path and also
-include `shuttle_candidates.jsonl`, `shuttle_tracklets.jsonl`, and diagnostic
-`shuttle_hypotheses.jsonl`. Candidates are
-connected TrackNet components above the `0.5` threshold, not stored heatmaps;
-InpaintNet continues to run only on the legacy single-track path. Tracklets are
-conservative diagnostic fragments that can be regenerated from candidates
-without rerunning TrackNet. Hypotheses are replayable top-five, diversified
-whole-video associations of those fragments; they do not replace `tracks.csv`
-or consume player evidence yet. Player previews show only the rank-1 path from
-each association region as a magenta connected overlay, and older bundles may
-omit the hypotheses artifact.
+The TrackNet submodule is pinned by its Git commit. Do not replace that commit
+with a moving branch during setup or CI.
 
-## Local data and models
+## Video to rally CSV and overlay
 
-After cloning onto another machine, copy or download your private working assets
-into the same relative locations:
+```bash
+python -m src.workflow rally predict \
+  --video match.mp4 \
+  --output-dir outputs/match \
+  --model rally-six-source-v1 \
+  --device auto
+```
+
+If court calibration is missing, the command reports it and opens the browser
+calibration tool. Save the calibration to continue. For a noninteractive run,
+provide `--calibration court.json`.
+
+The named model is downloaded only from its versioned release and every asset is
+checked against its size and SHA-256. The verified [rally-six-source-v1 release](https://github.com/MaxLinCode/BaddieVision/releases/tag/rally-six-source-v1)
+includes public weights and the approved ten-second sample. For an extracted
+release bundle or a sanitized local export, use:
+
+```bash
+python -m src.workflow rally predict \
+  --video match.mp4 --calibration court.json --output-dir outputs/match \
+  --checkpoint release/rally-segmenter.pt --model-manifest release/manifest.json
+```
+
+The pipeline registers an immutable source, extracts or verifies person tracks
+and pose, predicts one state per frame, then writes:
 
 ```text
-videos/                         Source shot-classification videos
-clips/                          Extracted/labeled shot clips
-features/                       Generated pose and shuttle features
-clip_features/                  Combined per-clip feature arrays
-models/                         TorchScript models and classifier checkpoints
-outputs/                        Rendered predictions and plots
-InPlay/videos/                  Source rally videos
-InPlay/features/                Generated rally pose/shuttle features
-InPlay/data/                    LSTM training arrays
-InPlay/models/                  In-play model checkpoints
-src/TrackNetV3/ckpts/           TrackNetV3 checkpoints
+outputs/match/
+  source.json
+  court/calibration.json
+  players/                       Observations and stage receipts
+  rallies/predictions.jsonl       One probability/state record per frame
+  rallies/rallies.csv             Inclusive zero-based rally intervals
+  rallies/overlay.mp4             Prediction-only video overlay
+  rallies/run.manifest.json       Inputs, versions, and output fingerprints
 ```
 
-The code now resolves these paths from the repository location, so the checkout
-does not need to be named `badminton` or live directly under your home directory.
+A verified cached rerun reuses the same outputs. Stale or incomplete artifacts
+fail with a `--force` recovery instruction. `--no-overlay` skips video rendering.
+CUDA, MPS, and CPU are supported; `auto` selects the first available device.
 
-Portable ZIP bundles have been prepared under `data_packages/`. The ZIP files are
-ignored by Git and can be uploaded to private cloud storage; their README and
-SHA-256 files remain versioned. See
-[`data_packages/README.md`](data_packages/README.md) for their contents and restore
-instructions.
+See [inference and release instructions](docs/rally-inference.md) for the complete
+command, registered-source reuse, checkpoint export, and sample preparation.
 
-Do not commit the ZIP files to ordinary Git history. If you later want versioned
-models or datasets, configure Git LFS or DVC before adding those files.
+## Private data
 
-## Typical workflows
+Videos, annotations, extracted features, model weights, local recording configs,
+and detector training images/labels stay outside tracked Git files. The checkout
+contains synthetic regression fixtures and generic example configs. Restore your
+own data locally; none is necessary for the default test suite.
 
-Extract pose features from videos:
+Previously committed data remains in Git history. This change preserves history
+and prevents the known private asset classes from being reintroduced in future
+commits. Release packages use an explicit file allowlist. Only approved sample
+media and inference assets belong in a verified release.
 
-```bash
-python src/extract_features.py
-mkdir -p features/court
-cp config/court_calibrations.example.json features/court/calibrations.json
-# Edit the registry and calibrate each static source video before continuing.
-python src/extract_clip_features.py
-```
+## Other workflows
 
-Shot features include a normalized court-space player anchor. The extractor
-resolves each clip to a shared source-video calibration through
-`features/court/calibrations.json`. Modern clip names can contain a source ID
-such as `img_3214`; clips without one need an explicit `clip_overrides` entry.
-Calibration paths are relative to the registry:
+- [Source registration, calibration, and annotation](docs/workflow.md)
+- [Annotation platform](docs/annotation-platform.md)
+- [Court-space shot features](docs/plans/court-space-player-anchor.md)
+- [Research evaluation](docs/independent-rally-segmenter.md)
 
-```json
-{
-  "version": 1,
-  "sources": {
-    "img_3214": {"calibration": "img_3214.json"}
-  },
-  "clip_overrides": {
-    "clear_001": "img_3214"
-  }
-}
-```
+The shot classifier remains a separate workflow. Its `(36, 76)` feature arrays
+contain 66 pose coordinates, seven shuttle features, and a three-value court
+anchor. Older 73-input checkpoints require feature regeneration and retraining.
 
-Each source ID must identify one static camera segment. Create a new source and
-calibration after any camera movement. Calibration files must include
-`image_size`, which the calibration command records automatically. Missing or
-ambiguous mappings and unusable foot tracks stop feature generation instead of
-silently producing invalid training data.
-
-Render the extracted pose, shuttle, and court-anchor features back onto a
-source video:
-
-```bash
-python src/visualize_features.py videos/example.mp4 --max-frames 300
-```
-
-The renderer reads `features/pose/<base>_pose.json` and
-`features/shuttle/<base>_ball.csv` by default, resolves court calibration from
-`features/court/calibrations.json`, and writes
-`outputs/<base>_feature_overlay.mp4`.
-
-Train the shot classifier:
-
-```bash
-python src/train_shot_classifier.py
-```
-
-The generated feature shape is `(36, 76)`: 66 pose coordinates, 7 shuttle
-features, and `[court_x, court_y, observed]`. Existing 73-input classifier
-checkpoints must be retrained. Training now groups validation by source video,
-so at least two calibrated sources are required and no recording appears in
-both splits.
-
-The singles player pipeline keeps detector output separate from court-role
-interpretation. Raw extraction does not require calibration or MediaPipe:
-
-```bash
-python3 -m InPlay.heuristic.person_tracks extract \
-  --video videos/example.mp4 --output outputs/example/person_tracks.jsonl
-```
-
-Interpret near-side P1 and far-side P2, incrementally enrich the pose cache,
-and preserve the rally classifier's `players.csv` schema:
-
-```bash
-python3 -m InPlay.heuristic.player_visualizer \
-  --video videos/example.mp4 \
-  --person-tracks outputs/example/person_tracks.jsonl \
-  --court-calibration features/court/example.json \
-  --pose-cache outputs/example/pose_cache.jsonl \
-  --assignments outputs/example/player_assignments.jsonl \
-  --players-csv outputs/example/players.csv \
-  --tracks-csv outputs/example/tracks.csv \
-  --preview outputs/example/preview.mp4
-```
-
-The former `InPlay.heuristic.players` command remains as a deprecated
-compatibility wrapper. Court calibration is required only for interpretation;
-missing, ambiguous, or image-size-mismatched calibration is an explicit error.
-
-Extract and train in-play features:
-
-```bash
-python InPlay/extract_features.py
-python InPlay/extract_combined_features.py
-python InPlay/train_lstm_model.py
-```
-
-Train the YOLO shuttle detector:
-
-```bash
-python yolov8/shuttle-yolo-dataset/train_yolo.py
-```
-
-TrackNetV3 is included as a submodule pointing to the
-[`MaxLinCode/TrackNetV3`](https://github.com/MaxLinCode/TrackNetV3) fork and its
-`codex/badminton-integration` branch. The fork contains this project's custom
-batch-prediction helpers and CUDA/MPS/CPU device support.
-
-TrackNetV3 checkpoints are not included. See
-[`src/TrackNetV3/README.md`](src/TrackNetV3/README.md) for the upstream checkpoint
-download and its detailed training/inference instructions.
-
-## Court projection
-
-Calibrate a static camera with draggable court-line guides. The browser workflow
-also works in headless WSL environments without OpenCV's Qt/X11 window support:
-
-```bash
-python src/calibrate_court.py videos/example.mp4 \
-  features/court/example.json --frame 0 \
-  --preview outputs/example_court_overlay.jpg
-```
-
-The command prints a localhost URL; paste it into a browser. Add
-`--open-browser` only if WSL supports launching your host browser. The browser
-has previous/next, ±10, and direct frame-number controls; changing frames clears
-the calibration. Zoom with the mouse wheel or the Zoom ± buttons, pan with the
-scrollbars, and use Fit to restore the full-frame view. A crosshair magnifier
-follows the pointer.
-
-For each cyan guide named in the header, click two points along the corresponding
-painted court line. After four guides are placed, the full projected court
-appears in green. Drag the orange handles until the green model aligns with the
-video. Guide intersections may lie outside the frame, so cropped outer corners
-are supported.
-
-The defaults use the left and right doubles sidelines plus the near and far
-short-service lines. Choose other visible floor markings with `--court-lines`:
-
-```bash
-python src/calibrate_court.py videos/example.mp4 features/court/example.json \
-  --frame 120 --preview outputs/example_court_overlay.jpg \
-  --court-lines left_singles_sideline right_singles_sideline \
-                near_doubles_long_service far_short_service
-```
-
-At least two longitudinal and two cross-court lines are required. Extra visible
-lines improve robustness. The older intersection-click workflow remains
-available with `--mode points`. The saved homography maps image pixels to court
-coordinates in metres, with the origin at court centre, x running left-to-right,
-and y running near-to-far.
-
-```python
-from src.court_projection import CourtHomography
-
-calibration = CourtHomography.load("features/court/example.json")
-feet_xy_metres = calibration.project_to_court([[player_foot_x, player_foot_y]])
-# MediaPipe coordinates are normalized, so also pass the source image size:
-feet_xy_metres = calibration.project_normalized_to_court(
-    [[landmark.x, landmark.y]], (frame_width, frame_height)
-)
-```
-
-A planar homography is valid for points on the floor (player foot positions and
-shuttle landing/contact points). Projecting an airborne shuttle gives only its
-vertical image-ray intersection with the court plane, not its true 3D position.
-
-## Contributing
-
-Issues and focused pull requests are welcome. Before submitting a change, run:
-
-```bash
-python -m pytest -q
-```
+Court calibration represents one static camera segment, uses `image_size`, and
+maps floor points to metres. Camera movement requires a new source/calibration.
+Airborne-shuttle projection does not recover true 3D location.
 
 ## License
 
-This project is available under the [MIT License](LICENSE). The TrackNetV3
-submodule retains its own license.
+The project is [MIT licensed](LICENSE). TrackNet retains its own license.
+Detector/pose assets retain their upstream license terms; redistribution must
+include the applicable notices in the model card.

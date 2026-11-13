@@ -8,10 +8,13 @@ import random
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Mapping
+from typing import TYPE_CHECKING, Mapping
 
 from .core import AnnotationRegistry
 from .views import validate_source_video
+
+if TYPE_CHECKING:
+    from src.temporal_selector.rally_intervals import RallyIntervalIndex
 
 
 def native_fps_burst(
@@ -151,6 +154,152 @@ def _burst(
         candidate_artifact_sha256=artifact_sha256,
         source_video_sha256=source.video_sha256,
         score=score,
+    )
+
+
+def build_rally_refill_queue(
+    registry: AnnotationRegistry,
+    task: str,
+    rally_index: RallyIntervalIndex,
+    *,
+    already_labeled: set[tuple[str, int]] | None = None,
+    excluded_frames: set[tuple[str, int]] | None = None,
+) -> AnnotationQueue:
+    """Build first/last/midpoint in-rally coverage without relabeling frames."""
+    already_labeled = set(already_labeled or ())
+    excluded_frames = set(excluded_frames or ())
+    bursts: list[QueueBurst] = []
+    claimed = already_labeled | excluded_frames
+    for source_id in sorted(rally_index.sources):
+        plugin, source = registry.resolve(task, source_id)
+        manifest_source = rally_index.sources[source_id]
+        if (
+            source.video_sha256 != manifest_source.video_sha256
+            or not math.isclose(source.fps, manifest_source.fps, rel_tol=0, abs_tol=1e-6)
+            or source.frame_count != manifest_source.frame_count
+        ):
+            raise ValueError("rally refill source provenance mismatch")
+        artifact_sha256 = plugin.verify_artifact_fingerprint(source)
+        width = max(1, math.floor(source.fps + 0.5))
+        right_span = width - 1 - width // 2
+        for interval in rally_index.for_source(source_id):
+            anchors = (
+                min(interval.end_frame, interval.start_frame + width // 2),
+                (interval.start_frame + interval.end_frame) // 2,
+                max(interval.start_frame, interval.end_frame - right_span),
+            )
+            for anchor in dict.fromkeys(anchors):
+                start = max(interval.start_frame, anchor - width // 2)
+                end = min(interval.end_frame, start + width - 1)
+                start = max(interval.start_frame, end - width + 1)
+                frames = tuple(
+                    frame
+                    for frame in range(start, end + 1)
+                    if (source_id, frame) not in claimed
+                )
+                if not frames:
+                    continue
+                claimed.update((source_id, frame) for frame in frames)
+                bursts.append(
+                    _burst(
+                        registry,
+                        task,
+                        source_id,
+                        anchor,
+                        kind="refill",
+                        score=None,
+                        artifact_sha256=artifact_sha256,
+                        frames=frames,
+                    )
+                )
+    return AnnotationQueue(
+        queue_id=f"rally-refill-{uuid.uuid4()}",
+        kind="refill",
+        task=task,
+        seed=None,
+        bursts=tuple(bursts),
+        construction={
+            "strategy": "strict-rally-first-last-midpoint-one-second",
+            "rally_intervals_sha256": rally_index.intervals_sha256,
+            "excluded_existing_frame_count": len(already_labeled),
+            "excluded_reserved_frame_count": len(excluded_frames),
+        },
+    )
+
+
+def build_rally_audit_extension_queue(
+    registry: AnnotationRegistry,
+    task: str,
+    rally_index: "RallyIntervalIndex",
+    *,
+    existing_audit_frames: set[tuple[str, int]],
+    excluded_frames: set[tuple[str, int]],
+) -> AnnotationQueue:
+    """Add one deterministic unbiased audit burst to uncovered rallies."""
+    bursts: list[QueueBurst] = []
+    used = set(excluded_frames)
+    for source_id in sorted(rally_index.sources):
+        plugin, source = registry.resolve(task, source_id)
+        manifest_source = rally_index.sources[source_id]
+        if (
+            source.video_sha256 != manifest_source.video_sha256
+            or not math.isclose(source.fps, manifest_source.fps, rel_tol=0, abs_tol=1e-6)
+            or source.frame_count != manifest_source.frame_count
+        ):
+            raise ValueError("rally audit source provenance mismatch")
+        artifact_sha256 = plugin.verify_artifact_fingerprint(source)
+        eligible = _eligible_bursts(registry, task, source_id)
+        for interval in rally_index.for_source(source_id):
+            if any(
+                (source_id, frame) in existing_audit_frames
+                for frame in range(interval.start_frame, interval.end_frame + 1)
+            ):
+                continue
+            midpoint = (interval.start_frame + interval.end_frame) // 2
+            anchors = sorted(
+                range(interval.start_frame, interval.end_frame + 1),
+                key=lambda frame: (abs(frame - midpoint), frame),
+            )
+            selected = next(
+                (
+                    (anchor, eligible[anchor])
+                    for anchor in anchors
+                    if not {
+                        (source_id, frame) for frame in eligible.get(anchor, ())
+                    }
+                    & used
+                ),
+                None,
+            )
+            if selected is None:
+                raise ValueError(
+                    f"no uncontaminated audit burst available for rally {interval.rally_id}"
+                )
+            anchor, frames = selected
+            used.update((source_id, frame) for frame in frames)
+            bursts.append(
+                _burst(
+                    registry,
+                    task,
+                    source_id,
+                    anchor,
+                    kind="audit",
+                    score=None,
+                    artifact_sha256=artifact_sha256,
+                    frames=frames,
+                )
+            )
+    return AnnotationQueue(
+        queue_id=f"rally-audit-extension-{uuid.uuid4()}",
+        kind="audit",
+        task=task,
+        seed=None,
+        bursts=tuple(bursts),
+        construction={
+            "sampling": "deterministic-rally-midpoint-nearest-uncontaminated",
+            "anchor_count": len(bursts),
+            "rally_intervals_sha256": rally_index.intervals_sha256,
+        },
     )
 
 
@@ -377,7 +526,7 @@ def build_adaptive_queue(
 
 def validate_queue(registry: AnnotationRegistry, queue: AnnotationQueue) -> None:
     """Validate a persisted queue against current source/artifact fingerprints."""
-    if queue.kind not in {"adaptive", "audit"}:
+    if queue.kind not in {"adaptive", "audit", "refill"}:
         raise ValueError(f"invalid queue kind: {queue.kind}")
     registration = registry.tasks.get(queue.task)
     if registration is None:
@@ -399,13 +548,18 @@ def validate_queue(registry: AnnotationRegistry, queue: AnnotationQueue) -> None
         if burst.source_video_sha256 != video_sha:
             raise ValueError(f"queue source-video fingerprint mismatch: {burst.burst_id}")
         expected_frames = eligible_bursts[burst.source_id].get(burst.anchor_frame)
-        if burst.frames != expected_frames:
+        if queue.kind == "refill":
+            valid_frames = set(expected_frames or ())
+            coverage_ok = bool(burst.frames) and set(burst.frames) <= valid_frames
+        else:
+            coverage_ok = burst.frames == expected_frames
+        if not coverage_ok:
             raise ValueError(
                 f"queue burst frames do not match eligible native-FPS coverage: {burst.burst_id}"
             )
         keys = {(burst.source_id, frame) for frame in burst.frames}
-        if queue.kind == "audit" and keys & used:
-            raise ValueError(f"audit queue contains overlapping evaluation frames: {burst.burst_id}")
+        if queue.kind in {"audit", "refill"} and keys & used:
+            raise ValueError(f"queue contains overlapping owned frames: {burst.burst_id}")
         used.update(keys)
     if queue.kind == "audit":
         declared_count = queue.construction.get("anchor_count")
