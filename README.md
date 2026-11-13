@@ -38,7 +38,7 @@ For development, install `requirements-dev.txt` with the inference pins as
 constraints, then run tests:
 
 ```bash
-python -m pip install -r requirements-dev.txt -c requirements-inference.txt
+python -m pip install -r requirements-dev.txt -r requirements-inference.txt
 python -m pytest -q
 python scripts/check_private_assets.py
 ```
@@ -61,9 +61,9 @@ calibration tool. Save the calibration to continue. For a noninteractive run,
 provide `--calibration court.json`.
 
 The named model is downloaded only from its versioned release and every asset is
-checked against its size and SHA-256. **The public model release is pending
-verification of the existing local weights and approved sample.** Until that
-release is available, use a sanitized local export:
+checked against its size and SHA-256. The verified [rally-six-source-v1 release](https://github.com/MaxLinCode/BaddieVision/releases/tag/rally-six-source-v1)
+includes public weights and the approved ten-second sample. For an extracted
+release bundle or a sanitized local export, use:
 
 ```bash
 python -m src.workflow rally predict \

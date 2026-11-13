@@ -3,8 +3,9 @@
 ## Run a video
 
 Install Python 3.11, FFmpeg, and `requirements-inference.txt` from the repository
-root. The public `rally-six-source-v1` weights are pending real-asset validation;
-the CLI explains how to use a local sanitized export if the release is absent.
+root. The verified [rally-six-source-v1 release](https://github.com/MaxLinCode/BaddieVision/releases/tag/rally-six-source-v1)
+contains the weights, approved ten-second sample, checksums, and upstream notices.
+Named-model inference downloads checksum-verified assets automatically.
 
 ```bash
 python -m src.workflow rally predict \
