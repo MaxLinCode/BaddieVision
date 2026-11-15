@@ -4,6 +4,11 @@ BaddieVision turns static-camera singles badminton video into structured rally
 intervals. It also contains research tooling for player pose, court projection,
 shuttle tracking, annotation, and shot classification.
 
+[![Example badminton video with BaddieVision's predicted rally-state overlay](https://github.com/MaxLinCode/BaddieVision/releases/download/rally-six-source-v1/sample-poster.jpg)](https://github.com/MaxLinCode/BaddieVision/releases/download/rally-six-source-v1/sample-overlay.mp4)
+
+*From match video to rally intervals: an example prediction overlay.
+[Watch the ten-second demo](https://github.com/MaxLinCode/BaddieVision/releases/download/rally-six-source-v1/sample-overlay.mp4).*
+
 The maintained RallySegmenter uses player/court observations and player-relative
 pose. It does not need shuttle candidates, training labels, or an annotation
 teacher at inference time. It is an offline model with centered temporal context.
