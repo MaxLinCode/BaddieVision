@@ -68,6 +68,7 @@ yolov8/shuttle_test/
 # Logs and local plots
 *.log
 runs/
+.remote-gpu/
 .codex/visualizations/
 
 # Portable data packages for Colab/Kaggle/Drive
@@ -89,3 +90,6 @@ yolov8/shuttle-yolo-dataset/labels/
 *.private-provenance.json
 release/
 InPlay/*.local.json
+
+# Private local data and recovered assets: retain on disk, never commit.
+/.local-data/

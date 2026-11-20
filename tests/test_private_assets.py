@@ -11,6 +11,8 @@ from scripts.check_private_assets import check_paths, private_path_reason
 
 
 @pytest.mark.parametrize("name", [
+    ".local-data/recovery/calibration.json",
+    ".local-data/recovery/notes.txt",
     ".annotation-private/events/shuttle.jsonl",
     "config/match.local.json",
     "config/experiment.local-loso-manifest.json",

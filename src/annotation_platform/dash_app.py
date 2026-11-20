@@ -676,7 +676,7 @@ def create_dash_app(
             canonical_position = None
             if label_kind == "selected":
                 source = registry.sources[burst.source_id]
-                overlays = getattr(task_plugin, "annotator_overlays", task_plugin.overlays)(source, frame)
+                overlays = task_plugin.annotator_overlays(source, frame)
                 selected_overlay = next(
                     (item for item in overlays if item.get("candidate_id") == candidate_id),
                     None,

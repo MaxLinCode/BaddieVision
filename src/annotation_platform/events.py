@@ -323,37 +323,21 @@ class EventStore:
         from .views import validate_source_video
 
         validate_source_video(source)
-        plugin.validate_label(
+        payload = plugin.build_label_payload(
             source,
             frame=int(frame),
             label_kind=label_kind,
             candidate_id=candidate_id,
             candidate_artifact_sha256=candidate_artifact_sha256,
+            canonical_position=canonical_position,
+            review_action_override=review_action_override,
         )
+        if set(payload) - {"candidate_position"}:
+            raise ValueError("task returned unsupported event payload fields")
+        position = payload.get("candidate_position")
         candidate_position = (
-            _validate_candidate_position(canonical_position)
-            if canonical_position is not None
-            else None
+            _validate_candidate_position(position) if position is not None else None
         )
-        if label_kind == "selected":
-            resolver = getattr(plugin, "resolve_candidate_position", None)
-            if resolver is not None:
-                candidate_position = _validate_candidate_position(
-                    resolver(
-                        source,
-                        frame=int(frame),
-                        candidate_id=candidate_id,
-                        candidate_artifact_sha256=candidate_artifact_sha256,
-                    )
-                )
-        elif (
-            label_kind == "missing_proposal"
-            and candidate_position is None
-            and review_action_override not in {"migrated", "derived"}
-        ):
-            raise ValueError(
-                "new missing_proposal labels require a clicked canonical position"
-            )
         suggestion_mapping = asdict(annotation_suggestion) if annotation_suggestion else None
         if annotation_suggestion is not None:
             if not annotation_suggestion.verified:
@@ -465,9 +449,8 @@ class EventStore:
         """Resolve an old selection only when its exact artifact is still registered."""
         try:
             plugin, source = self.registry.resolve(event.task, event.source_id)
-            resolver = getattr(plugin, "resolve_candidate_position")
             return _validate_candidate_position(
-                resolver(
+                plugin.resolve_candidate_position(
                     source,
                     frame=event.frame,
                     candidate_id=event.candidate_id,
