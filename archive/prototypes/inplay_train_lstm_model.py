@@ -1,4 +1,7 @@
+"""Historical fixed-input prototype; see archive/README.md before running."""
+
 import os
+import copy
 import numpy as np
 import torch
 import torch.nn as nn
@@ -11,10 +14,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 # === Load Data ===
 sequence_length = 36
-INPLAY_DIR = Path(__file__).resolve().parent
-X_seq = np.load(INPLAY_DIR / "data" / "img_3418_X.npy").astype(np.float32)
-y_seq = np.load(INPLAY_DIR / "data" / "img_3418_Y.npy").astype(np.float32)
-
+INPLAY_DIR = Path(__file__).resolve().parents[2] / "InPlay"
 # === Label smoothing around rally edges ===
 def edge_label_smoothing(labels, edge_width=2, smoothing=0.1):
     smoothed = labels.copy()
@@ -28,22 +28,6 @@ def edge_label_smoothing(labels, edge_width=2, smoothing=0.1):
                 if smoothed[i, -t-1] != smoothed[i, -t-2]:
                     smoothed[i, -t-1] = smoothed[i, -t-1] * (1 - smoothing) + 0.5 * smoothing
     return smoothed
-
-y_seq = edge_label_smoothing(y_seq, edge_width=4, smoothing=0.2)
-
-# Train-test split
-X_train, X_val, y_train, y_val = train_test_split(X_seq, y_seq, test_size=0.2, random_state=42)
-
-# Convert to tensors (no unsqueeze!)
-X_train = torch.tensor(X_train)
-y_train = torch.tensor(y_train)
-X_val = torch.tensor(X_val)
-y_val = torch.tensor(y_val)
-
-# Create DataLoaders
-batch_size = 64
-train_loader = DataLoader(TensorDataset(X_train, y_train), batch_size=batch_size, shuffle=True)
-val_loader = DataLoader(TensorDataset(X_val, y_val), batch_size=batch_size)
 
 # === Model ===
 class LSTMClassifier(nn.Module):
@@ -65,6 +49,25 @@ class LSTMClassifier(nn.Module):
 
 # === Training ===
 if __name__ == "__main__":
+    X_seq = np.load(INPLAY_DIR / "data" / "img_3418_X.npy").astype(np.float32)
+    y_seq = np.load(INPLAY_DIR / "data" / "img_3418_Y.npy").astype(np.float32)
+
+    y_seq = edge_label_smoothing(y_seq, edge_width=4, smoothing=0.2)
+
+    # Train-test split
+    X_train, X_val, y_train, y_val = train_test_split(X_seq, y_seq, test_size=0.2, random_state=42)
+
+    # Convert to tensors (no unsqueeze!)
+    X_train = torch.tensor(X_train)
+    y_train = torch.tensor(y_train)
+    X_val = torch.tensor(X_val)
+    y_val = torch.tensor(y_val)
+
+    # Create DataLoaders
+    batch_size = 64
+    train_loader = DataLoader(TensorDataset(X_train, y_train), batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(TensorDataset(X_val, y_val), batch_size=batch_size)
+
     input_dim = X_seq.shape[2]
     model = LSTMClassifier(input_size=input_dim, hidden_size=64, num_layers=2)
 
@@ -121,7 +124,7 @@ if __name__ == "__main__":
         # Early stopping
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            best_model_state = model.state_dict()
+            best_model_state = copy.deepcopy(model.state_dict())
             no_improve_counter = 0
         else:
             no_improve_counter += 1

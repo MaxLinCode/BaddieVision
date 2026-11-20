@@ -1,3 +1,7 @@
+# Preserve the original prototype import/setup ordering for reproduction.
+# ruff: noqa: E402, F401, F403
+"""Historical fixed-input prototype; see archive/README.md before running."""
+
 import os
 import numpy as np
 import torch
@@ -10,7 +14,7 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import confusion_matrix, f1_score
 
 # Load dataset
-INPLAY_DIR = Path(__file__).resolve().parent
+INPLAY_DIR = Path(__file__).resolve().parents[2] / "InPlay"
 data = np.load(INPLAY_DIR / "combined_features.npy")
 X = data[:, :-1].astype(np.float32)
 y = data[:, -1].astype(np.float32)

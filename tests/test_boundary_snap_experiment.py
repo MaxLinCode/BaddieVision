@@ -1,4 +1,4 @@
-from src.temporal_selector.boundary_snap_experiment import (
+from experiments.temporal_selector.boundary_snap_experiment import (
     OperationalSnapConfig,
     snap_prediction_rows,
 )

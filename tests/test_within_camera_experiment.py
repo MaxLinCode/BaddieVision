@@ -11,11 +11,11 @@ from src.temporal_selector.dataset import (
     rally_boundary_targets,
 )
 from src.temporal_selector.experiment import _TokenBucketBatchSampler
-from src.temporal_selector.within_camera_experiment import (
+from experiments.temporal_selector.within_camera_experiment import (
     _parser,
     chronological_window_split,
 )
-from src.temporal_selector.within_camera_decoder import (
+from experiments.temporal_selector.within_camera_decoder import (
     build_rally_diagnostics,
     calibrate_validation_decoder,
     contiguous_row_groups,
@@ -23,7 +23,7 @@ from src.temporal_selector.within_camera_decoder import (
 )
 from src.temporal_selector.rally_intervals import RallyInterval
 from src.temporal_selector.rally_video_diagnostics import selection_summary
-from src.temporal_selector.partial_oracle_experiment import oracle_candidate_windows
+from experiments.temporal_selector.partial_oracle_experiment import oracle_candidate_windows
 from src.annotation_platform.events import AnnotationEvent
 
 

@@ -18,13 +18,13 @@ and dataset fingerprint are written to `metrics.json` and the checkpoint.
 Start with the two candidate-free pose representations:
 
 ```bash
-.venv/bin/python -m src.temporal_selector.within_camera_experiment \
+.venv/bin/python -m experiments.temporal_selector.within_camera_experiment \
   --config config/selector-experiment.example.json \
   --output-dir outputs/within-maxnik-image-pose-v1 \
   --context-mode full_context --pose-coordinate-mode image \
   --epochs 25 --batch-size 8 --seed 1729 --device mps
 
-.venv/bin/python -m src.temporal_selector.within_camera_experiment \
+.venv/bin/python -m experiments.temporal_selector.within_camera_experiment \
   --config config/selector-experiment.example.json \
   --output-dir outputs/within-maxnik-player-relative-pose-v1 \
   --context-mode full_context --pose-coordinate-mode player_relative \
@@ -52,7 +52,7 @@ After training, tune the deterministic interval decoder on validation without
 retraining or consulting test labels:
 
 ```bash
-.venv/bin/python -m src.temporal_selector.within_camera_decoder \
+.venv/bin/python -m experiments.temporal_selector.within_camera_decoder \
   --config config/selector-experiment.example.json \
   --checkpoint outputs/within-maxnik-relative-pose-with-candidates-v2/model.pt \
   --output-dir outputs/within-maxnik-relative-pose-with-candidates-decoded-v1 \
