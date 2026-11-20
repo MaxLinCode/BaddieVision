@@ -22,10 +22,10 @@ import torch
 
 from src.annotation_platform.events import AnnotationEvent
 
-from .batch import MASKED_TARGET
-from .config import SelectorConfig
-from .dataset import FRAME_DIMS, SelectorWindow, SelectorWindowDataset
-from .experiment import load_dataset_config, prepare_output_directory, select_device
+from src.temporal_selector.batch import (MASKED_TARGET)
+from src.temporal_selector.config import (SelectorConfig)
+from src.temporal_selector.dataset import (FRAME_DIMS, SelectorWindow, SelectorWindowDataset)
+from src.temporal_selector.training import (load_dataset_config, prepare_output_directory, select_device)
 from .partial_oracle_experiment import (
     MATCHED_ANNOTATION_SHA256,
     MATCHED_FRAME_RANGE,

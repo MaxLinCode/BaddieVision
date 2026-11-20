@@ -24,30 +24,13 @@ from sklearn.metrics import balanced_accuracy_score, confusion_matrix, f1_score
 
 from src.court_projection import CourtHomography, HALF_LENGTH, HALF_WIDTH
 
-from .experiment import _seed_everything, prepare_output_directory
-from .joint_inference import InPlayDecoderConfig
-from .rally import RallySegmenter, RallySegmenterConfig, RallyTrainingRecipe, rally_checkpoint
-from .rally_dataset import RallyWindow, RallyWindowDataset
-from .rally_evaluation import (
-    camera_held_out_folds,
-    chronological_camera_train_validation_split,
-    decode_prediction_rows,
-    metrics_by_source,
-    paired_bce_bootstrap,
-    rally_metrics,
-    tune_rally_decoder,
-)
-from .rally_experiment import (
-    _macro_metrics,
-    predict_rally_windows,
-    train_rally_segmenter,
-)
-from .rally_features import (
-    FULL_RALLY_FEATURE_NAMES,
-    RALLY_FEATURE_VIEWS,
-    RALLY_PROBE_GROUPS,
-    rally_feature_indices,
-)
+from src.temporal_selector.training import (seed_everything as _seed_everything, prepare_output_directory)
+from src.temporal_selector.joint_inference import (InPlayDecoderConfig)
+from src.temporal_selector.rally import (RallySegmenter, RallySegmenterConfig, RallyTrainingRecipe, rally_checkpoint)
+from src.temporal_selector.rally_dataset import (RallyWindow, RallyWindowDataset)
+from src.temporal_selector.rally_evaluation import (camera_held_out_folds, chronological_camera_train_validation_split, decode_prediction_rows, metrics_by_source, paired_bce_bootstrap, rally_metrics, tune_rally_decoder)
+from src.temporal_selector.rally_experiment import (_macro_metrics, predict_rally_windows, train_rally_segmenter)
+from src.temporal_selector.rally_features import (FULL_RALLY_FEATURE_NAMES, RALLY_FEATURE_VIEWS, RALLY_PROBE_GROUPS, rally_feature_indices)
 
 
 SEED = 1729
@@ -886,7 +869,7 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    from .rally_experiment import load_experiment_datasets
+    from src.temporal_selector.rally_experiment import (load_experiment_datasets)
 
     args = _parser().parse_args(argv)
     dataset, _, camera_sources = load_experiment_datasets(args.config)

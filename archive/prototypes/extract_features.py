@@ -1,19 +1,23 @@
+# Preserve the original prototype import/setup ordering for reproduction.
+# ruff: noqa: E402, F401, F403
+"""Historical fixed-input prototype; see archive/README.md before running."""
+
 import os
 import sys
 import gc
 import torch
 from pathlib import Path
-from pose_extraction import extract_pose
+from src.pose_extraction import extract_pose
 from tqdm import tqdm
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 tracknet_path = PROJECT_ROOT / "src" / "TrackNetV3"
 if str(tracknet_path) not in sys.path:
     sys.path.insert(0, str(tracknet_path))
 
-from TrackNetV3.predictArgs import run_prediction_batch, load_torchscript_model, run_prediction
-from TrackNetV3.utils.general import *
+from src.TrackNetV3.predictArgs import run_prediction_batch, load_torchscript_model, run_prediction
+from src.TrackNetV3.utils.general import *
 
 # Paths
 video_dir = PROJECT_ROOT / "videos"

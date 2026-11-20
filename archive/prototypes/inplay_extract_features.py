@@ -1,10 +1,14 @@
+# Preserve the original prototype import/setup ordering for reproduction.
+# ruff: noqa: E402, F401, F403
+"""Historical fixed-input prototype; see archive/README.md before running."""
+
 import sys
 from pathlib import Path
 from tqdm import tqdm
-from pose_extraction import extract_pose
+from src.pose_extraction import extract_pose
 
 # Paths
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 INPLAY_DIR = PROJECT_ROOT / "InPlay"
 video_dir = INPLAY_DIR / "videos"
 pose_out_dir = INPLAY_DIR / "features" / "pose"

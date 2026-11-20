@@ -10,8 +10,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from .rally_evaluation import rally_metrics
-from .rally_pseudo_label import _split_merge_counts
+from src.temporal_selector.rally_evaluation import (rally_metrics)
+from src.temporal_selector.rally_pseudo_label import (_split_merge_counts)
 
 
 RADII_SECONDS = (0.25, 0.5, 0.75)

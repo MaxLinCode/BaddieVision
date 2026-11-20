@@ -11,26 +11,11 @@ from typing import Any, Mapping, Sequence
 
 import torch
 
-from .config import ContextMode, SelectorConfig
-from .crossfit import CrossFitFold
-from .dataset import (
-    FRAME_DIMS,
-    SelectorWindow,
-    SelectorWindowDataset,
-)
-from .experiment import (
-    _predict_windows,
-    _seed_everything,
-    _train_fold,
-    _heldout_boundary_epoch_metrics,
-    _write_epoch_diagnostic_plot,
-    aggregate_joint_predictions,
-    compile_metrics,
-    load_dataset_config,
-    prepare_output_directory,
-    select_device,
-)
-from .model import JointRallyShuttleModel
+from src.temporal_selector.config import (ContextMode, SelectorConfig)
+from src.temporal_selector.crossfit import (CrossFitFold)
+from src.temporal_selector.dataset import (FRAME_DIMS, SelectorWindow, SelectorWindowDataset)
+from src.temporal_selector.training import (predict_windows as _predict_windows, seed_everything as _seed_everything, train_selector_fold as _train_fold, _heldout_boundary_epoch_metrics, _write_epoch_diagnostic_plot, aggregate_joint_predictions, compile_metrics, load_dataset_config, prepare_output_directory, select_device)
+from src.temporal_selector.model import (JointRallyShuttleModel)
 
 
 def chronological_window_split(

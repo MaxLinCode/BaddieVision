@@ -26,12 +26,13 @@ PYTHONPATH=. .venv/bin/python \
   -m src.temporal_selector.rally_experiment \
   --config config/selector-experiment.example.json \
   --output-dir outputs/independent-rally-camera-held-out-v1 \
-  --device mps
+  --preset benchmark
 ```
 
-The recipe is frozen in code: seed 1729, 25 epochs, batch size 16,
+The historical `--preset benchmark` recipe is preserved: seed 1729, 25 epochs, batch size 16,
 boundary-balanced sampling, start/end auxiliary weight 0.25, AdamW at `3e-4`,
-and gradient clipping at 1.0.
+and gradient clipping at 1.0. Ordinary training accepts overrides; see
+[rally training and recovery](rally-training.md).
 
 Each of camera A, camera B, and camera C is held out once. Within a fold, every
 training camera is split independently at 80% chronology. One-second guard
@@ -53,7 +54,7 @@ the pairing auditable.
 
 The clean checkpoint records its model type, feature schema/version, dataset
 and annotation fingerprints, `offline_centered` context direction, split
-manifest, frozen training recipe, chosen epoch, and decoder configuration.
+manifest, resolved training recipe, chosen epoch, and decoder configuration.
 Legacy joint checkpoint reconstruction remains unchanged.
 
 If all clean-model guardrails pass, the runner trains the production model on

@@ -6,7 +6,7 @@ import torch
 
 from src.annotation_platform.events import AnnotationEvent
 from src.temporal_selector.dataset import SelectorWindow
-from src.temporal_selector.oracle_track_experiment import (
+from experiments.temporal_selector.oracle_track_experiment import (
     corrupt_oracle_track_windows,
     oracle_track_windows,
     shuffled_coordinate_map,

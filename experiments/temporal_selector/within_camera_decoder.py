@@ -13,24 +13,13 @@ from typing import Any, Iterable, Mapping, Sequence
 
 import torch
 
-from .config import SelectorConfig
-from .crossfit import CrossFitFold
-from .dataset import SelectorWindow, SelectorWindowDataset
-from .experiment import (
-    _predict_windows,
-    aggregate_joint_predictions,
-    compile_metrics,
-    load_dataset_config,
-    prepare_output_directory,
-    select_device,
-)
-from .joint_inference import (
-    InPlayDecoderConfig,
-    decode_inplay_probabilities,
-    decoded_intervals,
-)
-from .model import JointRallyShuttleModel
-from .rally_intervals import RallyInterval
+from src.temporal_selector.config import (SelectorConfig)
+from src.temporal_selector.crossfit import (CrossFitFold)
+from src.temporal_selector.dataset import (SelectorWindow, SelectorWindowDataset)
+from src.temporal_selector.training import (predict_windows as _predict_windows, aggregate_joint_predictions, compile_metrics, load_dataset_config, prepare_output_directory, select_device)
+from src.temporal_selector.joint_inference import (InPlayDecoderConfig, decode_inplay_probabilities, decoded_intervals)
+from src.temporal_selector.model import (JointRallyShuttleModel)
+from src.temporal_selector.rally_intervals import (RallyInterval)
 from .within_camera_experiment import chronological_window_split
 
 

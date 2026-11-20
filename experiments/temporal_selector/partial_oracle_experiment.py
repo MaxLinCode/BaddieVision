@@ -16,22 +16,12 @@ import torch
 
 from src.annotation_platform.events import AnnotationEvent, replay_events
 
-from .batch import MASKED_TARGET
-from .config import SelectorConfig
-from .crossfit import CrossFitFold
-from .dataset import FRAME_DIMS, SelectorWindow, SelectorWindowDataset
-from .experiment import (
-    _binary_roc_auc,
-    _predict_windows,
-    _seed_everything,
-    _train_fold,
-    aggregate_joint_predictions,
-    compile_metrics,
-    load_dataset_config,
-    prepare_output_directory,
-    select_device,
-)
-from .model import JointRallyShuttleModel
+from src.temporal_selector.batch import (MASKED_TARGET)
+from src.temporal_selector.config import (SelectorConfig)
+from src.temporal_selector.crossfit import (CrossFitFold)
+from src.temporal_selector.dataset import (FRAME_DIMS, SelectorWindow, SelectorWindowDataset)
+from src.temporal_selector.training import (_binary_roc_auc, predict_windows as _predict_windows, seed_everything as _seed_everything, train_selector_fold as _train_fold, aggregate_joint_predictions, compile_metrics, load_dataset_config, prepare_output_directory, select_device)
+from src.temporal_selector.model import (JointRallyShuttleModel)
 from .within_camera_decoder import calibrate_validation_decoder, decode_rows
 from .within_camera_experiment import _select_threshold
 

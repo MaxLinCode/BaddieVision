@@ -13,7 +13,7 @@ from src.temporal_selector.rally_features import (
     FULL_RALLY_FEATURE_NAMES,
     RALLY_FEATURE_VIEWS,
 )
-from src.temporal_selector.shortcut_diagnostic import (
+from experiments.temporal_selector.shortcut_diagnostic import (
     ProbeSample,
     balance_probe_partition,
     chronological_probe_split,

@@ -114,6 +114,7 @@ media and inference assets belong in a verified release.
 - [Shared extraction, recovery, calibration, and annotation](docs/workflow.md)
 - [Single maintained local/Colab/Kaggle extraction notebook](notebooks/Single_Video_Feature_Extraction.ipynb)
 - [Configurable rally training and epoch recovery](docs/rally-training.md)
+- [Historical research and prototypes](docs/research.md)
 - [Annotation platform](docs/annotation-platform.md)
 - [Court-space shot features](docs/plans/court-space-player-anchor.md)
 - [Research evaluation](docs/independent-rally-segmenter.md)
