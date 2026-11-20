@@ -16,10 +16,32 @@ import uuid
 ROOT = Path(__file__).resolve().parents[1]
 SSH_OPTIONS = ['-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
                '-o', 'ClearAllForwardings=yes']
+GPU_SETTINGS = {'BV_GPU_HOST', 'BV_GPU_DIR', 'BV_GPU_TRANSPORT'}
 
 
-def uses_wsl(host):
-    return os.environ.get('BV_GPU_TRANSPORT', 'wsl' if host == 'avalanche' else 'native') == 'wsl'
+def gpu_environment():
+    env_file = ROOT / '.env'
+    if not env_file.is_file():
+        return {}
+
+    settings = {}
+    for line in env_file.read_text(encoding='utf-8').splitlines():
+        name, separator, value = line.strip().removeprefix('export ').partition('=')
+        name = name.strip()
+        if not separator or name not in GPU_SETTINGS or name in os.environ:
+            continue
+        try:
+            words = shlex.split(value, comments=True)
+        except ValueError:
+            raise RuntimeError(f'Invalid {name} in .env') from None
+        if len(words) != 1 or not words[0]:
+            raise RuntimeError(f'Set {name} to a single value in .env')
+        settings[name] = words[0]
+    return settings
+
+
+def uses_wsl():
+    return os.environ.get('BV_GPU_TRANSPORT', 'native') == 'wsl'
 
 
 def windows_python(payload):
@@ -30,7 +52,7 @@ def windows_python(payload):
 
 
 def ssh(host, command, *, windows_command=False, **kwargs):
-    if uses_wsl(host) and not windows_command:
+    if uses_wsl() and not windows_command:
         import base64
         program = "import os\nos.execl('/bin/bash','bash','-lc'," + repr(command) + ")"
         command = windows_python(base64.b64encode(program.encode()).decode())
@@ -44,7 +66,7 @@ def remote_python(host, code, *args, **kwargs):
     program = 'import sys\nsys.argv = ' + repr(['remote', *map(str, args)]) + '\n' + code
     payload = base64.b64encode(program.encode()).decode()
     bootstrap = "import base64;exec(base64.b64decode('" + payload + "'))"
-    if uses_wsl(host):
+    if uses_wsl():
         return ssh(host, windows_python(payload), windows_command=True, **kwargs)
     command = 'python3 -c ' + shlex.quote(bootstrap)
     return ssh(host, command, **kwargs)
@@ -87,9 +109,15 @@ def source_files(root):
 
 
 def snapshot(destination):
+    def strip_local_ownership(member):
+        member.uid = member.gid = 0
+        member.uname = member.gname = ''
+        return member
+
     with tarfile.open(fileobj=destination, mode='w') as archive:
         for path in sorted(set(source_files(ROOT))):
-            archive.add(path, arcname=path.relative_to(ROOT).as_posix(), recursive=False)
+            archive.add(path, arcname=path.relative_to(ROOT).as_posix(), recursive=False,
+                        filter=strip_local_ownership)
 
 
 PREPARE = r'''
@@ -172,8 +200,12 @@ for job in jobs:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--host', default=os.environ.get('BV_GPU_HOST', 'avalanche'))
-    parser.add_argument('--remote-dir', default=os.environ.get('BV_GPU_DIR', '~/code/BaddieVision'))
+    local_settings = gpu_environment()
+    host = os.environ.get('BV_GPU_HOST', local_settings.get('BV_GPU_HOST'))
+    remote_dir = os.environ.get('BV_GPU_DIR', local_settings.get('BV_GPU_DIR'))
+    parser.add_argument('--host', default=host, help='SSH destination (defaults to BV_GPU_HOST)')
+    parser.add_argument('--remote-dir', default=remote_dir,
+                        help='Remote checkout path (defaults to BV_GPU_DIR)')
     sub = parser.add_subparsers(dest='action', required=True)
     sub.add_parser('doctor')
     submit = sub.add_parser('submit')
@@ -188,6 +220,14 @@ def main():
     fetch.add_argument('--path', default='outputs', help='Directory within the job workspace')
     fetch.add_argument('--destination', type=Path)
     args = parser.parse_args()
+    if not args.host:
+        parser.error('Set BV_GPU_HOST in .env or pass --host')
+    if not args.remote_dir:
+        parser.error('Set BV_GPU_DIR in .env or pass --remote-dir')
+    transport = os.environ.get('BV_GPU_TRANSPORT', local_settings.get('BV_GPU_TRANSPORT', 'native'))
+    if transport not in {'native', 'wsl'}:
+        parser.error('BV_GPU_TRANSPORT must be native or wsl')
+    os.environ.setdefault('BV_GPU_TRANSPORT', transport)
     if getattr(args, 'job', '') and not re.fullmatch(r'[0-9]{8}T[0-9]{6}-[a-f0-9]{8}', args.job):
         parser.error('Invalid job ID')
     if args.action == 'doctor':
@@ -216,10 +256,11 @@ subprocess.run([str(base / '.venv/bin/python'), '-c',
             job_dir = result.stdout.strip()
             if not job_dir.startswith('/') or '\n' in job_dir:
                 raise RuntimeError('Remote preparation returned an invalid path: ' + repr(job_dir))
-            ssh(args.host, 'tar -xf - -C ' + shlex.quote(job_dir + '/workspace'), stdin=archive)
+            ssh(args.host, 'tar --no-same-owner -xf - -C ' + shlex.quote(job_dir + '/workspace'),
+                stdin=archive)
         remote_python(args.host, LAUNCH, args.remote_dir, job, json.dumps(command),
-                      'wsl' if uses_wsl(args.host) else 'native')
-        if uses_wsl(args.host):
+                      'wsl' if uses_wsl() else 'native')
+        if uses_wsl():
             launch_windows_job(args.host, job_dir, job)
     elif args.action == 'status':
         remote_python(args.host, INSPECT, args.remote_dir, args.job)

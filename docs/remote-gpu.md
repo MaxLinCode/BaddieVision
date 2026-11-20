@@ -6,8 +6,19 @@ through Windows Task Scheduler. Native Linux SSH hosts use a detached tmux
 session. Jobs survive a Mac disconnect. Windows sleep, shutdown, or WSL
 shutdown can interrupt them.
 
+Create a `.env` file at the root of the worktree. Git already ignores this file.
+Replace the example values with your SSH alias and remote checkout path.
+
+```dotenv
+BV_GPU_HOST=gpu-host
+BV_GPU_DIR='~/path/to/BaddieVision'
+BV_GPU_TRANSPORT=native
+```
+
+Set `BV_GPU_TRANSPORT=wsl` for Windows OpenSSH with WSL. Keep device names,
+addresses, and usernames in your local SSH configuration.
+
 ```bash
-cd .worktrees/remote-gpu
 git submodule update --init --recursive
 ./scripts/gpu doctor
 ./scripts/gpu submit -- python -m src.workflow rally predict \
@@ -25,8 +36,8 @@ must include `image_size` and belong to the source's static camera segment. A
 registered source uses its canonical `<artifact_root>/court/calibration.json`;
 `config/sources.local.json` contains only the remote video/artifact-root mapping.
 
-The defaults are SSH alias `avalanche` and `~/code/BaddieVision`. Override with
-`BV_GPU_HOST` / `BV_GPU_DIR`, or `--host` / `--remote-dir` before the subcommand.
+Exported `BV_GPU_*` settings override `.env`. Pass `--host` or `--remote-dir`
+before the subcommand to override either setting for a single command.
 The existing remote `.venv` supplies Python and installed dependencies. The
 launcher does not install or update dependencies; run `doctor` to check CUDA.
 A command is an argument list, not a shell expression; explicitly use
@@ -37,6 +48,8 @@ worktree containing the launcher, including local edits and initialized
 submodule source. Initialize TrackNet in each worktree where you use it. Its
 checked-out revision is included in the snapshot. Keep credentials, environments,
 and model files in ignored locations and pass remote data paths to the command.
+Check for private files and symlink targets in the worktree before submitting.
+Job metadata records command arguments, so keep credentials out of the command line.
 
 Jobs live under `<remote-dir>/.remote-gpu/jobs/JOB_ID/`:
 
@@ -66,11 +79,9 @@ Ctrl-C exits log following without stopping the remote job.
 
 ## SSH transport
 
-The default `avalanche` alias uses the WSL transport. Configure Windows
-OpenSSH to run noninteractive commands in cmd.exe. The launcher enters WSL
-using `wsl.exe --cd ~ --exec python3` and encoded payloads. Other SSH aliases
-default to native Linux transport. Set `BV_GPU_TRANSPORT=wsl` for another
-Windows alias, or `BV_GPU_TRANSPORT=native` for a Linux server.
+The launcher defaults to native Linux transport. For WSL transport, configure
+Windows OpenSSH to run noninteractive commands in cmd.exe. The launcher enters
+WSL using `wsl.exe --cd ~ --exec python3` and encoded payloads.
 
 WSL submissions create a `BaddieVision-JOB_ID` scheduled task under the existing
 Windows account, without a password or elevated run level. The task keeps a
@@ -78,10 +89,11 @@ foreground `wsl.exe` process attached to the job, preventing WSL idle shutdown.
 Tasks are retained for diagnostics; this is a job runner, not a recurring task.
 
 If WSL stops responding, Windows SSH can still inspect its service. Restarting
-WSL interrupts its running Linux processes.
+WSL interrupts its running Linux processes. Replace `gpu-host` with your configured
+SSH alias.
 
 ```bash
-ssh avalanche 'powershell.exe -NoProfile -Command Get-Service WslService'
-ssh avalanche 'powershell.exe -NoProfile -Command Restart-Service WslService -Force'
-ssh avalanche 'wsl.exe --exec uname -a'
+ssh gpu-host 'powershell.exe -NoProfile -Command Get-Service WslService'
+ssh gpu-host 'powershell.exe -NoProfile -Command Restart-Service WslService -Force'
+ssh gpu-host 'wsl.exe --exec uname -a'
 ```

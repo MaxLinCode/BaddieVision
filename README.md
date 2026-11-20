@@ -97,6 +97,18 @@ CUDA, MPS, and CPU are supported; `auto` selects the first available device.
 See [inference and release instructions](docs/rally-inference.md) for the complete
 command, registered-source reuse, checkpoint export, and sample preparation.
 
+## Run on a remote GPU
+
+Configure your SSH destination and remote checkout in the worktree's ignored
+`.env`. Run `./scripts/gpu doctor` to check CUDA and the remote environment.
+Submit an inference or training command with `./scripts/gpu submit --` before
+the command and use `--device cuda` where supported. The launcher sends the
+current worktree's source and runs the job on the remote machine. Place videos
+and calibrations on the remote host before submitting an unattended run.
+
+See the [remote GPU guide](docs/remote-gpu.md) for setup, job status, logs, and
+fetching outputs.
+
 ## Private data
 
 Videos, annotations, extracted features, model weights, local recording configs,

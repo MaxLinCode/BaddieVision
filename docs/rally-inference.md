@@ -18,6 +18,10 @@ missing, canceled, invalid, or mismatched calibration stops the pipeline before
 player extraction. A browser URL is printed for environments without browser
 launch support. Supply a calibration file for unattended execution.
 
+For a remote CUDA run, prefix the command with `./scripts/gpu submit --` and
+set `--device cuda`. Use video and calibration paths available on the remote
+host. See the [remote GPU guide](remote-gpu.md) for SSH setup and fetching results.
+
 Use `--source-id match-a` to name a new source. For a registered source:
 
 ```bash
