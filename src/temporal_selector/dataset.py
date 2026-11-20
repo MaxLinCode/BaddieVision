@@ -36,7 +36,10 @@ from .rally_intervals import read_rally_intervals
 
 FrameView = Literal["candidates_only", "players_court", "full_context"]
 PoseCoordinateMode = Literal["image", "player_relative"]
+SelectionPolicy = Literal["legacy", "explicit_target_shuttle"]
 FRAME_DIMS = {"candidates_only": 0, "players_court": 22, "full_context": 154}
+SUPERVISED_SELECTION_STATUSES = ("selected_retained", "null")
+RALLY_STATE_BY_TARGET = {MASKED_TARGET: "unknown", 0: "out_of_play", 1: "in_play"}
 MASKED_LABELS = {
     "missing_proposal",
     "occluded_inferable",
@@ -147,12 +150,15 @@ class SelectorDataConfig:
     expected_annotation_sha256: str | None = None
     rally_intervals_path: Path | None = None
     rally_manifest_path: Path | None = None
+    selection_policy: SelectionPolicy = "legacy"
 
     def __post_init__(self) -> None:
         if self.context_mode not in FRAME_DIMS:
             raise ValueError(f"unsupported context mode: {self.context_mode}")
         if self.pose_coordinate_mode not in POSE_REPRESENTATION_VERSION:
             raise ValueError(f"unsupported pose coordinate mode: {self.pose_coordinate_mode}")
+        if self.selection_policy not in ("legacy", "explicit_target_shuttle"):
+            raise ValueError(f"unsupported selection policy: {self.selection_policy}")
         if not math.isclose(float(self.minimum_cutoff), 0.05) or self.retention_k != 8:
             raise ValueError("this dataset version is frozen at cutoff 0.05 and K=8")
         if len({source.source_id for source in self.sources}) != len(self.sources):
@@ -266,6 +272,9 @@ class SelectorWindowDataset(Dataset[SelectorWindow]):
                 for window in self.windows
             ],
         }
+        # Preserve the identity of legacy checkpoints and dataset artifacts.
+        if config.selection_policy != "legacy":
+            identity["selection_policy"] = config.selection_policy
         fingerprint = hashlib.sha256(
             json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
@@ -285,6 +294,8 @@ class SelectorWindowDataset(Dataset[SelectorWindow]):
         ]
         self.manifest = {
             **identity,
+            "selection_policy": config.selection_policy,
+            "selection_supervision_counts": self._selection_supervision_counts(),
             "dataset_fingerprint": fingerprint,
             "window_count": len(self.windows),
             "source_window_counts": {
@@ -307,6 +318,42 @@ class SelectorWindowDataset(Dataset[SelectorWindow]):
                 "positive": inplay_targets.count(1),
             },
         }
+
+    def _selection_supervision_counts(
+        self,
+    ) -> dict[str, dict[str, dict[str, dict[str, int]]]]:
+        counts = {
+            source.source_id: {
+                rally_state: {
+                    presence: dict.fromkeys(SUPERVISED_SELECTION_STATUSES, 0)
+                    for presence in ("with_candidates", "without_candidates")
+                }
+                for rally_state in RALLY_STATE_BY_TARGET.values()
+            }
+            for source in self.config.sources
+        }
+        seen_frames: set[tuple[str, int]] = set()
+        for window in self.windows:
+            candidate_frames = set(window.candidate_frame_indices.tolist())
+            for index, (frame, status) in enumerate(
+                zip(window.frame_indices, window.target_status)
+            ):
+                if frame not in window.owned_frames or status not in SUPERVISED_SELECTION_STATUSES:
+                    continue
+                frame_key = (window.source_id, frame)
+                if frame_key in seen_frames:
+                    continue
+                seen_frames.add(frame_key)
+                inplay = (
+                    int(window.inplay_targets[index])
+                    if window.inplay_targets is not None else MASKED_TARGET
+                )
+                rally_state = RALLY_STATE_BY_TARGET[inplay]
+                presence = (
+                    "with_candidates" if index in candidate_frames else "without_candidates"
+                )
+                counts[window.source_id][rally_state][presence][status] += 1
+        return counts
 
     def __len__(self) -> int:
         return len(self.windows)
@@ -546,7 +593,7 @@ class SelectorWindowDataset(Dataset[SelectorWindow]):
                         or event.source_video_sha256 != source_video_sha256
                     ):
                         raise ValueError("annotation fingerprint mismatch")
-                    if inplay == 0:
+                    if inplay == 0 and self.config.selection_policy == "legacy":
                         status = "out_of_play"
                     elif event.label_kind == "no_in_frame_target":
                         target, status = NULL_TARGET, "null"

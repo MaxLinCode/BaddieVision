@@ -1209,6 +1209,7 @@ def load_dataset_config(
         retention_k=int(data.get("retention_k", 8)),
         pose_visibility_threshold=float(data.get("pose_visibility_threshold", 0.5)),
         pose_coordinate_mode=pose_coordinate_mode,
+        selection_policy=data.get("selection_policy", "legacy"),
         expected_annotation_sha256=data.get("expected_annotation_sha256"),
         rally_intervals_path=(
             _resolve(path, data["rally_intervals_path"])
