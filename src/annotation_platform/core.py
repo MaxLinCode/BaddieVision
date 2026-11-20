@@ -130,7 +130,7 @@ class TaskPlugin(Protocol):
 
     def image_size(self, source: SourceRegistration) -> tuple[int, int]: ...
 
-    def validate_label(
+    def build_label_payload(
         self,
         source: SourceRegistration,
         *,
@@ -138,7 +138,34 @@ class TaskPlugin(Protocol):
         label_kind: str,
         candidate_id: str | None,
         candidate_artifact_sha256: str,
-    ) -> None: ...
+        canonical_position: Mapping[str, Any] | None,
+        review_action_override: str | None,
+    ) -> Mapping[str, Any]:
+        """Validate the label and build task-owned event fields.
+
+        Return ``candidate_position`` when the task records a coordinate
+        snapshot. Tasks without position labels return an empty mapping.
+        """
+        ...
+
+    def resolve_candidate_position(
+        self,
+        source: SourceRegistration,
+        *,
+        frame: int,
+        candidate_id: str | None,
+        candidate_artifact_sha256: str,
+    ) -> Mapping[str, Any] | None:
+        """Resolve historical positions, or return None for non-position tasks."""
+        ...
+
+    def representative_candidate_id(
+        self, source: SourceRegistration, frame: int, candidate_id: str
+    ) -> str: ...
+
+    def annotator_overlays(
+        self, source: SourceRegistration, frame: int
+    ) -> Sequence[Mapping[str, Any]]: ...
 
     def overlays(self, source: SourceRegistration, frame: int) -> Sequence[Mapping[str, Any]]: ...
 
