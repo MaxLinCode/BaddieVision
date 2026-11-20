@@ -7,10 +7,11 @@ Git-ignored `.annotation/` directory. Candidate artifacts may use
 exact candidate-artifact and source-video fingerprints registered at startup.
 
 Task implementations follow the explicit `TaskPlugin` contract in
-`src/annotation_platform/core.py`. `validate_label` verifies task semantics and
-artifact identity; `build_label_payload` constructs the allowed event fields.
-The shuttle plugin owns selected-candidate coordinate snapshots and the clicked
-position requirement for missing proposals. Tasks without position labels return
+`src/annotation_platform/core.py`. `build_label_payload` validates a label and
+returns its task-specific event fields. The shuttle plugin verifies the candidate
+file once per save and uses the verified candidate for the coordinate snapshot.
+It also requires a clicked position for new missing-proposal labels.
+Tasks without position labels return
 an empty payload. Candidate representatives, annotator overlays, suggestions,
 and historical position resolution are declared methods; the core continues to
 own revision history, durable sessions, and stale-action checks.

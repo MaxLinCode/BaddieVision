@@ -323,13 +323,6 @@ class EventStore:
         from .views import validate_source_video
 
         validate_source_video(source)
-        plugin.validate_label(
-            source,
-            frame=int(frame),
-            label_kind=label_kind,
-            candidate_id=candidate_id,
-            candidate_artifact_sha256=candidate_artifact_sha256,
-        )
         payload = plugin.build_label_payload(
             source,
             frame=int(frame),

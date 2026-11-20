@@ -130,16 +130,6 @@ class TaskPlugin(Protocol):
 
     def image_size(self, source: SourceRegistration) -> tuple[int, int]: ...
 
-    def validate_label(
-        self,
-        source: SourceRegistration,
-        *,
-        frame: int,
-        label_kind: str,
-        candidate_id: str | None,
-        candidate_artifact_sha256: str,
-    ) -> None: ...
-
     def build_label_payload(
         self,
         source: SourceRegistration,
@@ -151,7 +141,7 @@ class TaskPlugin(Protocol):
         canonical_position: Mapping[str, Any] | None,
         review_action_override: str | None,
     ) -> Mapping[str, Any]:
-        """Build task-owned event fields after validate_label succeeds.
+        """Validate the label and build task-owned event fields.
 
         Return ``candidate_position`` when the task records a coordinate
         snapshot. Tasks without position labels return an empty mapping.

@@ -325,7 +325,7 @@ class ShuttleSelectionPlugin:
     def verify_artifact_fingerprint(self, source: SourceRegistration) -> str:
         return self._artifact(source, verify_fingerprint=True).sha256
 
-    def validate_label(
+    def _validate_label(
         self,
         source: SourceRegistration,
         *,
@@ -333,7 +333,7 @@ class ShuttleSelectionPlugin:
         label_kind: str,
         candidate_id: str | None,
         candidate_artifact_sha256: str,
-    ) -> None:
+    ) -> Mapping[str, Any] | None:
         artifact = self._artifact(source, verify_fingerprint=True)
         if not 0 <= int(frame) < source.frame_count:
             raise ValueError(f"frame outside source bounds: {frame}")
@@ -353,12 +353,15 @@ class ShuttleSelectionPlugin:
             resolved = artifact.candidates.get(candidate_id)
             if resolved is None:
                 raise ValueError(f"candidate ID cannot be resolved: {candidate_id}")
-            if resolved[0] != int(frame):
+            candidate_frame, candidate = resolved
+            if candidate_frame != int(frame):
                 raise ValueError(
-                    f"candidate {candidate_id!r} belongs to frame {resolved[0]}, not {frame}"
+                    f"candidate {candidate_id!r} belongs to frame {candidate_frame}, not {frame}"
                 )
-        elif candidate_id is not None:
+            return candidate
+        if candidate_id is not None:
             raise ValueError(f"{label_kind} labels cannot carry a candidate ID")
+        return None
 
     def build_label_payload(
         self,
@@ -371,17 +374,19 @@ class ShuttleSelectionPlugin:
         canonical_position: Mapping[str, Any] | None,
         review_action_override: str | None,
     ) -> Mapping[str, Any]:
-        """Own shuttle selection snapshots and missing-proposal requirements."""
+        """Validate the label and snapshot the verified selection or human click."""
+        candidate = self._validate_label(
+            source,
+            frame=frame,
+            label_kind=label_kind,
+            candidate_id=candidate_id,
+            candidate_artifact_sha256=candidate_artifact_sha256,
+        )
         if canonical_position is not None and label_kind not in {"selected", "missing_proposal"}:
             raise ValueError("only visible-target labels may carry candidate_position")
         position = canonical_position
-        if label_kind == "selected":
-            position = self.resolve_candidate_position(
-                source,
-                frame=frame,
-                candidate_id=candidate_id,
-                candidate_artifact_sha256=candidate_artifact_sha256,
-            )
+        if candidate is not None:
+            position = self._candidate_position(source, candidate)
         elif (
             label_kind == "missing_proposal"
             and position is None
@@ -399,17 +404,21 @@ class ShuttleSelectionPlugin:
         frame: int,
         candidate_id: str | None,
         candidate_artifact_sha256: str,
-    ) -> Mapping[str, object]:
-        """Snapshot normalized coordinates from the fingerprint-verified artifact."""
-        self.validate_label(
+    ) -> Mapping[str, object] | None:
+        """Resolve a historical selection against its original candidate artifact."""
+        candidate = self._validate_label(
             source,
             frame=frame,
             label_kind="selected",
             candidate_id=candidate_id,
             candidate_artifact_sha256=candidate_artifact_sha256,
         )
-        artifact = self._artifact(source, verify_fingerprint=True)
-        candidate = artifact.candidates[str(candidate_id)][1]
+        return self._candidate_position(source, candidate) if candidate is not None else None
+
+    @staticmethod
+    def _candidate_position(
+        source: SourceRegistration, candidate: Mapping[str, Any]
+    ) -> Mapping[str, object]:
         image_width, image_height = source.image_size
 
         def normalized(normalized_field: str, pixel_field: str) -> object:

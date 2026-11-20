@@ -157,11 +157,9 @@ class DummyPlugin:
     def image_size(self, source):
         return source.image_size
 
-    def validate_label(self, source, **payload):
+    def build_label_payload(self, source, **payload):
         if payload["label_kind"] not in {"yes", "undo"}:
             raise ValueError("bad dummy label")
-
-    def build_label_payload(self, source, **payload):
         return {}
 
     def resolve_candidate_position(self, source, **payload):
@@ -304,11 +302,23 @@ def test_v1_missing_records_are_ineligible_not_implicit_empty_frames(tmp_path: P
     assert ("legacy", 2) not in audit.frame_keys()
 
 
-def test_select_correction_undo_replay_and_restart(tmp_path: Path) -> None:
-    registry, plugin, _, _ = _registry(tmp_path)
+def test_select_correction_undo_replay_and_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.annotation_platform import shuttle
+
+    registry, plugin, _, candidates = _registry(tmp_path)
     source = registry.sources["match"]
     fingerprint = plugin.artifact_sha256(source)
     store = EventStore(tmp_path / "events.jsonl", registry)
+    hash_file = shuttle.file_sha256
+    fingerprinted_paths = []
+
+    def count_fingerprint(path):
+        fingerprinted_paths.append(path)
+        return hash_file(path)
+
+    monkeypatch.setattr(shuttle, "file_sha256", count_fingerprint)
     first = store.record(
         task="shuttle_selection",
         source_id="match",
@@ -319,6 +329,7 @@ def test_select_correction_undo_replay_and_restart(tmp_path: Path) -> None:
         annotator="alice",
         session_id="session",
     )
+    assert fingerprinted_paths == [candidates.resolve()]
     correction = store.record(
         task="shuttle_selection",
         source_id="match",
@@ -329,6 +340,7 @@ def test_select_correction_undo_replay_and_restart(tmp_path: Path) -> None:
         annotator="alice",
         session_id="session",
     )
+    assert fingerprinted_paths == [candidates.resolve()] * 2
     undo = store.undo_last(annotator="alice", session_id="session")
 
     assert correction.superseded_revision == first.revision_id
@@ -1291,9 +1303,10 @@ def test_missing_proposal_callback_records_clicked_position(tmp_path: Path) -> N
 
 def test_label_payload_requirements_are_owned_by_each_task(tmp_path: Path) -> None:
     class NonShuttlePlugin(DummyPlugin):
-        def validate_label(self, source, **payload):
+        def build_label_payload(self, source, **payload):
             if payload["label_kind"] != "missing_proposal":
                 raise ValueError("bad task label")
+            return {}
 
     video = tmp_path / "dummy.mp4"
     video.write_bytes(b"dummy")
