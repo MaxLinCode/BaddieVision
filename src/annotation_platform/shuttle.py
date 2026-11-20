@@ -360,6 +360,38 @@ class ShuttleSelectionPlugin:
         elif candidate_id is not None:
             raise ValueError(f"{label_kind} labels cannot carry a candidate ID")
 
+    def build_label_payload(
+        self,
+        source: SourceRegistration,
+        *,
+        frame: int,
+        label_kind: str,
+        candidate_id: str | None,
+        candidate_artifact_sha256: str,
+        canonical_position: Mapping[str, Any] | None,
+        review_action_override: str | None,
+    ) -> Mapping[str, Any]:
+        """Own shuttle selection snapshots and missing-proposal requirements."""
+        if canonical_position is not None and label_kind not in {"selected", "missing_proposal"}:
+            raise ValueError("only visible-target labels may carry candidate_position")
+        position = canonical_position
+        if label_kind == "selected":
+            position = self.resolve_candidate_position(
+                source,
+                frame=frame,
+                candidate_id=candidate_id,
+                candidate_artifact_sha256=candidate_artifact_sha256,
+            )
+        elif (
+            label_kind == "missing_proposal"
+            and position is None
+            and review_action_override not in {"migrated", "derived"}
+        ):
+            raise ValueError(
+                "new missing_proposal labels require a clicked canonical position"
+            )
+        return {"candidate_position": position}
+
     def resolve_candidate_position(
         self,
         source: SourceRegistration,

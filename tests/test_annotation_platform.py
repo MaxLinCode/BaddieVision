@@ -161,6 +161,21 @@ class DummyPlugin:
         if payload["label_kind"] not in {"yes", "undo"}:
             raise ValueError("bad dummy label")
 
+    def build_label_payload(self, source, **payload):
+        return {}
+
+    def resolve_candidate_position(self, source, **payload):
+        return None
+
+    def representative_candidate_id(self, source, frame, candidate_id):
+        return candidate_id
+
+    def annotator_overlays(self, source, frame):
+        return self.overlays(source, frame)
+
+    def suggestion(self, source, frame):
+        return None
+
     def overlays(self, source, frame):
         return ()
 
@@ -1272,3 +1287,45 @@ def test_missing_proposal_callback_records_clicked_position(tmp_path: Path) -> N
     assert event.label_kind == "missing_proposal"
     assert event.candidate_position["peak_position_normalized"] == [0.25, 0.75]
     assert "missing_proposal" in status
+
+
+def test_label_payload_requirements_are_owned_by_each_task(tmp_path: Path) -> None:
+    class NonShuttlePlugin(DummyPlugin):
+        def validate_label(self, source, **payload):
+            if payload["label_kind"] != "missing_proposal":
+                raise ValueError("bad task label")
+
+    video = tmp_path / "dummy.mp4"
+    video.write_bytes(b"dummy")
+    registry = AnnotationRegistry()
+    registry.register_source("s", video, fps=2, frame_count=8, image_size=(16, 12))
+    registry.register_task(NonShuttlePlugin())
+    store = EventStore(tmp_path / "events.jsonl", registry)
+    event = store.record(
+        task="dummy",
+        source_id="s",
+        frame=0,
+        label_kind="missing_proposal",
+        candidate_artifact_sha256="d" * 64,
+        annotator="alice",
+        session_id="session",
+    )
+    assert event.candidate_position is None
+    assert store.replay().active[event.key] == event
+
+
+def test_shuttle_payload_rejects_position_on_nonvisible_label(tmp_path: Path) -> None:
+    registry, plugin, _, _ = _registry(tmp_path)
+    store = EventStore(tmp_path / "events.jsonl", registry)
+    with pytest.raises(ValueError, match="only visible-target"):
+        store.record(
+            task="shuttle_selection",
+            source_id="match",
+            frame=0,
+            label_kind="unsure",
+            candidate_artifact_sha256=plugin.artifact_sha256(registry.sources["match"]),
+            annotator="alice",
+            session_id="session",
+            canonical_position={"coordinate_space": "normalized_image_xy"},
+        )
+    assert not store.path.exists()

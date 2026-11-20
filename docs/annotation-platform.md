@@ -6,6 +6,15 @@ Git-ignored `.annotation/` directory. Candidate artifacts may use
 `shuttle_candidates` schema v1 or v2; every label and queue is bound to the
 exact candidate-artifact and source-video fingerprints registered at startup.
 
+Task implementations follow the explicit `TaskPlugin` contract in
+`src/annotation_platform/core.py`. `validate_label` verifies task semantics and
+artifact identity; `build_label_payload` constructs the allowed event fields.
+The shuttle plugin owns selected-candidate coordinate snapshots and the clicked
+position requirement for missing proposals. Tasks without position labels return
+an empty payload. Candidate representatives, annotator overlays, suggestions,
+and historical position resolution are declared methods; the core continues to
+own revision history, durable sessions, and stale-action checks.
+
 Create a local JSON source catalog. Paths are resolved relative to the catalog:
 
 ```json

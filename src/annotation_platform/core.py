@@ -140,6 +140,43 @@ class TaskPlugin(Protocol):
         candidate_artifact_sha256: str,
     ) -> None: ...
 
+    def build_label_payload(
+        self,
+        source: SourceRegistration,
+        *,
+        frame: int,
+        label_kind: str,
+        candidate_id: str | None,
+        candidate_artifact_sha256: str,
+        canonical_position: Mapping[str, Any] | None,
+        review_action_override: str | None,
+    ) -> Mapping[str, Any]:
+        """Build task-owned event fields after validate_label succeeds.
+
+        Return ``candidate_position`` when the task records a coordinate
+        snapshot. Tasks without position labels return an empty mapping.
+        """
+        ...
+
+    def resolve_candidate_position(
+        self,
+        source: SourceRegistration,
+        *,
+        frame: int,
+        candidate_id: str | None,
+        candidate_artifact_sha256: str,
+    ) -> Mapping[str, Any] | None:
+        """Resolve historical positions, or return None for non-position tasks."""
+        ...
+
+    def representative_candidate_id(
+        self, source: SourceRegistration, frame: int, candidate_id: str
+    ) -> str: ...
+
+    def annotator_overlays(
+        self, source: SourceRegistration, frame: int
+    ) -> Sequence[Mapping[str, Any]]: ...
+
     def overlays(self, source: SourceRegistration, frame: int) -> Sequence[Mapping[str, Any]]: ...
 
     def queue_score(self, source: SourceRegistration, frame: int) -> float: ...
