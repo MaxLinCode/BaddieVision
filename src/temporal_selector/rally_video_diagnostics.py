@@ -46,12 +46,29 @@ def _load_jsonl(path: Path) -> list[dict[str, Any]]:
     ]
 
 
-def _load_diagnostics(
-    path: Path, rally_numbers: Sequence[int]
+def load_rally_diagnostics(
+    path: Path,
+    rally_numbers: Sequence[int],
+    source_id: str | None = None,
+    rally_ids: Sequence[str] | None = None,
 ) -> list[dict[str, str]]:
-    wanted = set(rally_numbers)
     with path.open(newline="", encoding="utf-8") as handle:
-        rows = list(csv.DictReader(handle))
+        rows = [
+            row for row in csv.DictReader(handle)
+            if source_id is None or row["source_id"] == source_id
+        ]
+    if rally_ids is not None:
+        selected = []
+        for rally_id in rally_ids:
+            matches = [row for row in rows if row["rally_id"] == rally_id]
+            if len(matches) != 1:
+                raise ValueError(f"expected one diagnostic row for {source_id}/{rally_id}")
+            if Path(rally_id).name != rally_id or rally_id in {"", ".", ".."}:
+                raise ValueError(f"invalid rally ID for video filename: {rally_id!r}")
+            selected.append(matches[0])
+        return selected
+
+    wanted = set(rally_numbers)
     selected = [
         row
         for row in rows
@@ -231,6 +248,8 @@ def render_rally_videos(
     rally_numbers: Sequence[int] = DEFAULT_RALLY_NUMBERS,
     context_frames: int = 30,
     counterfactual_predictions_path: Path | None = None,
+    source_id: str | None = None,
+    rally_ids: Sequence[str] | None = None,
 ) -> list[Path]:
     """Render one source-local diagnostic video per requested rally."""
     rows = _load_jsonl(predictions_path)
@@ -241,7 +260,7 @@ def render_rally_videos(
         }
         if counterfactual_predictions_path is not None else None
     )
-    diagnostics = _load_diagnostics(diagnostics_path, rally_numbers)
+    diagnostics = load_rally_diagnostics(diagnostics_path, rally_numbers, source_id, rally_ids)
     videos = _source_videos(config_path)
     decoder_configs = {json.dumps(row["decoder_config"], sort_keys=True) for row in rows}
     if len(decoder_configs) != 1:

@@ -1,5 +1,21 @@
 # Repository guidance
 
+## Diagnostics
+
+- Treat model, training, feature extraction, inference, and pre-labeling code as
+  read-only during diagnostic work. This includes `src/annotation_platform/`,
+  `src/workflow/`, and the model and pipeline modules under `InPlay/` and `src/`.
+- Start with `git ls-files` or `git grep` scoped to relevant code and docs.
+  Never recursively scan runs, outputs, videos, clips, features, checkpoints,
+  annotation stores, `.local-data/`, or worktrees. Pass only explicitly selected
+  input files to the diagnostic CLI.
+- Run `python -m src.diagnostics` and read its `report.md`. Open linked visual
+  artifacts only when needed. Keep raw logs, frame rows, and datasets out of
+  agent context.
+- Extend this entrypoint and reuse existing evaluation and rendering helpers.
+  Avoid standalone scripts, notebooks, new dependencies, and unrelated changes
+  for diagnostic requests. See `docs/diagnostics.md` for usage.
+
 ## Shot-classifier features
 
 The per-frame shot-classifier schema is ordered as:
