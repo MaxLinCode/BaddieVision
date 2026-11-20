@@ -6,6 +6,9 @@ not interchangeable components of the maintained pipeline. Their data/model
 paths and experiment choices remain fixed. Invoke them from the repository root
 with `python -m archive.prototypes.<module>` after supplying the original assets.
 
+The [historical Colab setup notebook](notebooks/BaddieVision_Colab.ipynb)
+reproduces the original package-based workflows.
+
 Obsolete command wrappers have been removed. Import the historical LSTM model
 from `archive.prototypes.inplay_train_lstm_model`; this does not load training
 arrays, and best-model weights are copied when selected.
