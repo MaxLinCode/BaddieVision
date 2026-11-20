@@ -24,6 +24,12 @@ with `--resume` to restore the latest committed epoch. Completed training loops
 load their state without repeating optimization; fold evaluation and export
 can run again. An interrupted epoch repeats from its beginning.
 
+Fold IDs use sorted camera names. Reordering the keys in `camera_sources`
+leaves the fold IDs unchanged. Changing which sources belong to a camera or
+reordering its source list changes the split and requires a new run. Resolved
+configs from the earlier draft (version 1) lack the original fold order and
+cannot be resumed with this version.
+
 Recovery files contain the latest model and optimizer states, epoch, sampler
 position, Python/NumPy/Torch/device RNG states, epoch metrics, and a separate
 copy of the best validation model. They validate configuration, ordered window

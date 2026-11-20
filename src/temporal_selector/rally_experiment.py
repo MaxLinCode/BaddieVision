@@ -614,15 +614,19 @@ def _prepare_rally_run(
     camera_sources: Mapping[str, Sequence[str]],
     *,
     resume: bool,
-) -> Path:
+) -> tuple[Path, dict[str, list[str]]]:
     path = Path(path).expanduser().resolve()
+    # Camera keys are labels. Source lists retain their chronological order.
+    ordered_camera_sources = {
+        camera: list(camera_sources[camera]) for camera in sorted(camera_sources)
+    }
     configuration = {
         "schema": "resolved_rally_training",
-        "version": 1,
+        "version": 2,
         "training_recipe": asdict(recipe),
         "dataset_fingerprint": dataset.manifest["dataset_fingerprint"],
         "annotation_fingerprint": dataset.annotation_fingerprint,
-        "camera_sources": {key: list(value) for key, value in camera_sources.items()},
+        "camera_sources": ordered_camera_sources,
     }
     configuration_path = path / "resolved-config.json"
     if resume:
@@ -630,12 +634,18 @@ def _prepare_rally_run(
             raise ValueError(
                 "resume requires an existing run with resolved-config.json"
             )
-        if json.loads(configuration_path.read_text()) != configuration:
+        previous = json.loads(configuration_path.read_text())
+        if previous.get("version") == 1:
+            raise ValueError(
+                "resume cannot verify the original camera order from a version 1 run; "
+                "start a new run in a different output directory"
+            )
+        if previous != configuration:
             raise ValueError("resume configuration or dataset identity has changed")
     else:
         path = prepare_output_directory(path)
         _write_json(configuration_path, configuration)
-    return path
+    return path, ordered_camera_sources
 
 
 def run_independent_rally_experiment(
@@ -651,7 +661,9 @@ def run_independent_rally_experiment(
     recipe = recipe or RallyTrainingRecipe()
     device = device or torch.device(recipe.device)
     recipe = replace(recipe, device=device.type)
-    output_dir = _prepare_rally_run(output_dir, rally_dataset, recipe, camera_sources, resume=False)
+    output_dir, camera_sources = _prepare_rally_run(
+        output_dir, rally_dataset, recipe, camera_sources, resume=False
+    )
     _seed_everything(recipe.seed)
     folds = camera_held_out_folds(camera_sources)
     clean_camera_metrics: dict[str, Any] = {}
@@ -976,7 +988,9 @@ def run_clean_rally_experiment(
     recipe = recipe or RallyTrainingRecipe()
     device = device or torch.device(recipe.device)
     recipe = replace(recipe, device=device.type)
-    output_dir = _prepare_rally_run(output_dir, rally_dataset, recipe, camera_sources, resume=resume)
+    output_dir, camera_sources = _prepare_rally_run(
+        output_dir, rally_dataset, recipe, camera_sources, resume=resume
+    )
     _seed_everything(recipe.seed)
     camera_metrics: dict[str, Any] = {}
     test_rows: list[dict[str, Any]] = []
@@ -1133,7 +1147,9 @@ def run_candidate_inclusive_rally_experiment(
     recipe = recipe or RallyTrainingRecipe()
     device = device or torch.device(recipe.device)
     recipe = replace(recipe, device=device.type)
-    output_dir = _prepare_rally_run(output_dir, rally_dataset, recipe, camera_sources, resume=False)
+    output_dir, camera_sources = _prepare_rally_run(
+        output_dir, rally_dataset, recipe, camera_sources, resume=False
+    )
     _seed_everything(recipe.seed)
     camera_metrics: dict[str, Any] = {}
     fold_artifacts = []
