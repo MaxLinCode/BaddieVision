@@ -45,8 +45,9 @@ For an image/video that is not registered:
 python3 -m src.calibrate_court VIDEO OUTPUT.json --mode auto --review --open-browser
 ```
 
-The standalone command records the input hash and sample indices; source artifact
-registration is provided by the maintained workflow command above.
+The standalone command records the input hash and sample indices. Use
+`stage import-calibration` to register a reviewed result for the source.
+Automatic imports require completed review and a matching video fingerprint.
 
 ## Diagnostics and unattended runs
 

@@ -133,6 +133,34 @@ def import_artifact(
     return destination
 
 
+def _validate_automatic_calibration(
+    value: Mapping[str, Any], identity: SourceIdentity
+) -> Mapping[str, Any] | None:
+    if "automatic_calibration" not in value:
+        return None
+    automatic = value["automatic_calibration"]
+    if not isinstance(automatic, Mapping):
+        raise ValueError("automatic calibration metadata must be an object")
+    indices = automatic.get("frame_indices")
+    if not isinstance(indices, list) or not indices or any(
+        type(index) is not int or not 0 <= index < identity.frame_count
+        for index in indices
+    ):
+        raise ValueError(
+            "automatic calibration frames lie outside the source-local frame domain"
+        )
+    if automatic.get("source_sha256") != identity.video_sha256:
+        raise ValueError(
+            "automatic calibration source fingerprint differs from source identity"
+        )
+    if (
+        automatic.get("status") != "accepted"
+        or automatic.get("review_status") != "manually_reviewed"
+    ):
+        raise ValueError("automatic calibration requires review before publication")
+    return automatic
+
+
 def import_calibration(
     source: SourceEntry,
     external_path: str | Path,
@@ -154,6 +182,7 @@ def import_calibration(
         raise FileExistsError(
             f"canonical calibration already exists: {source.calibration_path}"
         )
+    _validate_automatic_calibration(value, identity)
     # Metadata is embedded in the calibration so downstream consumers have one
     # file and one authority.  The legacy path is informational only.
     value["artifact_metadata"] = {
@@ -181,17 +210,7 @@ def register_native_calibration(
         raise ValueError("calibration image_size does not match source identity")
     if not 0 <= int(source_frame) < identity.frame_count:
         raise ValueError("calibration frame lies outside the source-local frame domain")
-    automatic = value.get("automatic_calibration")
-    if automatic is not None:
-        indices = automatic.get("frame_indices", [])
-        if not indices or any(
-            type(index) is not int or not 0 <= index < identity.frame_count for index in indices
-        ):
-            raise ValueError("automatic calibration frames lie outside the source-local frame domain")
-        if automatic.get("source_sha256") != identity.video_sha256:
-            raise ValueError("automatic calibration source fingerprint differs from source identity")
-        if automatic.get("status") != "accepted" or automatic.get("review_status") != "manually_reviewed":
-            raise ValueError("automatic calibration requires review before publication")
+    automatic = _validate_automatic_calibration(value, identity)
     value["artifact_metadata"] = {
         "schema": "baddievision_court_calibration_artifact",
         "schema_version": 1,
@@ -202,7 +221,7 @@ def register_native_calibration(
         "producer": "src.calibrate_court",
     }
     if automatic is not None:
-        value["artifact_metadata"]["source_frames"] = indices
+        value["artifact_metadata"]["source_frames"] = automatic["frame_indices"]
         value["artifact_metadata"]["method"] = automatic["method"]
     return atomic_write_json(source.calibration_path, value)
 
@@ -223,4 +242,5 @@ def calibration_fingerprint(source: SourceEntry) -> str:
         raise ValueError("calibration was produced for a different source identity")
     if value.get("image_size") != [identity.width, identity.height]:
         raise ValueError("calibration image_size does not match source identity")
+    _validate_automatic_calibration(value, identity)
     return canonical_json_sha256(value)

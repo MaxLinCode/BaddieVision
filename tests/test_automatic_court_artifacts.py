@@ -6,7 +6,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from src.workflow.artifacts import calibration_fingerprint, register_native_calibration
+from src.workflow.artifacts import (
+    calibration_fingerprint,
+    import_calibration,
+    register_native_calibration,
+)
 from src.workflow.identity import ParentVideoProvenance, SourceIdentity
 from src.workflow.registry import SourceEntry
 
@@ -16,6 +20,7 @@ class AutomaticCalibrationArtifactTests(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         root = Path(self.directory.name)
+        self.external = root / "external.json"
         self.source = SourceEntry("source", root / "video.mp4", root / "artifacts")
         self.identity = SourceIdentity(
             "source", "a" * 64, 100, 640, 480, 30, 1,
@@ -65,6 +70,56 @@ class AutomaticCalibrationArtifactTests(unittest.TestCase):
         data = json.loads(self.source.calibration_path.read_text())
         self.assertNotIn("source_frames", data["artifact_metadata"])
         self.assertTrue(calibration_fingerprint(self.source))
+
+    def test_reviewed_automatic_calibration_can_be_imported_for_its_source(self):
+        self.external.write_text(json.dumps(self.value))
+        result = import_calibration(self.source, self.external)
+        self.assertEqual(result, self.source.calibration_path)
+        data = json.loads(result.read_text())
+        self.assertEqual(
+            data["automatic_calibration"], self.value["automatic_calibration"]
+        )
+        self.assertEqual(
+            data["artifact_metadata"]["source_identity_sha256"], self.identity.fingerprint
+        )
+        self.assertTrue(calibration_fingerprint(self.source))
+
+    def test_invalid_automatic_import_cannot_replace_a_canonical_calibration(self):
+        register_native_calibration(
+            self.source, source_frame=50, calibration_data=self.value
+        )
+        existing = self.source.calibration_path.read_bytes()
+        cases = [
+            ({"source_sha256": "b" * 64}, "source fingerprint"),
+            ({"status": "needs_review"}, "requires review"),
+            ({"review_status": "unreviewed"}, "requires review"),
+            ({"frame_indices": [0, 100]}, "source-local frame domain"),
+        ]
+        for mutation, error in cases:
+            with self.subTest(mutation=mutation):
+                value = copy.deepcopy(self.value)
+                value["automatic_calibration"].update(mutation)
+                self.external.write_text(json.dumps(value))
+                with self.assertRaisesRegex(ValueError, error):
+                    import_calibration(self.source, self.external, force=True)
+                self.assertEqual(self.source.calibration_path.read_bytes(), existing)
+
+    def test_fingerprint_rejects_previously_published_invalid_calibration(self):
+        path = register_native_calibration(
+            self.source, source_frame=50, calibration_data=self.value
+        )
+        published = json.loads(path.read_text())
+        cases = [
+            ({"source_sha256": "b" * 64}, "source fingerprint"),
+            ({"review_status": "unreviewed"}, "requires review"),
+        ]
+        for mutation, error in cases:
+            with self.subTest(mutation=mutation):
+                value = copy.deepcopy(published)
+                value["automatic_calibration"].update(mutation)
+                path.write_text(json.dumps(value))
+                with self.assertRaisesRegex(ValueError, error):
+                    calibration_fingerprint(self.source)
 
     def test_geometry_and_representative_frame_must_match_identity(self):
         for size, index in [([320, 240], 0), ([640, 480], 100), ([640, 480], -1)]:
