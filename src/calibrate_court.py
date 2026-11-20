@@ -130,10 +130,10 @@ def _valid_point(point) -> bool:
     )
 
 
-def _validate_lines(lines, expected_names: list[str]) -> bool:
+def _validate_lines(lines, expected_names: list[str], *, optional: bool = False) -> bool:
     return (
         isinstance(lines, dict)
-        and set(lines) == set(expected_names)
+        and (set(lines) <= set(expected_names) if optional else set(lines) == set(expected_names))
         and all(
             isinstance(endpoints, list)
             and len(endpoints) == 2
@@ -151,6 +151,9 @@ def collect_browser_selection(
     landmark_names: list[str],
     line_names: list[str],
     open_browser: bool = False,
+    initial_lines: dict | None = None,
+    background=None,
+    review: bool = False,
 ):
     """Collect point or line calibration data in a browser."""
 
@@ -163,6 +166,11 @@ def collect_browser_selection(
         "lineNames": line_names,
         "totalFrames": total_frames,
         "initialFrame": initial_frame_index,
+        "initialLines": initial_lines or {},
+        "optionalLines": review,
+        "review": review,
+        "hasBackground": background is not None,
+        "lineAxes": {name: value[0] for name, value in COURT_CALIBRATION_LINES.items()},
     }
     template_path = Path(__file__).with_name("calibration_ui.html")
     page = template_path.read_text(encoding="utf-8").replace(
@@ -194,6 +202,13 @@ def collect_browser_selection(
             if parsed.path == "/":
                 self._send(page_bytes, "text/html; charset=utf-8")
                 return
+            if parsed.path == "/background.jpg" and background is not None:
+                ok, encoded = cv2.imencode(".jpg", background)
+                if not ok:
+                    self.send_error(500, "could not encode background")
+                    return
+                self._send(encoded.tobytes(), "image/jpeg")
+                return
             if parsed.path != "/frame.jpg":
                 self.send_error(404)
                 return
@@ -215,7 +230,7 @@ def collect_browser_selection(
             if self.path == "/preview":
                 submitted = self._read_json()
                 lines = submitted.get("lines")
-                if not _validate_lines(lines, line_names):
+                if not _validate_lines(lines, line_names, optional=review):
                     self._send_json({"error": "invalid court lines"}, 400)
                     return
                 try:
@@ -245,8 +260,11 @@ def collect_browser_selection(
 
             if mode == "lines":
                 selection = submitted.get("lines")
-                if not _validate_lines(selection, line_names):
+                if not _validate_lines(selection, line_names, optional=review):
                     self._send_json({"error": "invalid court lines"}, 400)
+                    return
+                if review and submitted.get("orientation_confirmed") is not True:
+                    self._send_json({"error": "confirm court orientation before saving"}, 400)
                     return
                 try:
                     CourtHomography.from_lines(selection)
@@ -295,7 +313,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--frame", type=int, default=0, help="initial video frame")
     parser.add_argument(
         "--mode",
-        choices=("lines", "points"),
+        choices=("lines", "points", "auto"),
         default="lines",
         help="line mode supports off-screen court corners (default: lines)",
     )
@@ -325,11 +343,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="line-mode guides (at least two sidelines and two cross-court lines)",
     )
     parser.add_argument("--preview", type=Path, help="optional overlay image output")
+    parser.add_argument("--samples", type=int, default=31, help="distributed background samples")
+    parser.add_argument("--max-dimension", type=int, default=960, help="automatic working image size")
+    parser.add_argument("--max-hypotheses", type=int, default=65536, help="total bounded automatic court-template search")
+    parser.add_argument("--court-region", type=Path, help="JSON target-court polygon in original pixels")
+    parser.add_argument("--review", action="store_true", help="review/correct automatic candidates in browser")
+    parser.add_argument("--diagnostics", type=Path, help="automatic diagnostic directory")
+    parser.add_argument("--force", action="store_true", help="replace an existing calibration")
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.mode == "auto":
+        from src.automatic_court import calibrate_automatically
+
+        return calibrate_automatically(args)
     if args.mode == "points" and len(args.landmarks) < 4:
         raise ValueError("point mode requires at least four landmarks")
     if args.mode == "lines":
@@ -396,4 +425,10 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    main()
+    from src.automatic_court import CalibrationNeedsReview
+
+    try:
+        main()
+    except CalibrationNeedsReview as error:
+        print(str(error), file=sys.stderr)
+        raise SystemExit(2) from None
