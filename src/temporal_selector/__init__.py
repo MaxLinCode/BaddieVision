@@ -1,91 +1,84 @@
-"""Configurable temporal shuttle proposal selector."""
+"""Temporal selector and rally APIs, loaded only when requested.
 
-from .batch import MASKED_TARGET, NULL_TARGET, SelectorBatch
-from .config import ContextMode, SelectorConfig
-from .model import (
-    CandidateSelectionHead,
-    EncodedSelectorBatch,
-    InPlayHead,
-    JointLosses,
-    JointRallyShuttleModel,
-    NullSelectionHead,
-    SelectorOutput,
-    TemporalShuttleEncoder,
-    TemporalShuttleSelector,
-)
-from .dataset import (
-    FRAME_DIMS,
-    SelectorDataConfig,
-    SelectorSourceConfig,
-    SelectorWindow,
-    SelectorWindowDataset,
-    collate_selector_windows,
-)
-from .crossfit import (
-    CrossFitFold,
-    CrossFitManifest,
-    build_leave_one_group_out,
-    build_leave_one_source_out,
-    build_two_source_crossfit,
-    partition_metrics_by_queue,
-    validate_out_of_source_predictions,
-)
-from .rally_intervals import (
-    BOUNDARY_DEFINITION,
-    RallyInterval,
-    RallyIntervalIndex,
-    RallySourceManifest,
-    read_rally_intervals,
-    refill_frames,
-    write_rally_intervals,
-)
-from .joint_inference import (
-    InPlayDecoderConfig,
-    calibrate_inplay_decoder,
-    decode_inplay_probabilities,
-    decoded_intervals,
-    write_joint_artifacts,
-)
-from .rally import (
-    RALLY_CONTEXT_DIRECTION,
-    RALLY_FEATURE_DIM,
-    RALLY_FEATURE_SCHEMA,
-    RALLY_FEATURE_VERSION,
-    RALLY_MODEL_TYPE,
-    RallyBatch,
-    RallyLosses,
-    RallySegmenter,
-    RallySegmenterConfig,
-    RallySegmenterOutput,
-    RallyTrainingRecipe,
-    rally_checkpoint,
-)
-from .rally_dataset import (
-    RALLY_FEATURE_NAMES,
-    RallyDataConfig,
-    RallySourceConfig,
-    RallyWindow,
-    RallyWindowDataset,
-    collate_rally_windows,
-)
-from .rally_features import (
-    FULL_RALLY_FEATURE_NAMES,
-    RALLY_FEATURE_VIEWS,
-    RALLY_PROBE_GROUPS,
-    RallyFeatureView,
-    rally_feature_indices,
-    rally_feature_view,
-)
-from .rally_pseudo_label import (
-    SNAP_CONFIDENCE_FLOORS,
-    SNAP_RADII_SECONDS,
-    boundary_snap_diagnostic,
-    build_teacher_manifest,
-    combine_boundary_diagnostics,
-    pseudo_label_source,
-    select_snap_configuration,
-    snap_intervals,
-)
+Importing an interval or fold utility does not initialize the ML stack. Existing
+package-level names remain available for callers through lazy imports.
+"""
+
+from importlib import import_module
+
+_EXPORTS = {
+    'MASKED_TARGET': ('batch', 'MASKED_TARGET'),
+    'NULL_TARGET': ('batch', 'NULL_TARGET'),
+    'SelectorBatch': ('batch', 'SelectorBatch'),
+    'ContextMode': ('config', 'ContextMode'),
+    'SelectorConfig': ('config', 'SelectorConfig'),
+    'CandidateSelectionHead': ('model', 'CandidateSelectionHead'),
+    'EncodedSelectorBatch': ('model', 'EncodedSelectorBatch'),
+    'InPlayHead': ('model', 'InPlayHead'),
+    'JointLosses': ('model', 'JointLosses'),
+    'JointRallyShuttleModel': ('model', 'JointRallyShuttleModel'),
+    'NullSelectionHead': ('model', 'NullSelectionHead'),
+    'SelectorOutput': ('model', 'SelectorOutput'),
+    'TemporalShuttleEncoder': ('model', 'TemporalShuttleEncoder'),
+    'TemporalShuttleSelector': ('model', 'TemporalShuttleSelector'),
+    'FRAME_DIMS': ('dataset', 'FRAME_DIMS'),
+    'SelectorDataConfig': ('dataset', 'SelectorDataConfig'),
+    'SelectorSourceConfig': ('dataset', 'SelectorSourceConfig'),
+    'SelectorWindow': ('dataset', 'SelectorWindow'),
+    'SelectorWindowDataset': ('dataset', 'SelectorWindowDataset'),
+    'collate_selector_windows': ('dataset', 'collate_selector_windows'),
+    'CrossFitFold': ('crossfit', 'CrossFitFold'),
+    'CrossFitManifest': ('crossfit', 'CrossFitManifest'),
+    'build_leave_one_group_out': ('crossfit', 'build_leave_one_group_out'),
+    'build_leave_one_source_out': ('crossfit', 'build_leave_one_source_out'),
+    'build_two_source_crossfit': ('crossfit', 'build_two_source_crossfit'),
+    'partition_metrics_by_queue': ('crossfit', 'partition_metrics_by_queue'),
+    'validate_out_of_source_predictions': ('crossfit', 'validate_out_of_source_predictions'),
+    'BOUNDARY_DEFINITION': ('rally_intervals', 'BOUNDARY_DEFINITION'),
+    'RallyInterval': ('rally_intervals', 'RallyInterval'),
+    'RallyIntervalIndex': ('rally_intervals', 'RallyIntervalIndex'),
+    'RallySourceManifest': ('rally_intervals', 'RallySourceManifest'),
+    'read_rally_intervals': ('rally_intervals', 'read_rally_intervals'),
+    'refill_frames': ('rally_intervals', 'refill_frames'),
+    'write_rally_intervals': ('rally_intervals', 'write_rally_intervals'),
+    'InPlayDecoderConfig': ('joint_inference', 'InPlayDecoderConfig'),
+    'calibrate_inplay_decoder': ('joint_inference', 'calibrate_inplay_decoder'),
+    'decode_inplay_probabilities': ('joint_inference', 'decode_inplay_probabilities'),
+    'decoded_intervals': ('joint_inference', 'decoded_intervals'),
+    'write_joint_artifacts': ('joint_inference', 'write_joint_artifacts'),
+    'RALLY_CONTEXT_DIRECTION': ('rally', 'RALLY_CONTEXT_DIRECTION'),
+    'RALLY_FEATURE_DIM': ('rally', 'RALLY_FEATURE_DIM'),
+    'RALLY_FEATURE_SCHEMA': ('rally', 'RALLY_FEATURE_SCHEMA'),
+    'RALLY_FEATURE_VERSION': ('rally', 'RALLY_FEATURE_VERSION'),
+    'RALLY_MODEL_TYPE': ('rally', 'RALLY_MODEL_TYPE'),
+    'RallyBatch': ('rally', 'RallyBatch'),
+    'RallyLosses': ('rally', 'RallyLosses'),
+    'RallySegmenter': ('rally', 'RallySegmenter'),
+    'RallySegmenterConfig': ('rally', 'RallySegmenterConfig'),
+    'RallySegmenterOutput': ('rally', 'RallySegmenterOutput'),
+    'RallyTrainingRecipe': ('rally', 'RallyTrainingRecipe'),
+    'rally_checkpoint': ('rally', 'rally_checkpoint'),
+    'RALLY_FEATURE_NAMES': ('rally_dataset', 'RALLY_FEATURE_NAMES'),
+    'RallyDataConfig': ('rally_dataset', 'RallyDataConfig'),
+    'RallySourceConfig': ('rally_dataset', 'RallySourceConfig'),
+    'RallyWindow': ('rally_dataset', 'RallyWindow'),
+    'RallyWindowDataset': ('rally_dataset', 'RallyWindowDataset'),
+    'collate_rally_windows': ('rally_dataset', 'collate_rally_windows'),
+    'FULL_RALLY_FEATURE_NAMES': ('rally_features', 'FULL_RALLY_FEATURE_NAMES'),
+    'RALLY_FEATURE_VIEWS': ('rally_features', 'RALLY_FEATURE_VIEWS'),
+    'RALLY_PROBE_GROUPS': ('rally_features', 'RALLY_PROBE_GROUPS'),
+    'RallyFeatureView': ('rally_features', 'RallyFeatureView'),
+    'rally_feature_indices': ('rally_features', 'rally_feature_indices'),
+    'rally_feature_view': ('rally_features', 'rally_feature_view'),
+    'SNAP_CONFIDENCE_FLOORS': ('rally_pseudo_label', 'SNAP_CONFIDENCE_FLOORS'),
+    'SNAP_RADII_SECONDS': ('rally_pseudo_label', 'SNAP_RADII_SECONDS'),
+    'boundary_snap_diagnostic': ('rally_pseudo_label', 'boundary_snap_diagnostic'),
+    'build_teacher_manifest': ('rally_pseudo_label', 'build_teacher_manifest'),
+    'combine_boundary_diagnostics': ('rally_pseudo_label', 'combine_boundary_diagnostics'),
+    'pseudo_label_source': ('rally_pseudo_label', 'pseudo_label_source'),
+    'select_snap_configuration': ('rally_pseudo_label', 'select_snap_configuration'),
+    'snap_intervals': ('rally_pseudo_label', 'snap_intervals'),
+}
 
 __all__ = [
     "MASKED_TARGET",
@@ -160,3 +153,17 @@ __all__ = [
     "rally_feature_indices",
     "rally_feature_view",
 ]
+
+
+def __getattr__(name: str):
+    try:
+        module, attribute = _EXPORTS[name]
+    except KeyError:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
+    value = getattr(import_module(f".{module}", __name__), attribute)
+    globals()[name] = value
+    return value
+
+
+def __dir__():
+    return sorted(set(globals()) | set(__all__))

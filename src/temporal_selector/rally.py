@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass
 from typing import Any, Mapping
 
@@ -455,21 +456,50 @@ class RallyTrainingRecipe:
     device: str = "mps"
 
     def __post_init__(self) -> None:
-        expected = {
-            "seed": 1729,
-            "epochs": 25,
-            "batch_size": 16,
-            "sampling": "boundary_balanced",
-            "boundary_aux_weight": 0.25,
-            "optimizer": "AdamW",
-            "learning_rate": 3e-4,
-            "gradient_clip_norm": 1.0,
-            "device": "mps",
-        }
-        if asdict(self) != expected:
+        for name in ("epochs", "batch_size"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if (
+            not isinstance(self.seed, int)
+            or isinstance(self.seed, bool)
+            or self.seed < 0
+        ):
+            raise ValueError("seed must be a nonnegative integer")
+        if self.optimizer != "AdamW":
+            raise ValueError("supported rally optimizer is AdamW")
+        if self.sampling not in ("boundary_balanced", "uniform"):
+            raise ValueError("unsupported rally sampling mode")
+        if self.device not in ("cpu", "mps", "cuda"):
+            raise ValueError("unsupported rally device")
+        for name in ("learning_rate", "gradient_clip_norm", "boundary_aux_weight"):
+            value = getattr(self, name)
+            if (
+                not math.isfinite(value)
+                or value < 0
+                or (name != "boundary_aux_weight" and value == 0)
+            ):
+                raise ValueError(
+                    f"{name} must be finite and {'nonnegative' if name == 'boundary_aux_weight' else 'positive'}"
+                )
+
+    @classmethod
+    def benchmark(cls) -> "RallyTrainingRecipe":
+        """The historical 25-epoch MPS benchmark, preserved without overrides."""
+        return cls()
+
+    @classmethod
+    def from_preset(
+        cls, preset: str = "default", **overrides: Any
+    ) -> "RallyTrainingRecipe":
+        if preset not in ("default", "benchmark"):
+            raise ValueError(f"unknown rally training preset: {preset}")
+        recipe = cls(**overrides)
+        if preset == "benchmark" and recipe != cls.benchmark():
             raise ValueError(
-                "the independent rally experiment uses the frozen training recipe"
+                "benchmark preset requires the exact historical training recipe"
             )
+        return recipe
 
 
 def rally_checkpoint(

@@ -15,12 +15,12 @@ import torch
 from torch.utils.data import Dataset
 
 from .batch import MASKED_TARGET
-from .dataset import (
+from .observations import (
     POSE_REPRESENTATION_VERSION,
-    _frame_context,
-    _jsonl,
-    _sha256,
-    _validate_calibration,
+    frame_context,
+    read_jsonl_artifact,
+    file_sha256,
+    validate_calibration,
     rally_boundary_targets,
 )
 from src.court_projection import CourtHomography, HALF_LENGTH, HALF_WIDTH
@@ -126,7 +126,7 @@ class RallyWindowDataset(Dataset[RallyWindow]):
         annotation_identity = (
             {
                 "rally_intervals_sha256": self.rally_index.intervals_sha256,
-                "rally_manifest_sha256": _sha256(config.rally_manifest_path),
+                "rally_manifest_sha256": file_sha256(config.rally_manifest_path),
             }
             if self.rally_index is not None and config.rally_manifest_path is not None
             else None
@@ -153,10 +153,10 @@ class RallyWindowDataset(Dataset[RallyWindow]):
             "annotation": annotation_identity,
             "sources": {
                 source.source_id: {
-                    "video_sha256": _sha256(source.video_path),
-                    "assignments_sha256": _sha256(source.assignments_path),
-                    "pose_cache_sha256": _sha256(source.pose_cache_path),
-                    "calibration_sha256": _sha256(source.calibration_path),
+                    "video_sha256": file_sha256(source.video_path),
+                    "assignments_sha256": file_sha256(source.assignments_path),
+                    "pose_cache_sha256": file_sha256(source.pose_cache_path),
+                    "calibration_sha256": file_sha256(source.calibration_path),
                 }
                 for source in config.sources
             },
@@ -214,8 +214,8 @@ class RallyWindowDataset(Dataset[RallyWindow]):
     def _compile_source(
         self, source: RallySourceConfig
     ) -> list[RallyWindow]:
-        assignment_meta, assignment_records = _jsonl(source.assignments_path)
-        pose_meta, pose_records = _jsonl(source.pose_cache_path)
+        assignment_meta, assignment_records = read_jsonl_artifact(source.assignments_path)
+        pose_meta, pose_records = read_jsonl_artifact(source.pose_cache_path)
         frame_count = int(assignment_meta["frame_count"])
         fps = float(assignment_meta["fps"])
         image_size = tuple(map(int, assignment_meta["frame_size"]))
@@ -241,7 +241,7 @@ class RallyWindowDataset(Dataset[RallyWindow]):
             (int(record["frame"]), int(record["track_id"])): record
             for record in pose_records
         }
-        calibration_sha256 = _sha256(source.calibration_path)
+        calibration_sha256 = file_sha256(source.calibration_path)
         identity_path = source.calibration_path.parent.parent / "source.json"
         if source.calibration_path.name != "calibration.json" or source.calibration_path.parent.name != "court":
             raise ValueError("rally calibration must use the canonical court/calibration.json path")
@@ -271,7 +271,7 @@ class RallyWindowDataset(Dataset[RallyWindow]):
             or assignment_meta.get("calibration_sha256") != calibration_sha256
         ):
             raise ValueError("player assignments do not fingerprint the canonical calibration lineage")
-        _validate_calibration(source.calibration_path, image_size)
+        validate_calibration(source.calibration_path, image_size)
         homography = CourtHomography.load(source.calibration_path)
 
         capture = cv2.VideoCapture(str(source.video_path))
@@ -296,7 +296,7 @@ class RallyWindowDataset(Dataset[RallyWindow]):
         if self.rally_index is not None:
             source_manifest = self.rally_index.sources[source.source_id]
             if (
-                source_manifest.video_sha256 != _sha256(source.video_path)
+                source_manifest.video_sha256 != file_sha256(source.video_path)
                 or not math.isclose(
                     source_manifest.fps, fps, rel_tol=0, abs_tol=1e-6
                 )
@@ -321,7 +321,7 @@ class RallyWindowDataset(Dataset[RallyWindow]):
             validity: list[list[bool]] = []
             targets: list[int] = []
             for frame in frames:
-                frame_values, frame_validity = _frame_context(
+                frame_values, frame_validity = frame_context(
                     assignments[frame],
                     poses,
                     frame,

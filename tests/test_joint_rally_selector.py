@@ -27,6 +27,7 @@ from src.temporal_selector import (
     write_rally_intervals,
 )
 from src.temporal_selector.experiment import aggregate_joint_predictions, run_experiment
+from src.temporal_selector.training import train_selector_fold
 
 
 def _joint_batch() -> SelectorBatch:
@@ -572,6 +573,39 @@ class _JointDataset:
                 )
         self.windows = tuple(windows)
         self.manifest = {"dataset_fingerprint": "joint-synthetic"}
+
+
+def test_joint_final_checkpoint_can_train_without_evaluation_windows(monkeypatch):
+    def unexpected_evaluation(*args, **kwargs):
+        pytest.fail("fixed-budget training called held-out prediction")
+
+    monkeypatch.setattr(
+        "src.temporal_selector.training.predict_windows", unexpected_evaluation
+    )
+    model = JointRallyShuttleModel(
+        SelectorConfig(
+            context_mode="full_context",
+            frame_feature_dim=154,
+            token_size=16,
+            num_layers=1,
+            num_attention_heads=2,
+            feed_forward_size=32,
+        )
+    )
+    windows = _JointDataset().windows[:2]
+    fold = build_two_source_crossfit(("one", "two"), seed=1729).folds[0]
+    options = {"device": torch.device("cpu"), "epochs": 1, "batch_size": 1, "seed": 1729}
+
+    with pytest.raises(ValueError, match="requires evaluation windows"):
+        train_selector_fold(
+            model, windows, (), fold, checkpoint_selection="validation_loss",
+            validation_partition_designated=True, **options,
+        )
+    history = train_selector_fold(model, windows, (), fold, **options)
+
+    assert history[0]["optimizer_steps"] == 2
+    assert "heldout_inplay_loss" not in history[0]
+    assert model.checkpoint_selection["selected_epoch"] == 1
 
 
 def test_joint_runner_writes_conditional_outputs(tmp_path: Path) -> None:
