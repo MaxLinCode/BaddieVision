@@ -170,14 +170,28 @@ def import_calibration(
     return atomic_write_json(source.calibration_path, value)
 
 
-def register_native_calibration(source: SourceEntry, *, source_frame: int) -> Path:
+def register_native_calibration(
+    source: SourceEntry, *, source_frame: int, calibration_data: Mapping[str, Any] | None = None
+) -> Path:
     """Attach canonical artifact metadata after the native calibration UI writes."""
-    value = json.loads(source.calibration_path.read_text(encoding="utf-8"))
+    value = (dict(calibration_data) if calibration_data is not None else
+             json.loads(source.calibration_path.read_text(encoding="utf-8")))
     identity = SourceIdentity.read(source.identity_path)
     if value.get("image_size") != [identity.width, identity.height]:
         raise ValueError("calibration image_size does not match source identity")
     if not 0 <= int(source_frame) < identity.frame_count:
         raise ValueError("calibration frame lies outside the source-local frame domain")
+    automatic = value.get("automatic_calibration")
+    if automatic is not None:
+        indices = automatic.get("frame_indices", [])
+        if not indices or any(
+            type(index) is not int or not 0 <= index < identity.frame_count for index in indices
+        ):
+            raise ValueError("automatic calibration frames lie outside the source-local frame domain")
+        if automatic.get("source_sha256") != identity.video_sha256:
+            raise ValueError("automatic calibration source fingerprint differs from source identity")
+        if automatic.get("status") != "accepted" or automatic.get("review_status") != "manually_reviewed":
+            raise ValueError("automatic calibration requires review before publication")
     value["artifact_metadata"] = {
         "schema": "baddievision_court_calibration_artifact",
         "schema_version": 1,
@@ -187,6 +201,9 @@ def register_native_calibration(source: SourceEntry, *, source_frame: int) -> Pa
         "frame_indexing": "source_local_zero_based",
         "producer": "src.calibrate_court",
     }
+    if automatic is not None:
+        value["artifact_metadata"]["source_frames"] = indices
+        value["artifact_metadata"]["method"] = automatic["method"]
     return atomic_write_json(source.calibration_path, value)
 
 

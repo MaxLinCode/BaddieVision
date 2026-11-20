@@ -41,6 +41,13 @@ python3 -m src.workflow stage import-calibration \
 The import validates `image_size` and source identity, then writes the canonical
 artifact. Editing it invalidates dependent player assignments by fingerprint.
 
+Generate and review an automatic court proposal with
+`python3 -m src.workflow stage calibrate --source SOURCE --mode auto --review --open-browser`.
+It combines a distributed temporal-median background with court-line matching;
+missing corners can be recovered from partial lines. See
+[automatic court calibration](automatic-court-calibration.md) for diagnostics,
+review controls, and evaluation. Existing calibrations require `--force` to replace.
+
 During the validation cycle, copy existing observations without moving their
 legacy files, then regenerate calibration-dependent player outputs:
 

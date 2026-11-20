@@ -6,16 +6,19 @@
   <title>Court calibration</title>
   <style>
     * { box-sizing: border-box; }
-    body { margin: 0; background: #171717; color: white; font: 15px system-ui; }
+    body { margin: 0; background: #171717; color: white; font: 15px system-ui;
+      height: 100vh; display: flex; flex-direction: column; }
     header {
       position: sticky; top: 0; display: flex; align-items: center; gap: 6px;
-      min-height: 58px; padding: 8px 12px; background: #242424; z-index: 3;
+      flex-wrap: wrap; min-height: 58px; padding: 8px 12px; background: #242424; z-index: 3;
     }
     #status { flex: 1; min-width: 310px; }
     button, input { padding: 6px 9px; }
     input { width: 78px; }
+    input[type="checkbox"] { width: auto; }
+    #review-controls:not([hidden]) { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
     #viewport {
-      position: relative; width: calc(100vw - 24px); height: calc(100vh - 70px);
+      position: relative; width: calc(100vw - 24px); flex: 1; min-height: 0;
       margin: 6px auto; overflow: auto; background: #0d0d0d;
     }
     #canvas { display: block; max-width: none; height: auto; cursor: crosshair; }
@@ -35,6 +38,13 @@
     <button id="zoom-out">Zoom −</button><button id="zoom-in">Zoom +</button>
     <button id="zoom-fit">Fit</button>
     <button id="undo">Undo</button><button id="save" disabled>Save</button>
+    <span id="review-controls" hidden>
+      <button id="background">Background</button>
+      <select id="line-select"></select><button id="add-line">Add line</button>
+      <button id="remove-line">Remove line</button>
+      <button id="flip-x">Swap left/right</button><button id="flip-y">Swap near/far</button>
+      <label><input id="orientation" type="checkbox">Orientation checked</label>
+    </span>
   </header>
   <div id="viewport"><canvas id="canvas"></canvas></div>
   <canvas id="magnifier" width="200" height="200"></canvas>
@@ -43,7 +53,14 @@
     const {mode, landmarkNames, lineNames, totalFrames} = config;
     let frameIndex = config.initialFrame;
     const points = [];
-    const linePoints = Object.fromEntries(lineNames.map(name => [name, []]));
+    const linePoints = Object.fromEntries(lineNames.map(name => [name, config.initialLines?.[name] || []]));
+    let activeLines = config.optionalLines
+      ? Object.keys(config.initialLines || {})
+      : [...lineNames];
+    let showingBackground = false;
+    let previewValid = false;
+    let previewSequence = 0;
+    let imageSequence = 0;
     let projectedCourt = [];
     let draggedHandle = null;
     let suppressClick = false;
@@ -68,7 +85,15 @@
     }
 
     function linesComplete() {
-      return lineNames.every(name => linePoints[name].length === 2);
+      if (!config.optionalLines) return lineNames.every(name => linePoints[name].length === 2);
+      return activeLines.every(name => linePoints[name].length === 2)
+        && activeLines.filter(name => config.lineAxes[name] === "x").length >= 2
+        && activeLines.filter(name => config.lineAxes[name] === "y").length >= 2;
+    }
+
+    function selectedLines() {
+      return Object.fromEntries(activeLines.filter(name => linePoints[name].length === 2)
+        .map(name => [name, linePoints[name]]));
     }
 
     function eventPoint(event) {
@@ -93,7 +118,7 @@
           ctx.stroke();
         });
 
-        lineNames.forEach(name => {
+        activeLines.forEach(name => {
           const endpoints = linePoints[name];
           if (endpoints.length === 2) {
             const dx = endpoints[1][0] - endpoints[0][0];
@@ -120,11 +145,13 @@
           });
         });
 
-        const incomplete = lineNames.find(name => linePoints[name].length < 2);
+        const incomplete = activeLines.find(name => linePoints[name].length < 2);
         status.textContent = incomplete
           ? `Frame ${frameIndex}/${totalFrames - 1} · ${pretty(incomplete)}: click point ${linePoints[incomplete].length + 1}/2`
-          : `Frame ${frameIndex}/${totalFrames - 1} · Drag orange handles until green court lines align`;
-        save.disabled = !linesComplete();
+          : `Frame ${frameIndex}/${totalFrames - 1} · ${config.review
+            ? (linesComplete() ? "Drag handles; add/remove visible lines as needed" : "Add at least two sidelines and two cross-court lines")
+            : "Drag orange handles until green court lines align"}`;
+        save.disabled = !linesComplete() || (config.review && (!previewValid || !document.querySelector("#orientation").checked));
       } else {
         points.forEach((point, index) => {
           ctx.beginPath();
@@ -141,17 +168,26 @@
     }
 
     function requestPreview() {
+      previewValid = false;
+      const sequence = ++previewSequence;
+      if (config.review) draw();
       if (mode !== "lines" || !linesComplete()) return;
       clearTimeout(previewTimer);
       previewTimer = setTimeout(async () => {
         const response = await fetch("/preview", {
           method: "POST",
           headers: {"Content-Type": "application/json"},
-          body: JSON.stringify({lines: linePoints})
+          body: JSON.stringify({lines: selectedLines()})
         });
+        if (sequence !== previewSequence) return;
         if (response.ok) {
           projectedCourt = (await response.json()).segments;
+          previewValid = true;
           draw();
+        } else {
+          projectedCourt = [];
+          draw();
+          status.textContent = `Could not fit: ${(await response.json()).error}`;
         }
       }, 60);
     }
@@ -207,23 +243,26 @@
       projectedCourt = [];
     }
 
-    function loadFrame(requestedIndex) {
+    function loadFrame(requestedIndex, background = false) {
+      const sequence = ++imageSequence;
       const target = Math.min(Math.max(Number(requestedIndex) || 0, 0), totalFrames - 1);
       frameIndex = target;
       frameInput.value = frameIndex;
-      clearSelection();
+      showingBackground = background;
+      if (!config.review) clearSelection();
       status.textContent = `Loading frame ${frameIndex}…`;
       const nextImage = new Image();
       nextImage.onload = () => {
-        if (target !== frameIndex) return;
+        if (sequence !== imageSequence) return;
         image = nextImage;
         canvas.width = image.naturalWidth;
         canvas.height = image.naturalHeight;
         canvas.style.width = `${image.naturalWidth}px`;
         canvas.style.height = `${image.naturalHeight}px`;
         applyZoom(fitZoom());
+        requestPreview();
       };
-      nextImage.src = `/frame.jpg?index=${target}&cache=${Date.now()}`;
+      nextImage.src = background ? "/background.jpg" : `/frame.jpg?index=${target}&cache=${Date.now()}`;
     }
 
     document.querySelectorAll("[data-jump]").forEach(button => {
@@ -244,7 +283,7 @@
       if (mode !== "lines") return;
       const point = eventPoint(event);
       const radius = 14 / zoom;
-      for (const name of lineNames) {
+      for (const name of activeLines) {
         for (let index = 0; index < linePoints[name].length; index++) {
           const handle = linePoints[name][index];
           if (Math.hypot(point[0] - handle[0], point[1] - handle[1]) <= radius) {
@@ -275,7 +314,7 @@
       if (suppressClick) return;
       const point = eventPoint(event);
       if (mode === "lines") {
-        const name = lineNames.find(candidate => linePoints[candidate].length < 2);
+        const name = activeLines.find(candidate => linePoints[candidate].length < 2);
         if (!name) return;
         linePoints[name].push(point);
         requestPreview();
@@ -289,7 +328,7 @@
     document.querySelector("#undo").onclick = () => {
       if (mode === "lines") {
         projectedCourt = [];
-        for (const name of [...lineNames].reverse()) {
+        for (const name of [...activeLines].reverse()) {
           if (linePoints[name].length) {
             linePoints[name].pop();
             break;
@@ -310,7 +349,8 @@
         body: JSON.stringify({
           frame_index: frameIndex,
           mode,
-          lines: mode === "lines" ? linePoints : undefined,
+          lines: mode === "lines" ? selectedLines() : undefined,
+          orientation_confirmed: document.querySelector("#orientation").checked,
           points: mode === "points"
             ? Object.fromEntries(landmarkNames.map((name, index) => [name, points[index]]))
             : undefined
@@ -325,7 +365,34 @@
       }
     };
 
-    loadFrame(frameIndex);
+    if (config.review) {
+      document.querySelector("#review-controls").hidden = false;
+      const select = document.querySelector("#line-select");
+      lineNames.forEach(name => select.add(new Option(pretty(name), name)));
+      document.querySelector("#add-line").onclick = () => {
+        if (!activeLines.includes(select.value)) activeLines.push(select.value);
+        draw(); requestPreview();
+      };
+      document.querySelector("#remove-line").onclick = () => {
+        activeLines = activeLines.filter(name => name !== select.value);
+        linePoints[select.value] = [];
+        projectedCourt = []; draw(); requestPreview();
+      };
+      document.querySelector("#orientation").onchange = draw;
+      document.querySelector("#background").onclick = () => loadFrame(frameIndex, !showingBackground);
+      for (const [id, a, b] of [["flip-x", "left", "right"], ["flip-y", "near", "far"]]) {
+        document.querySelector(`#${id}`).onclick = () => {
+          const swap = name => name.split("_").map(part => part === a ? b : part === b ? a : part).join("_");
+          const old = selectedLines();
+          lineNames.forEach(name => linePoints[name] = []);
+          activeLines = Object.keys(old).map(swap);
+          Object.entries(old).forEach(([name, endpoints]) => linePoints[swap(name)] = endpoints);
+          document.querySelector("#orientation").checked = false;
+          draw(); requestPreview();
+        };
+      }
+    }
+    loadFrame(frameIndex, !!config.hasBackground);
   </script>
 </body>
 </html>

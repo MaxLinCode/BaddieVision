@@ -12,6 +12,7 @@ from src.court_projection import (
     CourtHomography,
     court_line_segments,
     draw_court_overlay,
+    floor_court_line_segments,
 )
 
 
@@ -169,3 +170,54 @@ def test_overlay_draws_pixels():
     overlay = draw_court_overlay(image, calibration)
     assert cv2.countNonZero(cv2.cvtColor(overlay, cv2.COLOR_BGR2GRAY)) > 0
     assert not image.any()
+
+
+def test_floor_evidence_excludes_net_and_includes_baseline_centers():
+    segments = floor_court_line_segments()
+    assert len(segments) == 12
+    assert ((-3.05, 0.0), (3.05, 0.0)) not in segments
+    assert COURT_LANDMARKS["near_baseline_center"] == (0.0, -6.7)
+    assert COURT_LANDMARKS["far_baseline_center"] == (0.0, 6.7)
+
+
+@pytest.mark.parametrize("middle_y", [0.0, 1e-9])
+def test_rejects_three_collinear_minimal_points(middle_y):
+    court = [[0, 0], [1, middle_y], [2, 0], [0, 2]]
+    image = [[100, 100], [150, 100 + middle_y], [200, 100], [100, 200]]
+    with pytest.raises(ValueError, match="degenerate"):
+        CourtHomography.from_points(image, court)
+
+
+def test_many_observations_fit_deterministically_with_outliers():
+    truth, _, _, _ = synthetic_calibration()
+    generator = np.random.default_rng(42)
+    court = generator.uniform([-3, -6], [3, 6], size=(180, 2))
+    image = truth.project_to_image(court)
+    image += generator.normal(0, 0.15, size=image.shape)
+    image[-35:] = generator.uniform([0, 0], [640, 480], size=(35, 2))
+    fitted, inliers = CourtHomography.from_points(image, court)
+    repeated, repeated_inliers = CourtHomography.from_points(image, court)
+    np.testing.assert_array_equal(inliers, repeated_inliers)
+    np.testing.assert_array_equal(fitted.image_to_court, repeated.image_to_court)
+    assert inliers[:145].all()
+    assert not inliers[145:].any()
+    np.testing.assert_allclose(
+        fitted.project_to_image(court[:145]),
+        truth.project_to_image(court[:145]),
+        atol=0.15,
+    )
+
+
+def test_hypothesis_generation_is_bounded_and_unique():
+    from src.court_projection import _homography_samples
+
+    samples = list(_homography_samples(200))
+    assert len(samples) == len(set(samples)) == 1024
+    assert samples == list(_homography_samples(200))
+
+
+@pytest.mark.parametrize("threshold", [0, -1, float("nan")])
+def test_rejects_invalid_robust_threshold(threshold):
+    _, image, court, _ = synthetic_calibration()
+    with pytest.raises(ValueError, match="ransac_threshold"):
+        CourtHomography.from_points(image, court, ransac_threshold=threshold)

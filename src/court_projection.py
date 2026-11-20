@@ -8,6 +8,7 @@ to the far baseline.
 from __future__ import annotations
 
 import json
+import math
 from itertools import combinations
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,6 +38,8 @@ COURT_LANDMARKS: dict[str, tuple[float, float]] = {
     "near_right_singles": (HALF_SINGLES_WIDTH, -HALF_LENGTH),
     "far_left_singles": (-HALF_SINGLES_WIDTH, HALF_LENGTH),
     "far_right_singles": (HALF_SINGLES_WIDTH, HALF_LENGTH),
+    "near_baseline_center": (0.0, -HALF_LENGTH),
+    "far_baseline_center": (0.0, HALF_LENGTH),
     "net_left": (-HALF_WIDTH, 0.0),
     "net_right": (HALF_WIDTH, 0.0),
     "net_left_singles": (-HALF_SINGLES_WIDTH, 0.0),
@@ -184,7 +187,14 @@ def _fit_homography_dlt(source: np.ndarray, destination: np.ndarray) -> np.ndarr
                 [0.0, 0.0, 0.0, -x, -y, -1.0, v * x, v * y, v],
             ]
         )
-    _, _, vh = np.linalg.svd(np.asarray(rows))
+    design = np.asarray(rows)
+    # Only the four-point (8x9) system needs the extra right-nullspace row.
+    # Full SVD on hundreds of observations would allocate a large square U.
+    _, singular_values, vh = np.linalg.svd(
+        design, full_matrices=len(rows) < 9
+    )
+    if singular_values[7] <= singular_values[0] * 1e-9:
+        raise ValueError("degenerate or poorly conditioned homography correspondences")
     normalized_homography = vh[-1].reshape(3, 3)
     homography = (
         np.linalg.inv(destination_transform)
@@ -211,12 +221,14 @@ def _fit_court_to_image(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Fit robustly without depending on OpenCV's NumPy ABI bindings."""
 
+    if not np.isfinite(ransac_threshold) or ransac_threshold <= 0:
+        raise ValueError("ransac_threshold must be finite and positive")
     if len(image) == 4:
+        if not _minimal_sample_valid(court) or not _minimal_sample_valid(image):
+            raise ValueError("degenerate four-point homography correspondences")
         return _fit_homography_dlt(court, image), np.ones(4, dtype=bool)
 
-    # Calibration normally uses fewer than a dozen points, so evaluating all
-    # four-point samples is deterministic and inexpensive.
-    samples = combinations(range(len(image)), 4)
+    samples = _homography_samples(len(image))
     best_matrix = None
     best_inliers = None
     best_score = (-1, float("-inf"))
@@ -224,10 +236,7 @@ def _fit_court_to_image(
         indices = np.asarray(sample)
         sample_court = court[indices]
         sample_image = image[indices]
-        if (
-            np.linalg.matrix_rank(sample_court - sample_court.mean(axis=0)) < 2
-            or np.linalg.matrix_rank(sample_image - sample_image.mean(axis=0)) < 2
-        ):
+        if not _minimal_sample_valid(sample_court) or not _minimal_sample_valid(sample_image):
             continue
         try:
             matrix = _fit_homography_dlt(sample_court, sample_image)
@@ -243,7 +252,52 @@ def _fit_court_to_image(
 
     if best_matrix is None or best_inliers is None or best_inliers.sum() < 4:
         raise ValueError("homography fit has fewer than four inliers")
-    return _fit_homography_dlt(court[best_inliers], image[best_inliers]), best_inliers
+    # Reclassify after refinement so the returned mask describes the returned
+    # matrix rather than the initial four-point hypothesis.
+    for _ in range(3):
+        refined = _fit_homography_dlt(court[best_inliers], image[best_inliers])
+        errors = np.linalg.norm(_transform_numpy(court, refined) - image, axis=1)
+        inliers = errors <= ransac_threshold
+        if inliers.sum() < 4:
+            break
+        best_matrix = refined
+        if np.array_equal(inliers, best_inliers):
+            break
+        best_inliers = inliers
+    errors = np.linalg.norm(_transform_numpy(court, best_matrix) - image, axis=1)
+    return best_matrix, errors <= ransac_threshold
+
+
+def _minimal_sample_valid(points: np.ndarray) -> bool:
+    """A projective four-point basis must have no three collinear points."""
+
+    scale_squared = float(np.sum(np.ptp(points, axis=0) ** 2))
+    if scale_squared <= 1e-20:
+        return False
+    for a, b, c in combinations(points, 3):
+        first, second = b - a, c - a
+        area = abs(first[0] * second[1] - first[1] * second[0])
+        if area <= scale_squared * 1e-7:
+            return False
+    return True
+
+
+def _homography_samples(count: int, limit: int = 1024):
+    """Enumerate small fits; bound larger fits with reproducible unique samples."""
+
+    if math.comb(count, 4) <= limit:
+        yield from combinations(range(count), 4)
+        return
+    generator = np.random.default_rng(0)
+    seen: set[tuple[int, ...]] = set()
+    # Bound attempts too, even if a caller supplies an unusual limit.
+    for _ in range(limit * 4):
+        sample = tuple(sorted(int(index) for index in generator.choice(count, 4, replace=False)))
+        if sample not in seen:
+            seen.add(sample)
+            yield sample
+            if len(seen) == limit:
+                return
 
 
 def _line_intersections(
@@ -475,7 +529,7 @@ class CourtHomography:
 
 
 def court_line_segments() -> list[tuple[tuple[float, float], tuple[float, float]]]:
-    """Return regulation court markings as metric line segments."""
+    """Return court overlay segments, including the legacy net-position guide."""
 
     x_left, x_right = -HALF_WIDTH, HALF_WIDTH
     y_near, y_far = -HALF_LENGTH, HALF_LENGTH
@@ -500,6 +554,15 @@ def court_line_segments() -> list[tuple[tuple[float, float], tuple[float, float]
         ]
     )
     return segments
+
+
+def floor_court_line_segments() -> list[tuple[tuple[float, float], tuple[float, float]]]:
+    """Return only painted floor segments suitable for calibration evidence."""
+
+    return [
+        segment for segment in court_line_segments()
+        if not (segment[0][1] == 0.0 and segment[1][1] == 0.0)
+    ]
 
 
 def draw_court_overlay(

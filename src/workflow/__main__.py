@@ -55,10 +55,17 @@ def _parser() -> argparse.ArgumentParser:
     calibrate = stage_commands.add_parser("calibrate")
     calibrate.add_argument("--source", required=True)
     calibrate.add_argument("--frame", type=int, default=0)
-    calibrate.add_argument("--mode", choices=("lines", "points"), default="lines")
+    calibrate.add_argument("--mode", choices=("lines", "points", "auto"), default="lines")
     calibrate.add_argument("--ui", choices=("browser", "opencv"), default="browser")
     calibrate.add_argument("--open-browser", action="store_true")
     calibrate.add_argument("--preview", type=Path)
+    calibrate.add_argument("--samples", type=int, default=31)
+    calibrate.add_argument("--max-dimension", type=int, default=960)
+    calibrate.add_argument("--max-hypotheses", type=int, default=65536)
+    calibrate.add_argument("--court-region", type=Path)
+    calibrate.add_argument("--review", action="store_true")
+    calibrate.add_argument("--diagnostics", type=Path)
+    calibrate.add_argument("--force", action="store_true")
     people = stage_commands.add_parser("person-tracks")
     people.add_argument("--source", required=True)
     people.add_argument("--model", default="yolov8n.pt")
@@ -355,11 +362,26 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.stage_command == "calibrate":
             from src.calibrate_court import main as calibrate_main
+            from src.automatic_court import CalibrationNeedsReview
             from .artifacts import register_native_calibration
 
+            if source.calibration_path.exists() and not args.force:
+                raise FileExistsError("canonical calibration already exists; use --force to replace")
+            if args.preview and args.preview.resolve() in {
+                source.video_path.resolve(), source.calibration_path.resolve(), source.identity_path.resolve()
+            }:
+                raise ValueError("preview must not overlap a canonical source artifact or the video")
+            # Automatic candidates are reviewed in a staging directory; source
+            # identity and multi-frame provenance join the canonical JSON in one
+            # atomic publication below.
+            import tempfile
+
+            staging = tempfile.TemporaryDirectory(prefix="court-calibration-")
+            destination = (Path(staging.name) / "reviewed.json" if args.mode == "auto"
+                           else source.calibration_path)
             forwarded = [
                 str(source.video_path),
-                str(source.calibration_path),
+                str(destination),
                 "--frame",
                 str(args.frame),
                 "--mode",
@@ -371,8 +393,27 @@ def main(argv: list[str] | None = None) -> int:
                 forwarded.append("--open-browser")
             if args.preview:
                 forwarded.extend(("--preview", str(args.preview)))
-            selected_frame = calibrate_main(forwarded)
-            print(register_native_calibration(source, source_frame=selected_frame))
+            if args.mode == "auto":
+                forwarded.extend(("--samples", str(args.samples), "--max-dimension", str(args.max_dimension),
+                                  "--max-hypotheses", str(args.max_hypotheses),
+                                  "--diagnostics", str(args.diagnostics or source.calibration_path.parent / "automatic")))
+                if args.review:
+                    forwarded.append("--review")
+                if args.court_region:
+                    forwarded.extend(("--court-region", str(args.court_region)))
+            if args.force:
+                forwarded.append("--force")
+            try:
+                selected_frame = calibrate_main(forwarded)
+                data = json.loads(destination.read_text(encoding="utf-8")) if args.mode == "auto" else None
+                if args.mode == "auto" and source.calibration_path.exists() and not args.force:
+                    raise FileExistsError("canonical calibration already exists; use --force to replace")
+                print(register_native_calibration(source, source_frame=selected_frame, calibration_data=data))
+            except CalibrationNeedsReview as error:
+                print(str(error), file=sys.stderr)
+                return 2
+            finally:
+                staging.cleanup()
             return 0
         if args.stage_command == "person-tracks":
             from .stages import run_person_stage
