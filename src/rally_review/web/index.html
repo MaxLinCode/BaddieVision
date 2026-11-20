@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; media-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'">
+  <title>Rally Diagnostics · BaddieVision</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="styles.css">
+  <script src="failures.js" defer></script>
+  <script src="diagnostics.js" defer></script>
+  <script src="overlays.js" defer></script>
+  <script src="experiments.js" defer></script>
+</head>
+<body>
+  <header class="top">
+    <div class="shell bar">
+      <div class="wordmark"><span class="mark" aria-hidden="true"><i></i><i></i><i></i></span>BaddieVision<span class="divider"></span><span class="product">Rally Diagnostics</span></div>
+      <button id="refresh-experiments" type="button">Refresh experiments</button>
+    </div>
+  </header>
+  <main class="shell">
+    <div class="title">
+      <div class="title-context"><h1>Rally review</h1><p id="source">Reading local experiment outputs…</p></div>
+      <output id="clock" class="mono">00:00.00</output>
+    </div>
+    <details id="experiment-picker">
+      <summary>Experiment and runs</summary>
+      <div class="experiment-controls">
+        <label>Experiment <select id="experiment" disabled></select></label>
+        <label>Recording <select id="recording" disabled></select></label>
+        <label>Run <select id="primary-run" disabled></select></label>
+        <label>Compare with <select id="compare-run" disabled></select></label>
+      </div>
+    </details>
+    <p id="load-status" role="status"></p>
+    <p id="notice" role="status" hidden></p>
+    <section class="player" aria-label="Source video">
+      <div class="empty" id="video-empty">
+        <span class="play-mark" aria-hidden="true">▶</span>
+        <strong>Source video</strong>
+        <span>Choose a recording from a local experiment.</span>
+      </div>
+      <div id="video-stage" class="video-stage" hidden>
+        <video id="video" controls playsinline preload="metadata" aria-label="Match video"></video>
+        <canvas id="player-overlay" aria-hidden="true"></canvas>
+      </div>
+    </section>
+    <section class="review" aria-labelledby="review-title">
+      <h2 id="review-title" class="visually-hidden">Model timeline</h2>
+      <div id="metrics" hidden>
+        <div class="charts">
+          <canvas id="timeline" tabindex="0" role="slider" aria-label="Timeline position. Use arrow keys to step frames." aria-valuemin="0" aria-valuemax="0" aria-valuenow="0"></canvas>
+          <label class="overview-label">Full video <input id="overview" type="range" min="0" value="0" max="0" step="1" aria-label="Seek across full video"></label>
+        </div>
+        <div class="switches">
+          <label><input id="boxes-toggle" type="checkbox" checked disabled> Boxes</label>
+          <label><input id="poses-toggle" type="checkbox" checked disabled> Poses</label>
+          <label><input id="heads" type="checkbox" disabled> Boundary scores</label>
+          <label><input id="follow" type="checkbox" checked disabled> Follow playback</label>
+        </div>
+        <p id="overlay-status" class="mode-help" role="status" hidden></p>
+        <div class="review-tools">
+          <div class="fields">
+            <label for="mode">Review <select id="mode"></select></label>
+            <label for="event">Event <select id="event"></select></label>
+          </div>
+          <label>Window <select id="window"><option value="12">12 s</option><option value="30">30 s</option><option value="60">60 s</option><option value="all">Full video</option></select></label>
+        </div>
+        <p id="mode-help" class="mode-help"></p>
+        <div id="event-detail" class="event-detail" aria-live="polite" hidden></div>
+        <div id="legend" class="legend" aria-label="Chart legend"></div>
+        <p id="summary" class="mode-help"></p>
+        <p class="chart-help">Click to seek. Focus the timeline and use the left or right arrow key to step one frame. <span id="head-guide" hidden>Dashed lines show the start head. Dotted lines show the end head.</span></p>
+        <div id="readout" class="readout" aria-label="Metrics at the selected frame"></div>
+      </div>
+      <div id="metrics-empty" class="metrics-empty"><span class="trace" aria-hidden="true">∿</span><p>The timeline will appear here once the run loads.</p></div>
+    </section>
+  </main>
+</body>
+</html>
