@@ -149,41 +149,45 @@ def test_token_bucket_sampler_is_deterministic_and_groups_similar_sizes():
 
 
 def test_batched_prediction_matches_single_window_prediction():
-    windows = [
-        _window("malaysia", "adaptive", 0, "selected_retained", "m"),
-        _window("malaysia", "audit", -1, "null", "n"),
-    ]
-    fold = build_two_source_crossfit(("malaysia", "max-vs-nik"), seed=1729).folds[1]
-    from src.temporal_selector.model import TemporalShuttleSelector
+    # Near-zero logits make this comparison sensitive to random initialization.
+    # Keep its numeric tolerance reproducible without changing other tests' RNG.
+    with torch.random.fork_rng(devices=[]):
+        torch.random.default_generator.manual_seed(0)
+        windows = [
+            _window("malaysia", "adaptive", 0, "selected_retained", "m"),
+            _window("malaysia", "audit", -1, "null", "n"),
+        ]
+        fold = build_two_source_crossfit(("malaysia", "max-vs-nik"), seed=1729).folds[1]
+        from src.temporal_selector.model import TemporalShuttleSelector
 
-    model = TemporalShuttleSelector().eval()
-    expected = [
-        row
-        for window in windows
-        for row in _predict_window(
-            model, window, fold, device=torch.device("cpu")
+        model = TemporalShuttleSelector().eval()
+        expected = [
+            row
+            for window in windows
+            for row in _predict_window(
+                model, window, fold, device=torch.device("cpu")
+            )
+        ]
+        actual = _predict_windows(
+            model,
+            windows,
+            fold,
+            device=torch.device("cpu"),
+            batch_size=2,
         )
-    ]
-    actual = _predict_windows(
-        model,
-        windows,
-        fold,
-        device=torch.device("cpu"),
-        batch_size=2,
-    )
-    numeric_fields = {"null_logit", "selection_loss", "inplay_logit", "in_play_probability", "inplay_loss"}
-    for batched, single in zip(actual, expected):
-        assert {
-            key: value for key, value in batched.items() if key not in numeric_fields | {"candidate_logits"}
-        } == {
-            key: value for key, value in single.items() if key not in numeric_fields | {"candidate_logits"}
-        }
-        assert batched["candidate_logits"] == pytest.approx(single["candidate_logits"])
-        for field in numeric_fields:
-            if single[field] is None:
-                assert batched[field] is None
-            else:
-                assert batched[field] == pytest.approx(single[field], abs=1e-6)
+        numeric_fields = {"null_logit", "selection_loss", "inplay_logit", "in_play_probability", "inplay_loss"}
+        for batched, single in zip(actual, expected):
+            assert {
+                key: value for key, value in batched.items() if key not in numeric_fields | {"candidate_logits"}
+            } == {
+                key: value for key, value in single.items() if key not in numeric_fields | {"candidate_logits"}
+            }
+            assert batched["candidate_logits"] == pytest.approx(single["candidate_logits"])
+            for field in numeric_fields:
+                if single[field] is None:
+                    assert batched[field] is None
+                else:
+                    assert batched[field] == pytest.approx(single[field], abs=1e-6)
 
 
 def test_no_shuttle_input_mask_removes_candidates_from_model_and_predictions():

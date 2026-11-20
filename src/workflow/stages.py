@@ -51,7 +51,7 @@ STAGE_CODE = {
     "predict": (
         "src/temporal_selector/rally_inference.py",
         "src/temporal_selector/rally_dataset.py",
-        "src/temporal_selector/dataset.py",
+        "src/temporal_selector/observations.py",
         "src/temporal_selector/rally_features.py",
         "src/temporal_selector/rally.py",
         "src/temporal_selector/batch.py",

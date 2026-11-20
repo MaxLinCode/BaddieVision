@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
@@ -36,20 +35,22 @@ def _resolve(parent: Path, value: str | Path) -> Path:
 
 
 def _loso_manifest(source_ids: list[str], seed: int) -> dict[str, Any]:
-    """Mirror the selector's deterministic LOSO format without importing torch."""
-    folds = [
-        {
-            "fold_id": chr(ord("A") + index),
-            "training_source_ids": [item for item in source_ids if item != held_out],
-            "evaluation_source_ids": [held_out],
-        }
-        for index, held_out in enumerate(source_ids)
-    ]
-    payload = {"seed": int(seed), "folds": folds}
-    fingerprint = hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-    return {**payload, "fingerprint": fingerprint}
+    """Use the shared lightweight fold builder without importing ML runtimes."""
+    from src.temporal_selector.crossfit import build_leave_one_source_out
+
+    manifest = build_leave_one_source_out(source_ids, seed=seed)
+    return {
+        "seed": manifest.seed,
+        "folds": [
+            {
+                "fold_id": fold.fold_id,
+                "training_source_ids": list(fold.training_source_ids),
+                "evaluation_source_ids": list(fold.evaluation_source_ids),
+            }
+            for fold in manifest.folds
+        ],
+        "fingerprint": manifest.fingerprint,
+    }
 
 
 @dataclass(frozen=True)
@@ -460,9 +461,13 @@ class SourceCatalog:
         output = Path(output).expanduser().resolve()
         runtime = Path(runtime).expanduser().resolve()
         selected = self.select(source_ids)
-        not_ready = [s.source_id for s in selected if not self.status(s).experiment_ready]
+        not_ready = [
+            s.source_id for s in selected if not self.status(s).experiment_ready
+        ]
         if not_ready:
-            raise ValueError(f"sources are not experiment-ready: {', '.join(not_ready)}")
+            raise ValueError(
+                f"sources are not experiment-ready: {', '.join(not_ready)}"
+            )
         if len(selected) < 2:
             raise ValueError("an experiment requires at least two sources")
         annotations = runtime / "events" / "shuttle.jsonl"
@@ -478,13 +483,19 @@ class SourceCatalog:
             "shuttle-rally-audit.json",
             "shuttle-refill.json",
         )
-        queues = [runtime / "queues" / name for name in queue_names if (runtime / "queues" / name).is_file()]
+        queues = [
+            runtime / "queues" / name
+            for name in queue_names
+            if (runtime / "queues" / name).is_file()
+        ]
         if not queues:
             raise ValueError("runtime has no annotation queues")
         manifest_value = _loso_manifest([source.source_id for source in selected], seed)
         manifest_path = output.with_name(output.stem + "-loso-manifest.json")
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
-        manifest_path.write_text(json.dumps(manifest_value, indent=2) + "\n", encoding="utf-8")
+        manifest_path.write_text(
+            json.dumps(manifest_value, indent=2) + "\n", encoding="utf-8"
+        )
         value = {
             "schema": "temporal_selector_experiment_config",
             "schema_version": 1,
@@ -503,10 +514,18 @@ class SourceCatalog:
                     {
                         "source_id": source.source_id,
                         "video_path": _portable_path(source.video_path, output.parent),
-                        "candidates_path": _portable_path(source.frozen_candidates_path, output.parent),
-                        "assignments_path": _portable_path(source.assignments_path, output.parent),
-                        "pose_cache_path": _portable_path(source.pose_cache_path, output.parent),
-                        "calibration_path": _portable_path(source.calibration_path, output.parent),
+                        "candidates_path": _portable_path(
+                            source.frozen_candidates_path, output.parent
+                        ),
+                        "assignments_path": _portable_path(
+                            source.assignments_path, output.parent
+                        ),
+                        "pose_cache_path": _portable_path(
+                            source.pose_cache_path, output.parent
+                        ),
+                        "calibration_path": _portable_path(
+                            source.calibration_path, output.parent
+                        ),
                     }
                     for source in selected
                 ],

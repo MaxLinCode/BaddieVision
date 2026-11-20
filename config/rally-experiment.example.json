@@ -1,7 +1,14 @@
 {
   "schema": "clean_rally_experiment_config",
   "schema_version": 1,
-  "seed": 1729,
+  "training": {
+    "seed": 1729,
+    "epochs": 25,
+    "batch_size": 16,
+    "learning_rate": 0.0003,
+    "gradient_clip_norm": 1.0,
+    "device": "mps"
+  },
   "camera_sources": {
     "Camera A": [
       "camera-a-segment-1"

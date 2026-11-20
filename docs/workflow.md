@@ -211,3 +211,5 @@ interrupted tracking stage restarts from frame zero. Arbitrary frame seeking is
 not supported: ByteTrack state/track identities and TrackNet temporal overlap
 and background preprocessing must be restored or deterministically replayed
 before a future implementation can claim equivalent in-stage tracking resume.
+For epoch recovery and configurable rally experiments, see
+[training and recovery](rally-training.md).
