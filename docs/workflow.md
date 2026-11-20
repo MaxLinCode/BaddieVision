@@ -54,6 +54,14 @@ python3 -m src.workflow stage import-artifact --source SOURCE \
 python3 -m src.workflow stage players --source SOURCE
 ```
 
+Player assignment uses the replacement guard by default. A track that still
+qualifies for its court role, averages at least 0.60 detector confidence, and
+occupies at least half of its occupancy window can only be replaced by a
+challenger averaging at least 0.35 detector confidence. Use
+`--no-replacement-guard` with the standalone
+`python3 -m InPlay.heuristic.player_interpretation` command to replay the earlier
+policy. Same-ID reacquisition remains opt-in on that command.
+
 Canonical observations are grouped beneath `ARTIFACT_ROOT/shuttle/`,
 `ARTIFACT_ROOT/players/`, and `ARTIFACT_ROOT/court/`. Imports are atomic and do
 not modify their source files.
@@ -128,3 +136,78 @@ Preparation fails if any selected source or required runtime input is missing.
 It captures the annotation SHA-256, includes the completed standard queues, and
 generates a deterministic leave-one-source-out manifest. The generated config
 and split manifest are local snapshots and ignored by Git.
+
+## Shared extraction and recovery
+
+Use one callable or CLI on local, Colab, and Kaggle:
+
+```bash
+python -m src.workflow extract --source SOURCE --profile observations \
+  --person-model models/yolov8n.pt --pose-model models/pose_landmarker_full.task \
+  --model-root . --device auto
+python -m src.workflow extract --source SOURCE --profile observations \
+  --model-root . --rebuild pose
+```
+
+For an unregistered video, replace `--source SOURCE` with `--video segment.mp4
+--source-id SOURCE --output-dir /durable/artifacts/SOURCE`. Pass `--calibration
+court.json` to import a calibration explicitly. The canonical copy is always
+`ARTIFACT_ROOT/court/calibration.json`; `image_size` is required. A source is one
+static camera segment with its own zero-based frames. Use a new source ID when
+the camera moves. Trimming/resizing must happen before registration; see
+`src.single_video.video.prepare_working_video` for that optional preparation.
+
+`--profile rally` completes person/court/pose observations without TrackNet.
+`observations` adds shuttle tracks, candidates, tracklets, and diagnostic
+hypotheses using the TrackNet bundle. `--rebuild shuttle-links` recomputes the
+derived tracklets/hypotheses while retaining tracking.
+The maintained notebook is
+[`Single_Video_Feature_Extraction.ipynb`](../notebooks/Single_Video_Feature_Extraction.ipynb).
+Its bootstrap selects storage paths; extraction logic lives in
+`src.workflow.extraction.run_extraction`. The old platform-specific notebooks have been removed.
+
+Manual `stage person-tracks` and `stage players` use the same functions,
+validation, backend/model identities, and receipts as extraction and rally
+prediction. Use the same model, device, and crop settings when combining manual
+and automatic stages. Explicit person-track imports receive a validated import
+receipt and act as a supplied source layer until explicitly rebuilt. Imported
+pose records are reused only when their observation/model/preprocessing keys
+match. Never silently adopt an unreceipted generated artifact.
+
+Each stage checks its own inputs, relevant implementation, model bytes, runtime
+packages, and output hashes. Stale or corrupt artifacts require an explicit
+`--rebuild STAGE`; `--force` rebuilds all requested stages. Rebuilding person
+tracks also rebuilds dependent player outputs; rebuilding pose leaves person
+and shuttle extraction reusable. Calibration changes require `--rebuild pose`
+(or `--force`) and reuse matching committed pose crops. Custom backends must
+have inspectable implementation code or an explicit stable backend identity;
+change that identity when backend behavior changes.
+
+`run-status.json` records pending, running, completed, failed, and stale stages.
+Inspect it directly or use `source status --source SOURCE --json`. Status refreshes
+the retained pose-unit count and last committed frame/track even after an abrupt
+exit. Counts include retained historical backend/source partitions. Pose crops
+are committed incrementally under `players/.pose-work/`, including source,
+frame, track, box, model/backend, and preprocessing identity. Restarting a failed
+player stage reuses matching crops. Pose snapshots publish atomically. Final
+outputs and their receipts use a recoverable publication journal; interrupted
+publication restores the previous bundle on the next run. Human annotation
+files are never extraction outputs.
+
+Optional `--preview` and `--export-zip /durable/result.zip` run after observations
+complete. Preview failure leaves completed observations usable. Exports contain
+canonical observations, calibration and source identity, excluding work caches.
+Store the artifact root on durable storage in cloud runtimes or sync committed
+units periodically. A session-local final ZIP cannot recover a lost runtime.
+
+Rally prediction also accepts `--rebuild person|pose|predict|decode|render`.
+`rallies/probabilities.jsonl` preserves the model output independently of the
+decoder. Decoding produces `predictions.jsonl` and `rallies.csv`; rendering reads
+those saved predictions. Decoder or overlay changes can reuse observations and
+probabilities. Rendering failure preserves the prediction receipt.
+
+Person tracking and TrackNet currently recover at **stage boundaries**. An
+interrupted tracking stage restarts from frame zero. Arbitrary frame seeking is
+not supported: ByteTrack state/track identities and TrackNet temporal overlap
+and background preprocessing must be restored or deterministically replayed
+before a future implementation can claim equivalent in-stage tracking resume.

@@ -103,7 +103,7 @@ def _identity(source: RallySourceConfig) -> SourceIdentity:
     return identity
 
 
-def _validate_rows(rows: Sequence[Mapping[str, Any]], frame_count: int) -> None:
+def validate_prediction_rows(rows: Sequence[Mapping[str, Any]], frame_count: int) -> None:
     if [row.get("frame") for row in rows] != list(range(frame_count)):
         raise ValueError("rally inference predictions must cover every source frame exactly once")
     for row in rows:
@@ -142,7 +142,18 @@ def predict_source(
     if model.config.frame_feature_dim != dataset.feature_view.dimension:
         raise ValueError("rally model dimension differs from preprocessing feature view")
     rows = predict_windows(model, dataset.windows, device=device, batch_size=batch_size)
-    _validate_rows(rows, identity.frame_count)
+    validate_prediction_rows(rows, identity.frame_count)
+    decode_prediction_rows(rows, source.source_id, identity, config)
+    return rows
+
+
+def decode_prediction_rows(
+    rows: Sequence[dict[str, Any]], source_id: str, identity: SourceIdentity,
+    decoder: Mapping[str, Any] | InPlayDecoderConfig,
+) -> None:
+    """Decode saved probabilities without invoking a model or compiling features."""
+    validate_prediction_rows(rows, identity.frame_count)
+    config = _decoder(decoder)
     fps = identity.fps_numerator / identity.fps_denominator
     states = decode_inplay_probabilities(
         [row["inplay_probability"] for row in rows], fps=fps, config=config,
@@ -152,11 +163,10 @@ def predict_source(
         row["rally_id"] = None
     for number, (start, end) in enumerate(decoded_intervals(list(range(len(rows))), states), 1):
         for frame in range(start, end + 1):
-            rows[frame]["rally_id"] = f"{source.source_id}-{number:04d}"
-    return rows
+            rows[frame]["rally_id"] = f"{source_id}-{number:04d}"
 
 
-def _render_overlay(
+def render_overlay(
     source: RallySourceConfig,
     rows: Sequence[Mapping[str, Any]],
     identity: SourceIdentity,
@@ -226,7 +236,7 @@ def write_prediction_artifacts(
 ) -> dict[str, Path]:
     """Stage a complete prediction bundle before atomically replacing each file."""
     identity = _identity(source)
-    _validate_rows(rows, identity.frame_count)
+    validate_prediction_rows(rows, identity.frame_count)
     if any(not isinstance(row.get("decoded_inplay"), bool) for row in rows):
         raise ValueError("prediction artifacts require boolean decoded states")
     directory = Path(output_dir)
@@ -271,3 +281,8 @@ def write_prediction_artifacts(
 def decoder_mapping(decoder: Mapping[str, Any] | InPlayDecoderConfig) -> dict[str, Any]:
     """Normalize and validate a frozen decoder for provenance output."""
     return asdict(_decoder(decoder))
+
+
+# Compatibility for earlier research callers.
+_validate_rows = validate_prediction_rows
+_render_overlay = render_overlay

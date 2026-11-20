@@ -50,7 +50,13 @@ def load_track_models(repo_dir: Path, *, use_inpaintnet: bool = False) -> dict[s
     import torch
     from TrackNetV3.predictArgs import load_torchscript_model
 
-    repo_dir = validate_model_root(repo_dir, use_inpaintnet=use_inpaintnet)
+    # Tracking does not consume the historical InPlay model tree. Keep full
+    # bundle validation for legacy copying, but require only actual inputs here.
+    repo_dir = Path(repo_dir)
+    required = REQUIRED_MODEL_FILES + (INPAINTNET_MODEL_FILES if use_inpaintnet else ())
+    missing = [name for name in required if not (repo_dir / name).is_file()]
+    if missing:
+        raise FileNotFoundError(f"Tracking models at {repo_dir} are missing: {missing}")
     tracknet_script = repo_dir / "models" / "TrackNet_torchscript.pt"
     tracknet_path = repo_dir / "src" / "TrackNetV3" / "ckpts" / "TrackNet_best.pt"
     tracknet_ckpt = torch.load(tracknet_path, map_location=torch.device("cpu"))

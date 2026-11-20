@@ -1,4 +1,5 @@
 import json
+import hashlib
 from pathlib import Path
 
 import cv2
@@ -6,16 +7,21 @@ import numpy as np
 import pytest
 
 from InPlay.heuristic.person_tracks import import_legacy_player_poses, raw_artifact_fingerprint
+from InPlay.heuristic import player_interpretation
 from InPlay.heuristic.player_interpretation import (
+    AssignmentPolicy,
+    Candidate,
     apply_temporal_pose_validation,
     assign_singles_slots,
     enrich_pose_cache,
     expand_pose_bbox,
     load_calibration,
+    load_pose_cache,
     pose_model_fingerprint,
 )
 from src.court_projection import CourtHomography
 from src.pose_estimator import PoseEstimate, PoseLandmark
+from src import pose_estimator
 
 
 def _observation(frame: int, track_id: int, x: float, y: float, confidence: float = 0.9):
@@ -118,6 +124,109 @@ def test_center_weighted_incumbent_is_retained_within_score_tolerance():
     frames = assign_singles_slots(observations, CourtHomography(np.eye(3)), 90, 30)
 
     assert _assignment_ids(frames, "P1") == {1}
+
+
+@pytest.mark.parametrize("challenger_confidence", [0.25, 0.85])
+def test_replacement_guard_distinguishes_floor_box_from_reliable_challenger(challenger_confidence):
+    observations = [
+        _observation(frame, 31, 0 if frame < 30 else 2.5, -3.35, 0.85)
+        for frame in range(80)
+    ] + [
+        _observation(frame, 99, 0, -3.35, challenger_confidence)
+        for frame in range(25, 80)
+    ]
+    court = CourtHomography(np.eye(3))
+    baseline = assign_singles_slots(
+        observations, court, 80, 10, policy=AssignmentPolicy(replacement_guard=False),
+    )
+    guarded = assign_singles_slots(observations, court, 80, 10)
+
+    assert baseline[0]["slots"]["P1"]["assignment"]["track_id"] == 31
+    assert baseline[45]["slots"]["P1"]["assignment"]["track_id"] == 99
+    decision = guarded[45]["slots"]["P1"]
+    if challenger_confidence < 0.35:
+        assert decision["assignment"]["track_id"] == 31
+        assert decision["ambiguity_reason"] == "low_confidence_replacement_guard"
+        assert [item["track_id"] for item in decision["candidates"]] == [99, 31]
+    else:
+        assert decision == baseline[45]["slots"]["P1"]
+
+
+@pytest.mark.parametrize(
+    ("selected_track", "return_frame", "position", "confidence", "other_slot_claim", "reacquired"),
+    [
+        (None, 5, (0, -3), 0.60, False, True),
+        (99, 9, (0, -3), 0.90, False, True),
+        (None, 10, (0, -3), 0.90, False, False),
+        (None, 5, (0, 3), 0.90, False, False),
+        (None, 5, (10, -3), 0.90, False, False),
+        (None, 5, (0, -3), 0.59, False, False),
+        (None, 5, (0, 0), 0.90, True, False),
+        (None, None, (0, -3), 0.90, False, False),
+    ],
+)
+def test_same_id_reacquisition_requires_recent_eligible_current_observation(
+    monkeypatch, selected_track, return_frame, position, confidence, other_slot_claim, reacquired,
+):
+    def rank(_items, _start, end, _occupancy_start, _occupancy_end, slot, _excluded, _fps):
+        if slot == 1:
+            choice = 31 if end == 25 else selected_track
+        else:
+            choice = 31 if end > 25 and other_slot_claim else None
+        return [] if choice is None else [Candidate(choice, 5, 1.0, 1.0, 0.9, 0.99)]
+
+    monkeypatch.setattr(player_interpretation, "_rank_candidates", rank)
+    observations = [_observation(4, 31, 0, -3)]
+    if return_frame is not None:
+        observations.append(_observation(return_frame, 31, *position, confidence))
+    court = CourtHomography(np.eye(3))
+    baseline = assign_singles_slots(
+        observations, court, 40, 10, policy=AssignmentPolicy(replacement_guard=False),
+    )
+    frames = assign_singles_slots(
+        observations, court, 40, 10,
+        policy=AssignmentPolicy(replacement_guard=False, same_id_reacquisition=True),
+    )
+
+    assert baseline[4]["slots"]["P1"]["assignment"]["track_id"] == 31
+    index = return_frame if return_frame is not None else 5
+    assert baseline[index]["slots"]["P1"]["assignment"] is None
+    decision = frames[index]["slots"]["P1"]
+    if reacquired:
+        assert decision["assignment"]["track_id"] == 31
+        assert decision["ambiguity_reason"] == "same_id_reacquired"
+        assert decision["confidence"] == 0.99
+        assert frames[index + 1]["slots"]["P1"]["assignment"] is None
+    else:
+        assert decision["assignment"] is None
+    if other_slot_claim:
+        assert frames[index]["slots"]["P2"]["assignment"]["track_id"] == 31
+
+
+def test_reacquisition_cannot_bypass_confidence_or_replace_the_period_track(monkeypatch):
+    def rank(_items, _start, end, _occupancy_start, _occupancy_end, slot, _excluded, _fps):
+        if slot == 2:
+            return []
+        incumbent = Candidate(31, 5, 1.0, 0.5, 0.85, 0.86)
+        selected = Candidate(99, 5, 1.0, 1.0, 0.9, 0.99)
+        return [incumbent] if end == 25 else [selected, incumbent]
+
+    monkeypatch.setattr(player_interpretation, "_rank_candidates", rank)
+    observations = [
+        _observation(4, 31, 0, -3),
+        _observation(5, 31, 0, -3),
+        _observation(6, 31, 0, -3, 0.50),
+        _observation(7, 31, 0, -3),
+        _observation(7, 99, 0, -3),
+    ]
+    frames = assign_singles_slots(
+        observations, CourtHomography(np.eye(3)), 40, 10,
+        policy=AssignmentPolicy(replacement_guard=False, same_id_reacquisition=True),
+    )
+
+    assert frames[5]["slots"]["P1"]["ambiguity_reason"] == "same_id_reacquired"
+    assert frames[6]["slots"]["P1"]["assignment"] is None
+    assert frames[7]["slots"]["P1"]["assignment"]["track_id"] == 99
 
 
 def test_equal_new_same_half_candidates_are_ambiguous():
@@ -293,12 +402,14 @@ def test_pose_cache_is_idempotent_and_selection_changes_compute_only_missing(tmp
         + json.dumps(_observation(0, 1, 4, 10)) + "\n"
         + json.dumps(_observation(1, 2, 8, 10)) + "\n"
     )
-    factory = lambda **_kwargs: _FakeEstimator()
-    assignment = lambda frame, track_id, bbox: {
-        "type": "frame", "frame": frame,
-        "slots": {"P1": {"assignment": {"track_id": track_id, "bbox": bbox}},
-                  "P2": {"assignment": None}},
-    }
+    def factory(**_kwargs):
+        return _FakeEstimator()
+    def assignment(frame, track_id, bbox):
+        return {
+            "type": "frame", "frame": frame,
+            "slots": {"P1": {"assignment": {"track_id": track_id, "bbox": bbox}},
+                      "P2": {"assignment": None}},
+        }
     first = [assignment(0, 1, [2, 4, 6, 10])]
     _FakeEstimator.calls = 0
     _, computed = enrich_pose_cache(video, first, raw, cache, estimator_factory=factory)
@@ -310,6 +421,123 @@ def test_pose_cache_is_idempotent_and_selection_changes_compute_only_missing(tmp
     assert computed == 1 and _FakeEstimator.calls == 2
 
 
+def _pose_recovery_fixture(tmp_path: Path):
+    video, raw = tmp_path / "video.mp4", tmp_path / "raw.jsonl"
+    _write_video(video, frames=2)
+    raw.write_text(json.dumps({
+        "type": "metadata", "schema": "person_tracks", "schema_version": 1,
+        "frame_size": [16, 16], "frame_count": 2, "fps": 25,
+    }) + "\n")
+    assignments = [{"type": "frame", "frame": frame, "slots": {
+        "P1": {"assignment": {"track_id": 1, "bbox": [2, 4, 6, 10]}},
+        "P2": {"assignment": None},
+    }} for frame in range(2)]
+    return video, raw, assignments
+
+
+def test_interrupted_pose_enrichment_reuses_committed_crops_in_a_new_stage(tmp_path: Path):
+    video, raw, assignments = _pose_recovery_fixture(tmp_path)
+    work = tmp_path / "durable" / "pose-work"
+
+    class InterruptedEstimator(_FakeEstimator):
+        def estimate_pose(self, image):
+            if self.calls:
+                raise KeyboardInterrupt("runtime interrupted")
+            return super().estimate_pose(image)
+
+    InterruptedEstimator.calls = 0
+    with pytest.raises(KeyboardInterrupt, match="runtime interrupted"):
+        enrich_pose_cache(
+            video, assignments, raw, tmp_path / "abandoned-stage" / "cache.jsonl",
+            estimator_factory=lambda **_: InterruptedEstimator(), pose_work_dir=work,
+        )
+
+    _FakeEstimator.calls = 0
+    published = tmp_path / "new-stage" / "cache.jsonl"
+    cache, computed = enrich_pose_cache(
+        video, assignments, raw, published,
+        estimator_factory=lambda **_: _FakeEstimator(), pose_work_dir=work,
+    )
+    assert computed == _FakeEstimator.calls == 1
+    assert {key[0] for key in cache} == {0, 1}
+    assert len(load_pose_cache(published)[1]) == 2
+
+
+def test_failed_pose_publication_keeps_previous_cache_and_committed_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    video, raw, assignments = _pose_recovery_fixture(tmp_path)
+    published = tmp_path / "cache.jsonl"
+    def factory(**_):
+        return _FakeEstimator()
+    enrich_pose_cache(video, assignments[:1], raw, published, estimator_factory=factory)
+    previous = published.read_bytes()
+    replace = Path.replace
+
+    def interrupted_replace(path, target):
+        if Path(target) == published:
+            raise OSError("publication interrupted")
+        return replace(path, target)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "replace", interrupted_replace)
+        with pytest.raises(OSError, match="publication interrupted"):
+            enrich_pose_cache(video, assignments, raw, published, estimator_factory=factory)
+    assert published.read_bytes() == previous
+
+    _FakeEstimator.calls = 0
+    _, computed = enrich_pose_cache(video, assignments, raw, published, estimator_factory=factory)
+    assert computed == _FakeEstimator.calls == 0
+    assert len(load_pose_cache(published)[1]) == 2
+
+
+def test_reused_pose_work_restores_original_estimate_before_temporal_validation(tmp_path: Path):
+    video, raw, assignments = _pose_recovery_fixture(tmp_path)
+    published = tmp_path / "cache.jsonl"
+    def factory(**_):
+        return _FakeEstimator()
+    enrich_pose_cache(video, assignments, raw, published, estimator_factory=factory)
+    metadata, records = load_pose_cache(published)
+    records[0]["pose_landmarks"][0]["x"] = 0.99
+    records[0]["temporal_status"] = "rejected_jump_interpolated"
+    published.write_text("\n".join(json.dumps(value) for value in [metadata, *records]) + "\n")
+
+    _FakeEstimator.calls = 0
+    active, computed = enrich_pose_cache(video, assignments, raw, published, estimator_factory=factory)
+
+    assert computed == _FakeEstimator.calls == 0
+    restored = active[(0, 1, (2, 4, 6, 10))]
+    assert restored["temporal_status"] == "original"
+    assert restored["pose_landmarks"][0]["x"] == 0.5
+
+
+@pytest.mark.parametrize("change", ["backend", "preprocessing", "raw", "bbox"])
+def test_pose_recovery_respects_all_observation_and_backend_inputs(tmp_path: Path, change: str):
+    video, raw, assignments = _pose_recovery_fixture(tmp_path)
+    work = tmp_path / "pose-work"
+    options = {"pose_backend_identity": {"name": "test", "version": 1}}
+    def factory(**_):
+        return _FakeEstimator()
+    enrich_pose_cache(
+        video, assignments[:1], raw, tmp_path / "first.jsonl",
+        estimator_factory=factory, pose_work_dir=work, **options,
+    )
+    if change == "backend":
+        options["pose_backend_identity"] = {"name": "test", "version": 2}
+    elif change == "preprocessing":
+        options["pose_crop_padding"] = 0.25
+    elif change == "raw":
+        raw.write_text(raw.read_text() + "\n")
+    else:
+        assignments[0]["slots"]["P1"]["assignment"]["bbox"][0] += 1
+    _FakeEstimator.calls = 0
+    _, computed = enrich_pose_cache(
+        video, assignments[:1], raw, tmp_path / "second.jsonl",
+        estimator_factory=factory, pose_work_dir=work, **options,
+    )
+    assert computed == _FakeEstimator.calls == 1
+
+
 def test_pose_cache_is_rebuilt_when_the_raw_person_track_artifact_changes(tmp_path: Path):
     video, raw, cache = tmp_path / "video.mp4", tmp_path / "person_tracks.jsonl", tmp_path / "pose_cache.jsonl"
     _write_video(video, frames=1)
@@ -319,7 +547,8 @@ def test_pose_cache_is_rebuilt_when_the_raw_person_track_artifact_changes(tmp_pa
         "P1": {"assignment": {"track_id": 1, "bbox": [2, 4, 6, 10]}}, "P2": {"assignment": None},
     }}]
     _FakeEstimator.calls = 0
-    factory = lambda **_kwargs: _FakeEstimator()
+    def factory(**_kwargs):
+        return _FakeEstimator()
     enrich_pose_cache(video, assignments, raw, cache, estimator_factory=factory)
     raw.write_text(raw.read_text() + "\n")  # A rerun replaced the immutable source layer.
 
@@ -338,7 +567,8 @@ def test_legacy_pose_cache_with_matching_model_is_upgraded_without_recomputing(t
         "P1": {"assignment": {"track_id": 1, "bbox": [2, 4, 6, 10]}}, "P2": {"assignment": None},
     }}]
     _FakeEstimator.calls = 0
-    factory = lambda **_kwargs: _FakeEstimator()
+    def factory(**_kwargs):
+        return _FakeEstimator()
     enrich_pose_cache(video, assignment, raw, cache, estimator_factory=factory)
     lines = [json.loads(line) for line in cache.read_text().splitlines()]
     lines[0]["schema_version"] = 1
@@ -346,12 +576,131 @@ def test_legacy_pose_cache_with_matching_model_is_upgraded_without_recomputing(t
         record.pop("preprocessing_fingerprint")
     cache.write_text("\n".join(json.dumps(line) for line in lines) + "\n")
 
-    _, computed = enrich_pose_cache(video, assignment, raw, cache, estimator_factory=factory)
+    _, computed = enrich_pose_cache(
+        video, assignment, raw, cache, estimator_factory=factory,
+        pose_work_dir=tmp_path / "empty-work",
+    )
 
     assert computed == 0 and _FakeEstimator.calls == 1
     upgraded = [json.loads(line) for line in cache.read_text().splitlines()]
     assert upgraded[0]["schema_version"] == 2
     assert upgraded[1]["preprocessing_fingerprint"]
+
+
+def test_legacy_model_match_without_preprocessing_proof_recomputes(tmp_path: Path):
+    video, raw, assignments = _pose_recovery_fixture(tmp_path)
+    cache = tmp_path / "cache.jsonl"
+    enrich_pose_cache(video, assignments, raw, cache, estimator_factory=lambda **_: _FakeEstimator())
+    metadata, records = load_pose_cache(cache)
+    metadata["schema_version"] = 1
+    metadata.pop("preprocessing_fingerprint")
+    for record in records:
+        record.pop("preprocessing_fingerprint")
+    cache.write_text("\n".join(json.dumps(value) for value in [metadata, *records]) + "\n")
+
+    _FakeEstimator.calls = 0
+    _, computed = enrich_pose_cache(
+        video, assignments, raw, cache, estimator_factory=lambda **_: _FakeEstimator(),
+        pose_work_dir=tmp_path / "empty-work",
+    )
+
+    assert computed == _FakeEstimator.calls == 2
+
+
+@pytest.mark.parametrize("verified_implementation", [True, False])
+def test_legacy_path_fingerprint_migrates_only_with_verified_backend_and_preprocessing(
+    tmp_path: Path, verified_implementation: bool,
+):
+    video, raw, assignments = _pose_recovery_fixture(tmp_path)
+    model, cache = tmp_path / "pose.task", tmp_path / "cache.jsonl"
+    model.write_bytes(b"same-model")
+    enrich_pose_cache(
+        video, assignments, raw, cache, pose_model_asset=model,
+        estimator_factory=lambda **_: _FakeEstimator(),
+    )
+    metadata, records = load_pose_cache(cache)
+    legacy_backend = dict(metadata["pose_backend"])
+    if not verified_implementation:
+        legacy_backend.pop("implementation_fingerprint")
+    legacy_payload = {**legacy_backend, "model_asset_sha256": hashlib.sha256(model.read_bytes()).hexdigest()}
+    legacy_fingerprint = "sha256:" + hashlib.sha256(
+        json.dumps(legacy_payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    metadata["pose_backend"] = legacy_backend
+    metadata["pose_model_fingerprint"] = legacy_fingerprint
+    for record in records:
+        record["pose_model_fingerprint"] = legacy_fingerprint
+    cache.write_text("\n".join(json.dumps(value) for value in [metadata, *records]) + "\n")
+
+    _FakeEstimator.calls = 0
+    _, computed = enrich_pose_cache(
+        video, assignments, raw, cache, pose_model_asset=model,
+        estimator_factory=lambda **_: _FakeEstimator(), pose_work_dir=tmp_path / "empty-work",
+    )
+
+    assert computed == _FakeEstimator.calls == (0 if verified_implementation else 2)
+
+
+def test_interpolated_import_without_raw_journal_recomputes_original_crops(tmp_path: Path):
+    video, raw, assignments = _pose_recovery_fixture(tmp_path)
+    cache = tmp_path / "cache.jsonl"
+    enrich_pose_cache(video, assignments, raw, cache, estimator_factory=lambda **_: _FakeEstimator())
+    metadata, records = load_pose_cache(cache)
+    records[0]["pose_landmarks"][0]["x"] = 0.99
+    records[0]["temporal_status"] = "rejected_jump_interpolated"
+    cache.write_text("\n".join(json.dumps(value) for value in [metadata, *records]) + "\n")
+
+    _FakeEstimator.calls = 0
+    active, computed = enrich_pose_cache(
+        video, assignments, raw, cache, estimator_factory=lambda **_: _FakeEstimator(),
+        pose_work_dir=tmp_path / "empty-work",
+    )
+
+    assert computed == _FakeEstimator.calls == 1
+    assert active[(0, 1, (2, 4, 6, 10))]["pose_landmarks"][0]["x"] == 0.5
+    assert len(load_pose_cache(cache)[1]) == 2
+
+
+@pytest.mark.parametrize("component", ["backend", "crop", "temporal", "assignment", "drawing"])
+def test_pose_recovery_tracks_inference_code_without_invalidating_for_consumers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, component: str,
+):
+    video, raw, assignments = _pose_recovery_fixture(tmp_path)
+    work = tmp_path / "work"
+    enrich_pose_cache(
+        video, assignments, raw, tmp_path / "first.jsonl", pose_work_dir=work,
+        estimator_factory=lambda **_: _FakeEstimator(),
+    )
+    if component == "backend":
+        original = pose_estimator.normalize_pose_landmarks
+
+        def normalize_pose_landmarks(landmarks):
+            return original(landmarks)
+
+        monkeypatch.setattr(pose_estimator, "normalize_pose_landmarks", normalize_pose_landmarks)
+    elif component == "crop":
+        original = player_interpretation.expand_pose_bbox
+
+        def expand_pose_bbox(*args, **kwargs):
+            box = original(*args, **kwargs)
+            box[0] = max(0, box[0] - 1)
+            return box
+
+        monkeypatch.setattr(player_interpretation, "expand_pose_bbox", expand_pose_bbox)
+    elif component == "temporal":
+        monkeypatch.setattr(player_interpretation, "TEMPORAL_JUMP_THRESHOLD", 0.05)
+    elif component == "assignment":
+        monkeypatch.setattr(player_interpretation, "COURT_MARGIN_METERS", 0.5)
+    else:
+        monkeypatch.setattr(pose_estimator, "POSE_CONNECTIONS", ((0, 1),))
+
+    _FakeEstimator.calls = 0
+    _, computed = enrich_pose_cache(
+        video, assignments, raw, tmp_path / "second.jsonl", pose_work_dir=work,
+        estimator_factory=lambda **_: _FakeEstimator(),
+    )
+
+    assert computed == _FakeEstimator.calls == (2 if component in {"backend", "crop"} else 0)
 
 
 def test_pose_fingerprint_normalizes_relative_and_absolute_model_paths(

@@ -277,8 +277,8 @@ def test_interrupted_stage_is_not_published_and_can_resume(pipeline, stage):
         / ("person_tracks.jsonl" if stage == "person" else "assignments.jsonl")
     ).exists()
     assert not (root / "rallies" / "run.manifest.json").exists()
-    assert not list((root / "players").glob(".person-*"))
-    assert not list((root / "players").glob(".players-*"))
+    assert not [path for path in (root / "players").glob(".person-*") if path.is_dir()]
+    assert not [path for path in (root / "players").glob(".players-*") if path.is_dir()]
     run_pipeline(**kwargs)
     assert calls == {"person": 1, "players": 1}
 
@@ -463,3 +463,407 @@ def test_new_catalog_cannot_overwrite_another_source_identity(pipeline):
     with pytest.raises(ValueError, match="different source"):
         run_pipeline(**different)
     assert identity_path.read_bytes() == before
+
+
+def test_manual_and_pipeline_stages_share_completion_policy(pipeline):
+    from src.workflow.extraction import resolve_source
+    from src.workflow.rally_pipeline import _calibrate
+    from src.workflow.stages import run_person_stage, run_player_stage
+
+    kwargs, calls = pipeline
+    source = resolve_source(
+        kwargs["catalog"],
+        source_id=kwargs["source_id"],
+        video=kwargs["video"],
+        output_dir=kwargs["output_dir"],
+    )
+    _calibrate(source, kwargs["calibration"], force=False)
+    manifest = json.loads(kwargs["model_manifest"].read_text())
+    assets = {
+        name: kwargs["model_manifest"].parent / item["filename"]
+        for name, item in manifest["assets"].items()
+    }
+    run_person_stage(
+        source,
+        model=assets["person_detector"],
+        device="cpu",
+        extractor=kwargs["person_extractor"],
+    )
+    run_player_stage(
+        source,
+        pose_model=assets["pose_landmarker"],
+        interpreter=kwargs["player_interpreter"],
+    )
+    run_pipeline(**kwargs)
+    assert calls == {"person": 1, "players": 1}
+
+
+def test_inference_edit_and_pose_backend_rebuild_preserve_person_cache(
+    pipeline, monkeypatch
+):
+    import src.workflow.stages as stages
+
+    kwargs, calls = pipeline
+    run_pipeline(**kwargs)
+    original_identity = stages.implementation_identity
+
+    def changed(stage):
+        return {
+            **original_identity(stage),
+            **({"revision": "new-inference"} if stage == "predict" else {}),
+        }
+
+    monkeypatch.setattr(stages, "implementation_identity", changed)
+    monkeypatch.setattr("src.workflow.rally_pipeline.implementation_identity", changed)
+    run_pipeline(**kwargs, rebuild=["predict"])
+    assert calls == {"person": 1, "players": 1}
+    run_pipeline(
+        **kwargs, pose_backend_identity="another-pose-backend", rebuild=["pose"]
+    )
+    assert calls == {"person": 1, "players": 2}
+
+
+def test_render_failure_keeps_predictions_and_retries_without_inference(
+    pipeline, monkeypatch
+):
+    import src.temporal_selector.rally_inference as inference
+
+    kwargs, calls = pipeline
+    original = inference.render_overlay
+
+    def fail(*args):
+        raise RuntimeError("encoder failed")
+
+    monkeypatch.setattr(inference, "render_overlay", fail)
+    with pytest.raises(RuntimeError, match="encoder failed"):
+        run_pipeline(**kwargs)
+    root = kwargs["output_dir"]
+    assert (root / "rallies" / "run.manifest.json").exists()
+    status = json.loads((root / "run-status.json").read_text())
+    assert status["stages"]["render"]["state"] == "failed"
+    monkeypatch.setattr(inference, "render_overlay", original)
+    monkeypatch.setattr(
+        inference,
+        "predict_source",
+        lambda *args, **kw: pytest.fail("inference repeated"),
+    )
+    run_pipeline(**kwargs)
+    assert calls == {"person": 1, "players": 1}
+
+
+def test_decoder_rebuild_uses_saved_probabilities(pipeline, monkeypatch):
+    import src.temporal_selector.rally_inference as inference
+
+    kwargs, calls = pipeline
+    run_pipeline(**kwargs)
+    monkeypatch.setattr(
+        inference,
+        "predict_source",
+        lambda *args, **kw: pytest.fail("inference repeated"),
+    )
+    result = run_pipeline(**kwargs, rebuild=["decode"])
+    assert result["overlay"].is_file()
+    assert calls == {"person": 1, "players": 1}
+
+
+def test_shared_observation_runner_reuses_both_branches_and_optional_outputs(
+    pipeline, monkeypatch
+):
+    from src.single_video.shuttle import ShuttleCandidateCollector
+    from src.workflow.extraction import run_extraction
+    import src.single_video.artifacts as artifacts
+
+    kwargs, calls = pipeline
+    root = kwargs["output_dir"].parent
+    models = root / "bundle"
+    for name in (
+        "models/TrackNet_torchscript.pt",
+        "src/TrackNetV3/ckpts/TrackNet_best.pt",
+    ):
+        path = models / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"tracknet")
+    manifest = json.loads(kwargs["model_manifest"].read_text())
+    assets = {
+        name: kwargs["model_manifest"].parent / item["filename"]
+        for name, item in manifest["assets"].items()
+    }
+    shuttle_calls = []
+
+    def shuttle(video, tracks, candidates):
+        shuttle_calls.append(video)
+        identity = inspect_source("generated", video)
+        collector = ShuttleCandidateCollector(
+            fps=6,
+            image_size=(128, 96),
+            heatmap_size=(2, 2),
+            checkpoint_sha256=sha256_file(
+                models / "src/TrackNetV3/ckpts/TrackNet_best.pt"
+            ),
+            inference_model_sha256=sha256_file(
+                models / "models/TrackNet_torchscript.pt"
+            ),
+            tracknet_config={"sequence_length": 3},
+            source_frame_range=(0, 8),
+        )
+        for frame in range(9):
+            collector.add(frame, np.zeros((2, 2), dtype=np.float32))
+        collector.write(candidates)
+        lines = candidates.read_text().splitlines()
+        header = json.loads(lines[0])
+        header["source_video_sha256"] = identity.video_sha256
+        candidates.write_text(json.dumps(header) + "\n" + "\n".join(lines[1:]) + "\n")
+        tracks.write_text(
+            "Frame,X,Y,Visibility\n" + "".join(f"{frame},0,0,0\n" for frame in range(9))
+        )
+
+    arguments = dict(
+        catalog=kwargs["catalog"],
+        source_id="generated",
+        video=kwargs["video"],
+        output_dir=kwargs["output_dir"],
+        calibration=kwargs["calibration"],
+        person_model=assets["person_detector"],
+        pose_model=assets["pose_landmarker"],
+        model_root=models,
+        device="cpu",
+        person_extractor=kwargs["person_extractor"],
+        player_interpreter=kwargs["player_interpreter"],
+        shuttle_extractor=shuttle,
+    )
+    result = run_extraction(**arguments)
+    before = result["manifest"].read_bytes()
+    assert run_extraction(**arguments) == result
+    assert len(shuttle_calls) == 1
+    assert calls == {"person": 1, "players": 1}
+
+    def fail(*args, **kw):
+        raise RuntimeError("preview encoder failed")
+
+    monkeypatch.setattr(artifacts, "render_player_preview", fail)
+    with pytest.raises(RuntimeError, match="preview encoder failed"):
+        run_extraction(**arguments, preview=True)
+    assert result["manifest"].read_bytes() == before
+    assert calls == {"person": 1, "players": 1}
+    assert len(shuttle_calls) == 1
+    zip_path = root / "portable.zip"
+    run_extraction(**arguments, export_zip=zip_path)
+    import zipfile
+
+    with zipfile.ZipFile(zip_path) as archive:
+        assert not any(
+            ".pose-work" in path or "publication" in path for path in archive.namelist()
+        )
+        assert any(path.endswith("source.json") for path in archive.namelist())
+
+
+def test_explicit_person_import_is_reused_without_loading_detector(pipeline):
+    from src.workflow.artifacts import import_artifact
+    from src.workflow.stages import run_person_stage
+
+    kwargs, calls = pipeline
+    run_pipeline(**kwargs)
+    source = kwargs["catalog"].select(["generated"])[0]
+    external = kwargs["output_dir"].parent / "imported-person-tracks.jsonl"
+    external.write_bytes(source.person_tracks_path.read_bytes())
+    import_artifact(source, "person-tracks", external, force=True)
+    # An explicitly imported source layer does not claim to be generated by a
+    # currently configured detector and needs no model download to reuse it.
+    assert not run_person_stage(source, model="nonexistent-detector.pt", device="cpu")
+    run_pipeline(**kwargs)
+    assert calls == {"person": 1, "players": 1}
+
+
+def test_tracknet_adapter_passes_verified_models_and_local_frame_domain(
+    pipeline, monkeypatch
+):
+    import sys
+    import types
+    import src.single_video.models as model_loader
+    import src.workflow.extraction as extraction
+    from src.single_video.shuttle import (
+        ShuttleCandidateCollector,
+        read_shuttle_candidates,
+    )
+
+    kwargs, _ = pipeline
+    kwargs["video"] = kwargs["video"].rename(kwargs["video"].with_suffix(".webm"))
+    source = extraction.resolve_source(
+        kwargs["catalog"],
+        source_id="generated",
+        video=kwargs["video"],
+        output_dir=kwargs["output_dir"],
+    )
+    staging = kwargs["output_dir"].parent / "staged-shuttle"
+    staging.mkdir()
+    models = {
+        "tracknet": object(),
+        "tracknet_checkpoint": "verified-checkpoint",
+        "tracknet_model": "verified-script",
+        "inpaintnet_enabled": False,
+    }
+    backend = types.ModuleType("TrackNetV3.predictArgs")
+    seen = []
+
+    def predict(**options):
+        assert options["reuse_models"] is models
+        assert options["num_workers"] == 0
+        assert options["video_file"] == str(source.video_path)
+        assert options["large_video"] and not options["output_video"]
+        seen.append(options)
+        directory = Path(options["save_dir"])
+        (directory / f"{source.video_path.name[:-4].lower()}_ball.csv").write_text(
+            "Frame,X,Y,Visibility\n" + "".join(f"{frame},0,0,0\n" for frame in range(9))
+        )
+        collector = ShuttleCandidateCollector(
+            fps=6,
+            image_size=(128, 96),
+            heatmap_size=(2, 2),
+            source_frame_range=(0, 8),
+            checkpoint_sha256="a" * 64,
+            inference_model_sha256="b" * 64,
+        )
+        for frame in range(9):
+            collector.add(frame, np.zeros((2, 2), dtype=np.float32))
+        collector.write(options["candidate_output_path"])
+
+    backend.run_prediction = predict
+
+    def child_process(command, **options):
+        package = types.ModuleType("TrackNetV3")
+        package.predictArgs = backend
+        with monkeypatch.context() as child:
+            child.setitem(sys.modules, "TrackNetV3", package)
+            child.setattr(sys, "argv", ["-c", *command[3:]])
+            child.setattr(model_loader, "load_track_models", lambda root: models)
+            exec(compile(command[2], "tracknet-adapter", "exec"), {})
+
+    monkeypatch.setattr(extraction.subprocess, "run", child_process)
+    tracks, candidates = staging / "tracks.csv", staging / "candidates.jsonl"
+    extraction._tracknet_adapter(
+        source,
+        tracks,
+        candidates,
+        model_root=staging,
+        batch_size=2,
+        num_workers=0,
+        device="cpu",
+    )
+    assert len(seen) == 1
+    assert backend.DEVICE == torch.device("cpu")
+    header, frames = read_shuttle_candidates(candidates)
+    assert header["source_id"] == "generated"
+    assert header["source_video_sha256"] == sha256_file(source.video_path)
+    assert header["checkpoint_sha256"] == "a" * 64
+    assert header["inference_model_sha256"] == "b" * 64
+    assert [frame["frame"] for frame in frames] == list(range(9))
+    assert tracks.is_file()
+
+
+def test_registration_preserves_parent_provenance_and_rejects_wrong_root(pipeline):
+    from dataclasses import replace
+    from src.workflow.extraction import resolve_source
+    from src.workflow.identity import ParentVideoProvenance
+
+    kwargs, _ = pipeline
+    source = resolve_source(
+        kwargs["catalog"],
+        source_id="generated",
+        video=kwargs["video"],
+        output_dir=kwargs["output_dir"],
+    )
+    identity = SourceIdentity.read(source.identity_path)
+    identity = replace(
+        identity,
+        parent_video=ParentVideoProvenance(
+            video_sha256="a" * 64,
+            start_time_seconds=120,
+            end_time_seconds=122,
+            handling="trim",
+        ),
+    )
+    identity.write(source.identity_path)
+    original = source.identity_path.read_bytes()
+    assert (
+        resolve_source(
+            kwargs["catalog"],
+            source_id="generated",
+            video=kwargs["video"],
+            output_dir=kwargs["output_dir"],
+        )
+        == source
+    )
+    another_catalog = SourceCatalog(
+        kwargs["output_dir"].parent / "another-catalog.json"
+    )
+    assert (
+        another_catalog.add(
+            kwargs["video"], source_id="generated", output_dir=kwargs["output_dir"]
+        )
+        == source
+    )
+    assert source.identity_path.read_bytes() == original
+    with pytest.raises(ValueError, match="different source identity"):
+        SourceCatalog(kwargs["output_dir"].parent / "wrong-catalog.json").add(
+            kwargs["video"], source_id="another-id", output_dir=kwargs["output_dir"]
+        )
+    assert source.identity_path.read_bytes() == original
+
+
+def test_status_reports_committed_pose_work_after_interruption(pipeline, capsys):
+    from src.workflow.__main__ import main
+
+    kwargs, _ = pipeline
+
+    def interrupt(
+        video,
+        person,
+        calibration,
+        poses,
+        assignments,
+        features,
+        *,
+        pose_model_asset,
+        pose_crop_padding,
+        pose_work_dir,
+        pose_backend_identity,
+    ):
+        unit = pose_work_dir / "raw" / "backend" / "preprocessing" / "observation.json"
+        unit.parent.mkdir(parents=True)
+        unit.write_text(
+            json.dumps(
+                {
+                    "frame": 3,
+                    "track_id": 7,
+                    "raw_artifact_fingerprint": "raw",
+                    "pose_model_fingerprint": "model",
+                    "preprocessing_fingerprint": "preprocessing",
+                }
+            )
+        )
+        # Abandoned temporary files are never counted as committed observations.
+        (unit.parent / ".interrupted.tmp").write_text("partial")
+        raise RuntimeError("interrupted after commit")
+
+    with pytest.raises(RuntimeError, match="after commit"):
+        run_pipeline(**{**kwargs, "player_interpreter": interrupt})
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                "--catalog",
+                str(kwargs["catalog"].path),
+                "source",
+                "status",
+                "--source",
+                "generated",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    stage = json.loads(capsys.readouterr().out)[0]["run"]["stages"]["pose"]
+    assert stage["state"] == "failed"
+    assert stage["committed_work"]["retained_unit_count"] == 1
+    assert stage["committed_work"]["last_committed_unit"]["frame"] == 3
+    assert stage["committed_work"]["last_committed_unit"]["track_id"] == 7

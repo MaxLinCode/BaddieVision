@@ -206,7 +206,6 @@ def test_load_track_models_loads_inpaintnet_only_when_enabled(
     for relative in (
         "models/TrackNet_torchscript.pt",
         "models/InpaintNet_torchscript.pt",
-        "InPlay/models/player.pt",
         "src/TrackNetV3/ckpts/TrackNet_best.pt",
         "src/TrackNetV3/ckpts/InpaintNet_best.pt",
     ):
@@ -350,26 +349,3 @@ def test_metadata_includes_inpaintnet_provenance_only_when_enabled(
     assert model_info["inpaintnet_enabled"] is True
     assert model_info["tracking_stage"] == "tracknet_inpaintnet"
     assert model_info["inpaintnet_checkpoint"] == "/models/inpaint.pt"
-
-
-@pytest.mark.parametrize(
-    "notebook_name",
-    [
-        "Single_Video_Feature_Extraction_Colab.ipynb",
-        "Single_Video_Feature_Extraction_Kaggle.ipynb",
-        "Single_Video_Feature_Extraction_Local.ipynb",
-    ],
-)
-def test_supported_notebooks_default_to_tracknet_only(notebook_name: str) -> None:
-    notebook_path = Path(__file__).parents[1] / "notebooks" / notebook_name
-    notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
-    source = "".join(
-        line
-        for cell in notebook["cells"]
-        for line in cell.get("source", [])
-    )
-
-    assert "USE_INPAINTNET = False" in source
-    assert "load_track_models(REPO_DIR, use_inpaintnet=USE_INPAINTNET)" in source
-    assert 'models["inpaintnet"]' not in source
-    assert "reuse_models=models" in source

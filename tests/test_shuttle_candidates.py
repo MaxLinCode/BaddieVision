@@ -333,33 +333,6 @@ def test_exact_candidate_retention_recall_uses_present_denominator(tmp_path: Pat
     assert report["maximum_candidates_per_frame"] == 7
 
 
-def test_notebooks_forward_tracknet_model_provenance() -> None:
-    notebook_dir = Path(__file__).parents[1] / "notebooks"
-    for variant in ("Local", "Colab", "Kaggle"):
-        notebook = json.loads((notebook_dir / f"Single_Video_Feature_Extraction_{variant}.ipynb").read_text(encoding="utf-8"))
-        source = "".join(line for cell in notebook["cells"] for line in cell.get("source", []))
-        # The complete conditional bundle carries TrackNet provenance through
-        # the same reuse path and includes InpaintNet only on explicit opt-in.
-        assert "models = load_track_models(REPO_DIR, use_inpaintnet=USE_INPAINTNET)" in source
-        assert "reuse_models=models" in source
-    predict_source = (Path(__file__).parents[1] / "src" / "TrackNetV3" / "predictArgs.py").read_text(encoding="utf-8")
-    assert "CAP_PROP_FRAME_COUNT" in predict_source
-    assert "source_frame_range=candidate_source_range" in predict_source
-
-
-def test_all_single_video_notebooks_bundle_layered_shuttle_artifacts() -> None:
-    notebook_dir = Path(__file__).parents[1] / "notebooks"
-    for variant in ("Local", "Colab", "Kaggle"):
-        notebook = json.loads((notebook_dir / f"Single_Video_Feature_Extraction_{variant}.ipynb").read_text(encoding="utf-8"))
-        source = "".join(line for cell in notebook["cells"] for line in cell.get("source", []))
-        assert "shuttle_candidates.jsonl" in source
-        assert "shuttle_tracklets.jsonl" in source
-        assert "shuttle_hypotheses.jsonl" in source
-        assert "candidate_output_path=str(candidates_path)" in source
-        assert "link_shuttle_candidates(candidates_path, tracklets_path)" in source
-        assert "link_shuttle_hypotheses(candidates_path, tracklets_path, hypotheses_path)" in source
-
-
 def test_hypothesis_decoder_is_replayable_validates_inputs_and_preserves_raw_layers(tmp_path: Path) -> None:
     candidates, tracklets = _write_hypothesis_inputs(tmp_path, [("t0", [(0, 10, 10, 0.8)]), ("t1", [(1, 10, 10, 0.9)])])
     before = (candidates.read_bytes(), tracklets.read_bytes())

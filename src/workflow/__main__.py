@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import subprocess
 from pathlib import Path
 
 from .registry import SourceCatalog
@@ -62,10 +63,14 @@ def _parser() -> argparse.ArgumentParser:
     people.add_argument("--source", required=True)
     people.add_argument("--model", default="yolov8n.pt")
     people.add_argument("--force", action="store_true")
+    people.add_argument(
+        "--device", choices=("auto", "cpu", "mps", "cuda"), default="auto"
+    )
     players = stage_commands.add_parser("players")
     players.add_argument("--source", required=True)
     players.add_argument("--pose-model", type=Path)
     players.add_argument("--force", action="store_true")
+    players.add_argument("--pose-crop-padding", type=float, default=0.20)
     check = stage_commands.add_parser("check")
     check.add_argument("--source", required=True)
     check.add_argument(
@@ -79,6 +84,36 @@ def _parser() -> argparse.ArgumentParser:
             "player-poses",
         ),
     )
+
+    extract = commands.add_parser(
+        "extract", help="shared local and cloud observation extraction"
+    )
+    extraction_inputs = extract.add_mutually_exclusive_group(required=True)
+    extraction_inputs.add_argument("--source")
+    extraction_inputs.add_argument("--video", type=Path)
+    extract.add_argument("--source-id")
+    extract.add_argument("--output-dir", type=Path)
+    extract.add_argument("--calibration", type=Path)
+    extract.add_argument(
+        "--profile", choices=("observations", "rally"), default="observations"
+    )
+    extract.add_argument("--person-model", default="yolov8n.pt")
+    extract.add_argument("--pose-model", type=Path)
+    extract.add_argument("--model-root", type=Path)
+    extract.add_argument(
+        "--device", choices=("auto", "cpu", "mps", "cuda"), default="auto"
+    )
+    extract.add_argument("--batch-size", type=int, default=16)
+    extract.add_argument("--num-workers", type=int, default=0)
+    extract.add_argument(
+        "--rebuild",
+        action="append",
+        default=[],
+        choices=("person", "pose", "shuttle", "shuttle-links", "preview", "export"),
+    )
+    extract.add_argument("--preview", action="store_true")
+    extract.add_argument("--export-zip", type=Path)
+    extract.add_argument("--force", action="store_true")
 
     annotate = commands.add_parser("annotate")
     annotate.add_argument("--annotator", required=True)
@@ -129,6 +164,12 @@ def _parser() -> argparse.ArgumentParser:
     predict.add_argument("--batch-size", type=int, default=16)
     predict.add_argument("--no-overlay", action="store_true")
     predict.add_argument("--force", action="store_true")
+    predict.add_argument(
+        "--rebuild",
+        action="append",
+        default=[],
+        choices=("person", "pose", "predict", "decode", "render"),
+    )
     pseudo = rally_commands.add_parser("pseudo-label")
     pseudo.add_argument("--source", required=True)
     pseudo.add_argument("--teacher", type=Path, required=True)
@@ -149,6 +190,8 @@ def _load_or_create(path: Path) -> SourceCatalog:
 def _status_mapping(
     catalog: SourceCatalog, source_ids: list[str] | None
 ) -> list[dict[str, object]]:
+    from .stages import read_run_status
+
     rows = []
     for source in catalog.select(source_ids):
         status = catalog.status(source)
@@ -168,6 +211,7 @@ def _status_mapping(
                 "experiment_ready": status.experiment_ready,
                 "rally_ready": status.rally_ready,
                 "problems": list(status.problems),
+                "run": read_run_status(source),
             }
         )
     return rows
@@ -176,6 +220,42 @@ def _status_mapping(
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     catalog = _load_or_create(args.catalog)
+    if args.command == "extract":
+        from .extraction import run_extraction
+
+        if args.source and args.source_id:
+            raise ValueError("--source-id applies only to --video")
+        try:
+            outputs = run_extraction(
+                catalog,
+                source_id=args.source or args.source_id,
+                video=args.video,
+                output_dir=args.output_dir,
+                calibration=args.calibration,
+                profile=args.profile,
+                person_model=args.person_model,
+                pose_model=args.pose_model,
+                model_root=args.model_root,
+                device=args.device,
+                batch_size=args.batch_size,
+                num_workers=args.num_workers,
+                rebuild=args.rebuild,
+                force=args.force,
+                preview=args.preview,
+                export_zip=args.export_zip,
+            )
+        except (
+            OSError,
+            ValueError,
+            KeyError,
+            RuntimeError,
+            subprocess.CalledProcessError,
+        ) as exc:
+            print(f"extraction failed: {exc}", file=sys.stderr)
+            return 2
+        for name, path in outputs.items():
+            print(f"{name}: {path}")
+        return 0
     if args.command == "rally" and args.rally_command == "predict":
         from .rally_pipeline import run_pipeline
 
@@ -196,6 +276,7 @@ def main(argv: list[str] | None = None) -> int:
                 batch_size=args.batch_size,
                 overlay=not args.no_overlay,
                 force=args.force,
+                rebuild=args.rebuild,
             )
         except (OSError, ValueError, KeyError, RuntimeError) as exc:
             print(f"rally prediction failed: {exc}", file=sys.stderr)
@@ -239,6 +320,22 @@ def main(argv: list[str] | None = None) -> int:
                     print(
                         f"  {field.replace('_', ' '):18} {'ready' if row[field] else 'missing'}"
                     )
+                if row.get("run"):
+                    for name, stage in row["run"]["stages"].items():
+                        print(
+                            f"  stage {name:12} {stage['state']} {stage.get('reason', '')}"
+                        )
+                        if name == "pose" and stage.get("committed_work"):
+                            progress = stage["committed_work"]
+                            unit = progress.get("last_committed_unit")
+                            last = (
+                                f"; latest frame {unit['frame']}, track {unit['track_id']}"
+                                if unit
+                                else ""
+                            )
+                            print(
+                                f"    {progress['retained_unit_count']} retained pose units{last}"
+                            )
                 for problem in row["problems"]:
                     print(f"  problem: {problem}")
         return 0
@@ -278,46 +375,27 @@ def main(argv: list[str] | None = None) -> int:
             print(register_native_calibration(source, source_frame=selected_frame))
             return 0
         if args.stage_command == "person-tracks":
-            from InPlay.heuristic.person_tracks import extract_person_tracks
+            from .stages import run_person_stage
+            from .rally_pipeline import select_device
 
-            if source.person_tracks_path.exists() and not args.force:
-                raise FileExistsError(
-                    f"person tracks already exist: {source.person_tracks_path}"
-                )
-            source.person_tracks_path.parent.mkdir(parents=True, exist_ok=True)
-            extract_person_tracks(
-                source.video_path, source.person_tracks_path, args.model
+            run_person_stage(
+                source,
+                model=args.model,
+                device=select_device(args.device),
+                force=args.force,
             )
             print(source.person_tracks_path)
             return 0
         if args.stage_command == "players":
-            from InPlay.heuristic.player_interpretation import interpret_players
+            from .stages import run_player_stage
 
-            if source.assignments_path.exists() and not args.force:
-                raise FileExistsError(
-                    f"player assignments already exist: {source.assignments_path}"
-                )
-            if not source.person_tracks_path.is_file():
-                raise FileNotFoundError(
-                    f"person tracks are missing: {source.person_tracks_path}"
-                )
-            if not source.calibration_path.is_file():
-                raise FileNotFoundError(
-                    f"canonical calibration is missing: {source.calibration_path}"
-                )
-            source.assignments_path.parent.mkdir(parents=True, exist_ok=True)
-            assignments, computed = interpret_players(
-                source.video_path,
-                source.person_tracks_path,
-                source.calibration_path,
-                source.pose_cache_path,
-                source.assignments_path,
-                source.artifact_root / "players" / "features.csv",
-                pose_model_asset=args.pose_model,
+            run_player_stage(
+                source,
+                pose_model=args.pose_model,
+                pose_crop_padding=args.pose_crop_padding,
+                force=args.force,
             )
-            print(
-                f"{source.source_id}: {len(assignments)} assignment frames; {computed} poses computed"
-            )
+            print(source.assignments_path)
             return 0
         status = catalog.status(source)
         artifact_state = {

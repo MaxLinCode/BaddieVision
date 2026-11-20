@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import ast
+import hashlib
 import importlib.metadata
+import inspect
+import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Literal
@@ -93,6 +97,19 @@ def pose_connections() -> tuple[tuple[int, int], ...]:
     return POSE_CONNECTIONS
 
 
+def pose_backend_implementation_fingerprint() -> str:
+    """Identify the inference adapter independently of drawing and model paths."""
+    components = (
+        PoseLandmark, PoseEstimate, _normalize_running_mode, _landmark_value,
+        normalize_pose_landmarks, MediaPipeTasksPoseEstimator, create_pose_estimator,
+    )
+    implementation = "\n".join(
+        ast.dump(ast.parse(textwrap.dedent(inspect.getsource(component))), include_attributes=False)
+        for component in components
+    )
+    return "sha256:" + hashlib.sha256(implementation.encode()).hexdigest()
+
+
 def pose_backend_info(model_asset_path: str | Path | None = None) -> dict[str, str]:
     try:
         package_version = importlib.metadata.version("mediapipe")
@@ -103,6 +120,7 @@ def pose_backend_info(model_asset_path: str | Path | None = None) -> dict[str, s
         "package": "mediapipe",
         "package_version": package_version,
         "model_asset_path": str(model_asset_path or DEFAULT_POSE_MODEL_PATH),
+        "implementation_fingerprint": pose_backend_implementation_fingerprint(),
     }
 
 

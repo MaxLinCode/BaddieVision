@@ -78,7 +78,8 @@ def test_artifact_import_copies_without_touching_legacy_file(tmp_path: Path) -> 
     legacy = tmp_path / "person_tracks.jsonl"
     original = json.dumps({
         "type": "metadata", "schema": "person_tracks", "schema_version": 1,
-        "frame_count": 100,
+        "frame_count": 100, "frame_size": [identity.width, identity.height],
+        "fps": identity.fps_numerator / identity.fps_denominator,
     }) + "\n"
     legacy.write_text(original)
 
