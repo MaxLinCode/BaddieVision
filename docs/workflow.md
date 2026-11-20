@@ -172,7 +172,9 @@ prediction. Use the same model, device, and crop settings when combining manual
 and automatic stages. Explicit person-track imports receive a validated import
 receipt and act as a supplied source layer until explicitly rebuilt. Imported
 pose records are reused only when their observation/model/preprocessing keys
-match. Never silently adopt an unreceipted generated artifact.
+match. Before using person tracks, the players stage verifies their hash and
+source identity against the person-track receipt. Import or regenerate older
+tracks that lack a receipt.
 
 Each stage checks its own inputs, relevant implementation, model bytes, runtime
 packages, and output hashes. Stale or corrupt artifacts require an explicit
@@ -191,8 +193,9 @@ are committed incrementally under `players/.pose-work/`, including source,
 frame, track, box, model/backend, and preprocessing identity. Restarting a failed
 player stage reuses matching crops. Pose snapshots publish atomically. Final
 outputs and their receipts use a recoverable publication journal; interrupted
-publication restores the previous bundle on the next run. Human annotation
-files are never extraction outputs.
+publication restores the previous bundle on the next run when it stopped
+before commit. Recovery reports the outcome and receipt path on stderr.
+Human annotation files are never extraction outputs.
 
 Optional `--preview` and `--export-zip /durable/result.zip` run after observations
 complete. Preview failure leaves completed observations usable. Exports contain
