@@ -1,0 +1,266 @@
+#!/usr/bin/env python3
+"""Submit isolated source snapshots to a home Linux GPU over SSH."""
+import argparse
+import datetime as dt
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import shlex
+import subprocess
+import sys
+import tarfile
+import tempfile
+import uuid
+
+ROOT = Path(__file__).resolve().parents[1]
+SSH_OPTIONS = ['-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
+               '-o', 'ClearAllForwardings=yes']
+
+
+def uses_wsl(host):
+    return os.environ.get('BV_GPU_TRANSPORT', 'wsl' if host == 'avalanche' else 'native') == 'wsl'
+
+
+def windows_python(payload):
+    # No whitespace or double quotes in the Python argument: the Windows SSH
+    # batch wrapper and cmd.exe otherwise disagree about nested quoting.
+    return ("wsl.exe --cd ~ --exec python3 -c "
+            "exec(__import__('base64').b64decode('" + payload + "'))")
+
+
+def ssh(host, command, *, windows_command=False, **kwargs):
+    if uses_wsl(host) and not windows_command:
+        import base64
+        program = "import os\nos.execl('/bin/bash','bash','-lc'," + repr(command) + ")"
+        command = windows_python(base64.b64encode(program.encode()).decode())
+    return subprocess.run(['ssh', *SSH_OPTIONS, host, command], check=True, **kwargs)
+
+
+def remote_python(host, code, *args, **kwargs):
+    # One double-quoted argument survives the Windows SSH wrapper. The payload
+    # itself is base64, avoiding nested Windows/POSIX quoting of Python source.
+    import base64
+    program = 'import sys\nsys.argv = ' + repr(['remote', *map(str, args)]) + '\n' + code
+    payload = base64.b64encode(program.encode()).decode()
+    bootstrap = "import base64;exec(base64.b64decode('" + payload + "'))"
+    if uses_wsl(host):
+        return ssh(host, windows_python(payload), windows_command=True, **kwargs)
+    command = 'python3 -c ' + shlex.quote(bootstrap)
+    return ssh(host, command, **kwargs)
+
+
+def launch_windows_job(host, job_dir, job):
+    import base64
+    def literal(value):
+        return "'" + value.replace("'", "''") + "'"
+    task_name = 'BaddieVision-' + job
+    arguments = subprocess.list2cmdline(['--cd', '~', '--exec', '/bin/bash', job_dir + '/run.sh'])
+    script = (
+        "$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue';"
+        "$name=" + literal(task_name) + ";"
+        "if(Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue){throw 'Task already exists'};"
+        "$action=New-ScheduledTaskAction -Execute 'C:\\Windows\\System32\\wsl.exe' -Argument " + literal(arguments) + ";"
+        "$principal=New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType S4U -RunLevel Limited;"
+        "$settings=New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries;"
+        "Register-ScheduledTask -TaskName $name -Action $action -Principal $principal -Settings $settings -Description 'BaddieVision GPU job' | Out-Null;"
+        "Start-ScheduledTask -TaskName $name"
+    )
+    encoded = base64.b64encode(script.encode('utf-16le')).decode()
+    ssh(host, 'powershell.exe -NoProfile -NonInteractive -EncodedCommand ' + encoded,
+        windows_command=True)
+
+
+def source_files(root):
+    result = subprocess.check_output(
+        ['git', '-C', str(root), 'ls-files', '-z', '--cached', '--others', '--exclude-standard'])
+    for raw in result.split(b'\0'):
+        if not raw:
+            continue
+        path = root / os.fsdecode(raw)
+        if path.is_dir() and not path.is_symlink():
+            # Git submodules have their own tracked/untracked file inventory.
+            if (path / '.git').exists():
+                yield from source_files(path)
+        elif path.exists() or path.is_symlink():
+            yield path
+
+
+def snapshot(destination):
+    with tarfile.open(fileobj=destination, mode='w') as archive:
+        for path in sorted(set(source_files(ROOT))):
+            archive.add(path, arcname=path.relative_to(ROOT).as_posix(), recursive=False)
+
+
+PREPARE = r'''
+import json, pathlib, sys
+base = pathlib.Path(sys.argv[1]).expanduser().resolve()
+if not (base / '.venv/bin/python').is_file():
+    raise SystemExit('Missing remote virtualenv: ' + str(base / '.venv'))
+job = base / '.remote-gpu/jobs' / sys.argv[2]
+job.mkdir(parents=True, exist_ok=False)
+(job / 'workspace').mkdir()
+print(job)
+'''
+
+LAUNCH = r'''
+import json, os, pathlib, shlex, subprocess, sys
+base = pathlib.Path(sys.argv[1]).expanduser().resolve()
+job = base / '.remote-gpu/jobs' / sys.argv[2]
+work = job / 'workspace'
+command = json.loads(sys.argv[3])
+# Reuse large input directories; each job has fresh code and its own outputs.
+for relative in ['videos', 'clips', 'features', 'clip_features', 'models',
+                 'InPlay/videos', 'InPlay/features', 'InPlay/clip_features',
+                 'InPlay/data', 'InPlay/models', 'src/TrackNetV3/ckpts']:
+    source, target = base / relative, work / relative
+    if source.exists() and not target.exists():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.symlink_to(source, target_is_directory=True)
+for source in (base / 'config').glob('*.local*.json'):
+    target = work / 'config' / source.name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if not target.exists():
+        target.symlink_to(source)
+(work / '.venv').symlink_to(base / '.venv', target_is_directory=True)
+metadata = {'id': sys.argv[2], 'command': command, 'workspace': str(work)}
+(job / 'job.json').write_text(json.dumps(metadata, indent=2) + '\n')
+script = ('#!/bin/bash\n'
+          + 'echo $$ > ' + shlex.quote(str(job / 'pid')) + '\n'
+          + 'cd ' + shlex.quote(str(work)) + ' || exit 1\n'
+          + 'export PATH=' + shlex.quote(str(base / '.venv/bin')) + ':"$PATH"\n'
+          + 'export PYTHONUNBUFFERED=1\n'
+          + 'date -u +%FT%TZ > ' + shlex.quote(str(job / 'started')) + '\n'
+          + shlex.join(command) + ' > ' + shlex.quote(str(job / 'job.log')) + ' 2>&1\n'
+          + 'result=$?\n'
+          + 'printf "%s\\n" "$result" > ' + shlex.quote(str(job / 'exit-code.tmp')) + '\n'
+          + 'mv ' + shlex.quote(str(job / 'exit-code.tmp')) + ' ' + shlex.quote(str(job / 'exit-code')) + '\n'
+          + 'exit "$result"\n')
+(job / 'run.sh').write_text(script)
+if sys.argv[4] == 'native':
+    subprocess.run(['tmux', 'new-session', '-d', '-s', 'bv-' + sys.argv[2],
+                    'bash ' + shlex.quote(str(job / 'run.sh'))], check=True)
+print(sys.argv[2])
+'''
+
+INSPECT = r'''
+import json, pathlib, subprocess, sys
+base = pathlib.Path(sys.argv[1]).expanduser().resolve()
+root = base / '.remote-gpu/jobs'
+jobs = [root / sys.argv[2]] if sys.argv[2] else sorted(root.glob('*'))
+for job in jobs:
+    if not (job / 'job.json').is_file():
+        continue
+    meta = json.loads((job / 'job.json').read_text())
+    if (job / 'exit-code').exists():
+        code = (job / 'exit-code').read_text().strip()
+        state = 'succeeded' if code == '0' else 'failed (exit ' + code + ')'
+    else:
+        live = subprocess.run(['tmux', 'has-session', '-t', 'bv-' + job.name],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        active = live.returncode == 0
+        try:
+            pid = int((job / 'pid').read_text())
+            argv = pathlib.Path('/proc') / str(pid) / 'cmdline'
+            active = active or str(job / 'run.sh').encode() in argv.read_bytes().split(b'\0')
+        except (OSError, ValueError):
+            pass
+        state = 'running' if active else 'interrupted'
+    print(job.name + '\t' + state + '\t' + json.dumps(meta['command']))
+'''
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--host', default=os.environ.get('BV_GPU_HOST', 'avalanche'))
+    parser.add_argument('--remote-dir', default=os.environ.get('BV_GPU_DIR', '~/code/BaddieVision'))
+    sub = parser.add_subparsers(dest='action', required=True)
+    sub.add_parser('doctor')
+    submit = sub.add_parser('submit')
+    submit.add_argument('command', nargs=argparse.REMAINDER)
+    status = sub.add_parser('status')
+    status.add_argument('job', nargs='?', default='')
+    logs = sub.add_parser('logs')
+    logs.add_argument('job')
+    logs.add_argument('--follow', '-f', action='store_true')
+    fetch = sub.add_parser('fetch')
+    fetch.add_argument('job')
+    fetch.add_argument('--path', default='outputs', help='Directory within the job workspace')
+    fetch.add_argument('--destination', type=Path)
+    args = parser.parse_args()
+    if getattr(args, 'job', '') and not re.fullmatch(r'[0-9]{8}T[0-9]{6}-[a-f0-9]{8}', args.job):
+        parser.error('Invalid job ID')
+    if args.action == 'doctor':
+        remote_python(args.host, '''
+import pathlib, shutil, subprocess, sys
+base = pathlib.Path(sys.argv[1]).expanduser().resolve()
+print('Remote checkout:', base, flush=True)
+for tool in ['tmux', 'tar', 'nvidia-smi']:
+    print(tool + ': ' + str(shutil.which(tool)), flush=True)
+    if not shutil.which(tool): raise SystemExit(1)
+subprocess.run(['nvidia-smi', '-L'], check=True)
+subprocess.run([str(base / '.venv/bin/python'), '-c',
+    'import torch; print("PyTorch:", torch.__version__); print("CUDA:", torch.cuda.is_available()); assert torch.cuda.is_available(); print(torch.cuda.get_device_name(0))'], check=True)
+''', args.remote_dir)
+    elif args.action == 'submit':
+        command = args.command
+        if command[:1] == ['--']:
+            command = command[1:]
+        if not command:
+            parser.error('Provide a command after submit --')
+        job = dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%S-') + uuid.uuid4().hex[:8]
+        with tempfile.TemporaryFile() as archive:
+            snapshot(archive)
+            archive.seek(0)
+            result = remote_python(args.host, PREPARE, args.remote_dir, job, capture_output=True, text=True)
+            job_dir = result.stdout.strip()
+            if not job_dir.startswith('/') or '\n' in job_dir:
+                raise RuntimeError('Remote preparation returned an invalid path: ' + repr(job_dir))
+            ssh(args.host, 'tar -xf - -C ' + shlex.quote(job_dir + '/workspace'), stdin=archive)
+        remote_python(args.host, LAUNCH, args.remote_dir, job, json.dumps(command),
+                      'wsl' if uses_wsl(args.host) else 'native')
+        if uses_wsl(args.host):
+            launch_windows_job(args.host, job_dir, job)
+    elif args.action == 'status':
+        remote_python(args.host, INSPECT, args.remote_dir, args.job)
+    elif args.action == 'logs':
+        remote_python(args.host, '''
+import os, pathlib, sys
+job = pathlib.Path(sys.argv[1]).expanduser() / '.remote-gpu/jobs' / sys.argv[2]
+os.execvp('tail', ['tail', '-n', '100'] + (['-F'] if sys.argv[3] == 'yes' else []) + [str(job / 'job.log')])
+''', args.remote_dir, args.job, 'yes' if args.follow else 'no')
+    elif args.action == 'fetch':
+        relative = PurePosixPath(args.path)
+        if relative.is_absolute() or '..' in relative.parts or str(relative) == '.':
+            parser.error('--path must be a relative directory within the workspace')
+        destination = args.destination or ROOT / 'outputs/remote-gpu' / args.job
+        destination.mkdir(parents=True, exist_ok=True)
+        # Download only the selected directory. Reject links and traversal on extraction.
+        with tempfile.TemporaryFile() as archive:
+            remote_python(args.host, '''
+import os, pathlib, sys
+work = pathlib.Path(sys.argv[1]).expanduser() / '.remote-gpu/jobs' / sys.argv[2] / 'workspace'
+path = work / sys.argv[3]
+if not path.is_dir(): raise SystemExit('Missing output directory: ' + str(path))
+os.execvp('tar', ['tar', '-cf', '-', '-C', str(path), '.'])
+''', args.remote_dir, args.job, str(relative), stdout=archive)
+            archive.seek(0)
+            with tarfile.open(fileobj=archive) as bundle:
+                for member in bundle.getmembers():
+                    if not (member.isfile() or member.isdir()):
+                        raise RuntimeError('Refusing output archive containing links or special files')
+                    target = (destination / member.name).resolve()
+                    if not target.is_relative_to(destination.resolve()):
+                        raise RuntimeError('Unsafe output archive path')
+                bundle.extractall(destination, filter='data')
+        print(destination)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except (subprocess.CalledProcessError, OSError, RuntimeError) as exc:
+        print('gpu: ' + str(exc), file=sys.stderr)
+        sys.exit(1)
