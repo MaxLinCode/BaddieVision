@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import csv
 import hashlib
+import inspect
 import json
+import os
+import tempfile
+import textwrap
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,6 +40,9 @@ MIN_CENTER_ACCESS = 0.10
 MIN_TOTAL_SCORE = 0.35
 SCORE_TOLERANCE = 0.08
 HANDOFF_MIN_DETECTION_CONFIDENCE = 0.35
+RELIABLE_ASSIGNMENT_CONFIDENCE = 0.60
+REPLACEMENT_GUARD_MIN_OCCUPANCY = 0.50
+REACQUISITION_MAX_AGE_SECONDS = 0.50
 HANDOFF_MIN_BOX_IOU = 0.10
 HANDOFF_MAX_IMAGE_FOOT_DISPLACEMENT_RATIO = 0.08
 HANDOFF_MAX_COURT_FOOT_DISPLACEMENT_METERS = 1.25
@@ -59,6 +67,27 @@ class Candidate:
     occupancy_ratio: float
     mean_confidence: float
     score: float
+
+
+@dataclass(frozen=True)
+class AssignmentPolicy:
+    replacement_guard: bool = True
+    same_id_reacquisition: bool = False
+
+    def metadata(self) -> dict[str, Any]:
+        return {
+            "replacement_guard": {
+                "enabled": self.replacement_guard,
+                "incumbent_min_mean_confidence": RELIABLE_ASSIGNMENT_CONFIDENCE,
+                "incumbent_min_occupancy_ratio": REPLACEMENT_GUARD_MIN_OCCUPANCY,
+                "challenger_min_mean_confidence": HANDOFF_MIN_DETECTION_CONFIDENCE,
+            },
+            "same_id_reacquisition": {
+                "enabled": self.same_id_reacquisition,
+                "min_detection_confidence": RELIABLE_ASSIGNMENT_CONFIDENCE,
+                "max_age_seconds": REACQUISITION_MAX_AGE_SECONDS,
+            },
+        }
 
 
 def load_calibration(path: str | Path, frame_size: tuple[int, int]) -> CourtHomography:
@@ -231,12 +260,16 @@ def _choose_track_handoff(
 def assign_singles_slots(
     observations: list[dict[str, Any]], homography: CourtHomography, frame_count: int, fps: float,
     *, frame_size: tuple[int, int] | None = None,
+    policy: AssignmentPolicy = AssignmentPolicy(),
 ) -> list[dict[str, Any]]:
     """Assign near P1/far P2 periodically while treating raw IDs as fragments."""
     projected = [_project_observation(item, homography) for item in observations]
     by_frame: dict[int, dict[int, dict[str, Any]]] = defaultdict(dict)
+    evidence_by_frame: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for item in projected:
-        by_frame[int(item["frame"])][int(item["track_id"])] = item
+        frame = int(item["frame"])
+        by_frame[frame][int(item["track_id"])] = item
+        evidence_by_frame[frame].append(item)
     periods: list[tuple[int, int, dict[int, dict[str, Any]]]] = []
     incumbents: dict[int, int | None] = {1: None, 2: None}
     if fps <= 0:
@@ -249,14 +282,33 @@ def assign_singles_slots(
         evidence_end = min(frame_count, center + (evidence_window + 1) // 2)
         occupancy_start = max(0, center - occupancy_window // 2)
         occupancy_end = min(frame_count, center + (occupancy_window + 1) // 2)
+        evidence = [
+            item
+            for frame in range(evidence_start, evidence_end)
+            for item in evidence_by_frame.get(frame, ())
+        ]
         chosen: dict[int, dict[str, Any]] = {}
         excluded: set[int] = set()
         for slot in (1, 2):
             candidates = _rank_candidates(
-                projected, evidence_start, evidence_end, occupancy_start, occupancy_end,
+                evidence, evidence_start, evidence_end, occupancy_start, occupancy_end,
                 slot, excluded, fps,
             )
             track_id, reason, confidence, details = _choose_candidate(candidates, incumbents[slot])
+            incumbent = next((item for item in candidates if item.track_id == incumbents[slot]), None)
+            if (
+                policy.replacement_guard
+                and incumbent is not None
+                and incumbent.mean_confidence >= RELIABLE_ASSIGNMENT_CONFIDENCE
+                and incumbent.occupancy_ratio >= REPLACEMENT_GUARD_MIN_OCCUPANCY
+            ):
+                eligible = [
+                    item for item in candidates
+                    if item.mean_confidence >= HANDOFF_MIN_DETECTION_CONFIDENCE
+                ]
+                guarded_id, _, guarded_score, _ = _choose_candidate(eligible, incumbents[slot])
+                if guarded_id != track_id:
+                    track_id, reason, confidence = guarded_id, "low_confidence_replacement_guard", guarded_score
             chosen[slot] = {
                 "track_id": track_id, "confidence": confidence, "reason": reason,
                 "candidates": details, "evidence_window": [evidence_start, evidence_end],
@@ -273,23 +325,27 @@ def assign_singles_slots(
         frame_diagonal = float(np.hypot(image_extent, image_extent))
     else:
         frame_diagonal = float(np.hypot(*frame_size))
+    last_reliable: dict[int, tuple[int, int, float]] = {}
     for start, end, chosen in periods:
         active_track_ids = {slot: chosen[slot]["track_id"] for slot in (1, 2)}
         previous_assignments: dict[int, dict[str, Any] | None] = {1: None, 2: None}
+        prior_period = last_reliable.copy()
         for frame_index in range(start, end):
             slots: dict[str, Any] = {}
             used: set[int] = set()
+            current = by_frame.get(frame_index, {})
             for slot in (1, 2):
                 decision = chosen[slot]
                 track_id = active_track_ids[slot]
-                observation = by_frame.get(frame_index, {}).get(track_id) if track_id is not None else None
+                observation = current.get(track_id)
                 assignment = None
                 reason = decision["reason"]
+                confidence = decision["confidence"]
                 handoff = None
                 if observation is None and track_id is not None:
                     reason = "selected_track_absent"
                     replacement, handoff = _choose_track_handoff(
-                        by_frame.get(frame_index, {}).values(), previous_assignments[slot], slot,
+                        current.values(), previous_assignments[slot], slot,
                         used, decision["candidates"], frame_diagonal,
                     )
                     if replacement is not None:
@@ -297,6 +353,31 @@ def assign_singles_slots(
                         track_id = int(observation["track_id"])
                         active_track_ids[slot] = track_id
                         reason = "track_handoff"
+                history = prior_period.get(slot)
+                reacquired = False
+                if observation is None and history is not None:
+                    prior_frame, prior_id, prior_score = history
+                    same = current.get(prior_id)
+                    other_slot = 3 - slot
+                    other_claim = active_track_ids[other_slot] == prior_id and same is not None and (
+                        same["court_y"] <= 0 if other_slot == 1 else same["court_y"] >= 0
+                    )
+                    if (
+                        (frame_index - prior_frame) / fps <= REACQUISITION_MAX_AGE_SECONDS
+                        and same is not None
+                        and same["in_court"]
+                        and (same["court_y"] <= 0 if slot == 1 else same["court_y"] >= 0)
+                        and float(same.get("confidence", 0.0)) >= RELIABLE_ASSIGNMENT_CONFIDENCE
+                        and prior_id not in used
+                        and not other_claim
+                    ):
+                        observation, track_id = same, prior_id
+                        confidence = next(
+                            (item["score"] for item in decision["candidates"] if item["track_id"] == prior_id),
+                            prior_score,
+                        )
+                        reason = "same_id_reacquired"
+                        reacquired = True
                 if observation is not None:
                     correct_half = observation["court_y"] <= 0 if slot == 1 else observation["court_y"] >= 0
                     if not observation["in_court"]:
@@ -313,9 +394,17 @@ def assign_singles_slots(
                             "detection_confidence": float(observation.get("confidence", 0.0)),
                             "court_x": observation["court_x"], "court_y": observation["court_y"],
                         }
-                        previous_assignments[slot] = assignment
+                        # A cross-period fallback must satisfy its confidence
+                        # floor on each frame. It cannot seed a fragment handoff.
+                        if not reacquired:
+                            previous_assignments[slot] = assignment
+                        if policy.same_id_reacquisition:
+                            if track_id != (history[1] if history is not None else None):
+                                prior_period.pop(slot, None)
+                            if assignment["detection_confidence"] >= RELIABLE_ASSIGNMENT_CONFIDENCE:
+                                last_reliable[slot] = frame_index, track_id, confidence
                 slots[f"P{slot}"] = {
-                    "assignment": assignment, "confidence": decision["confidence"],
+                    "assignment": assignment, "confidence": confidence,
                     "ambiguity_reason": reason, "candidates": decision["candidates"],
                 }
                 if handoff is not None:
@@ -372,13 +461,46 @@ def pose_quality(landmarks: list[dict[str, Any]] | None) -> float:
     return float(0.6 * np.mean(torso) + 0.4 * np.mean(limbs))
 
 
+def _estimate_pose_record(
+    image: np.ndarray, bbox: Iterable[float], estimator: Any, padding: float,
+) -> dict[str, Any]:
+    """Infer one independent image crop, including quality-based padding retry."""
+    attempts = []
+    paddings = [padding] if padding == POSE_RETRY_PADDING else [padding, POSE_RETRY_PADDING]
+    for crop_padding in paddings:
+        expanded = expand_pose_bbox(bbox, (image.shape[1], image.shape[0]), crop_padding)
+        x1, y1, x2, y2 = [int(round(value)) for value in expanded]
+        pose_bbox = [float(x1), float(y1), float(x2), float(y2)]
+        crop = image[y1:y2, x1:x2]
+        landmarks = None
+        status = "invalid_crop"
+        if crop.size:
+            result = estimator.estimate_pose(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
+            landmarks = result.to_raw_landmarks() if result.detected else None
+            status = "detected" if landmarks else "no_pose"
+        attempts.append((pose_quality(landmarks), landmarks, pose_bbox, status))
+        if attempts[-1][0] >= POSE_QUALITY_THRESHOLD:
+            break
+    quality, landmarks, pose_bbox, status = max(attempts, key=lambda item: item[0])
+    if landmarks and quality < POSE_QUALITY_THRESHOLD:
+        status = "low_quality"
+    return {
+        "pose_bbox": pose_bbox, "status": status, "temporal_status": "original",
+        "pose_quality": quality, "pose_attempts": len(attempts), "pose_landmarks": landmarks,
+    }
+
+
 def _pose_preprocessing(padding: float) -> dict[str, Any]:
+    implementation = "\n".join(
+        ast.dump(ast.parse(textwrap.dedent(inspect.getsource(component))), include_attributes=False)
+        for component in (_bbox_key, expand_pose_bbox, pose_quality, _estimate_pose_record)
+    )
     return {
         "pose_crop_padding": padding, "retry_padding": POSE_RETRY_PADDING,
         "quality_threshold": POSE_QUALITY_THRESHOLD,
-        "visibility_threshold": POSE_VISIBILITY_THRESHOLD,
-        "temporal": {"max_bracket_motion": TEMPORAL_MAX_BRACKET_MOTION,
-                     "jump_threshold": TEMPORAL_JUMP_THRESHOLD, "max_gap_frames": 1},
+        "quality_landmarks": QUALITY_LANDMARKS,
+        "implementation_fingerprint": "sha256:" + hashlib.sha256(implementation.encode()).hexdigest(),
+        "runtime": {"numpy": np.__version__, "opencv": cv2.__version__},
     }
 
 
@@ -411,24 +533,82 @@ def load_pose_cache(path: str | Path) -> tuple[dict[str, Any] | None, list[dict[
     return metadata, records
 
 
+def _atomic_json_lines(path: str | Path, values: Iterable[dict[str, Any]]) -> None:
+    """Publish a complete, synced file without truncating the previous version."""
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", prefix=f".{destination.name}.",
+            suffix=".tmp", dir=destination.parent, delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            for value in values:
+                handle.write(json.dumps(value, separators=(",", ":"), allow_nan=False) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(destination)
+        directory = os.open(destination.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _pose_unit_name(record: dict[str, Any]) -> str:
+    key = [
+        record["raw_artifact_fingerprint"], int(record["frame"]), int(record["track_id"]),
+        list(_bbox_key(record["bbox"])), record["pose_model_fingerprint"],
+        record["preprocessing_fingerprint"],
+    ]
+    payload = json.dumps(key, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(payload.encode()).hexdigest() + ".json"
+
+
+def _validate_pose_unit(record: dict[str, Any]) -> None:
+    """Reject corrupt committed units before they can suppress inference."""
+    if record.get("type") != "pose" or int(record["frame"]) < 0:
+        raise ValueError("invalid committed pose work unit")
+    if record.get("temporal_status") != "original":
+        raise ValueError("committed pose work units must contain original inference results")
+    int(record["track_id"])
+    for name in ("bbox", "pose_bbox"):
+        box = np.asarray(record[name], dtype=float)
+        if box.shape != (4,) or not np.isfinite(box).all():
+            raise ValueError(f"invalid committed pose {name}")
+    landmarks = record["pose_landmarks"]
+    if landmarks is not None:
+        if not isinstance(landmarks, list) or len(landmarks) != 33:
+            raise ValueError("invalid committed pose landmark count")
+        for landmark in landmarks:
+            if not all(np.isfinite(float(landmark[name])) for name in ("x", "y", "z", "visibility")):
+                raise ValueError("invalid committed pose landmarks")
+    if not np.isfinite(float(record["pose_quality"])):
+        raise ValueError("invalid committed pose quality")
+    if record.get("status") not in {"detected", "low_quality", "no_pose", "invalid_crop"}:
+        raise ValueError("invalid committed pose status")
+    if bool(landmarks) != (record["status"] in {"detected", "low_quality"}):
+        raise ValueError("committed pose status does not match landmarks")
+
+
 def compact_pose_cache(path: str | Path, fingerprint_aliases: dict[str, str] | None = None) -> int:
     """Normalize known fingerprint aliases and retain one record per complete cache key."""
     metadata, records = load_pose_cache(path)
     if metadata is None:
         return 0
     aliases = fingerprint_aliases or {}
-    unique: dict[tuple[int, int, tuple[float, ...], str], dict[str, Any]] = {}
+    unique: dict[tuple[int, int, tuple[float, ...], str, str | None], dict[str, Any]] = {}
     for item in records:
         fingerprint = aliases.get(item["pose_model_fingerprint"], item["pose_model_fingerprint"])
         item["pose_model_fingerprint"] = fingerprint
-        key = (int(item["frame"]), int(item["track_id"]), _bbox_key(item["bbox"]), fingerprint)
+        key = (int(item["frame"]), int(item["track_id"]), _bbox_key(item["bbox"]),
+               fingerprint, item.get("preprocessing_fingerprint"))
         unique[key] = item
-    temporary = Path(path).with_suffix(Path(path).suffix + ".tmp")
-    with temporary.open("w", encoding="utf-8") as handle:
-        handle.write(json.dumps(metadata, separators=(",", ":")) + "\n")
-        for item in unique.values():
-            handle.write(json.dumps(item, separators=(",", ":")) + "\n")
-    temporary.replace(path)
+    _atomic_json_lines(path, [metadata, *unique.values()])
     return len(records) - len(unique)
 
 
@@ -441,8 +621,16 @@ def enrich_pose_cache(
     pose_model_asset: str | Path | None = None,
     pose_crop_padding: float = POSE_CROP_PADDING,
     estimator_factory: Callable[..., Any] = create_pose_estimator,
+    pose_work_dir: str | Path | None = None,
+    pose_backend_identity: dict[str, Any] | None = None,
 ) -> tuple[dict[tuple[int, int, tuple[float, ...]], dict[str, Any]], int]:
-    """Compute only selected observation keys absent for this raw/model fingerprint."""
+    """Compute absent observations, committing each crop before continuing.
+
+    ``pose_work_dir`` must live on durable storage when the final cache is staged
+    in a temporary directory. Completed work is partitioned by raw artifact,
+    backend/model, and preprocessing identity; an interrupted attempt can safely
+    reuse it without publishing incomplete assignments or player features.
+    """
     raw_fingerprint = raw_artifact_fingerprint(person_tracks_path)
     # Resolve/download the production asset before hashing it. Previously the
     # first run fingerprinted a missing path and the second run fingerprinted
@@ -453,6 +641,8 @@ def enrich_pose_cache(
         else pose_model_asset
     )
     backend = pose_backend_info(resolved_model_asset)
+    if pose_backend_identity is not None:
+        backend["adapter_identity"] = pose_backend_identity
     model_fingerprint = pose_model_fingerprint(backend)
     preprocessing_fingerprint = pose_preprocessing_fingerprint(pose_crop_padding)
     metadata, records = load_pose_cache(pose_cache_path)
@@ -491,6 +681,7 @@ def enrich_pose_cache(
         metadata is not None
         and int(metadata.get("schema_version", 1)) < POSE_CACHE_SCHEMA_VERSION
         and metadata.get("pose_model_fingerprint") == model_fingerprint
+        and metadata.get("preprocessing_fingerprint") == preprocessing_fingerprint
     )
     existing = {
         (int(item["frame"]), int(item["track_id"]), _bbox_key(item["bbox"]),
@@ -505,6 +696,40 @@ def enrich_pose_cache(
             if "preprocessing_fingerprint" not in item:
                 item["preprocessing_fingerprint"] = preprocessing_fingerprint
                 cache_needs_upgrade = True
+    work_root = (
+        Path(pose_work_dir) if pose_work_dir is not None
+        else Path(pose_cache_path).parent / f".{Path(pose_cache_path).name}.work"
+    )
+    unit_directory = work_root.joinpath(*(
+        hashlib.sha256(value.encode()).hexdigest()
+        for value in (raw_fingerprint, model_fingerprint, preprocessing_fingerprint)
+    ))
+    recovered = 0
+    for unit_path in sorted(unit_directory.glob("*.json")):
+        record = json.loads(unit_path.read_text(encoding="utf-8"))
+        _validate_pose_unit(record)
+        if (
+            record["raw_artifact_fingerprint"] != raw_fingerprint
+            or record["pose_model_fingerprint"] != model_fingerprint
+            or record["preprocessing_fingerprint"] != preprocessing_fingerprint
+            or unit_path.name != _pose_unit_name(record)
+        ):
+            raise ValueError(f"committed pose work unit identity mismatch: {unit_path}")
+        key = (int(record["frame"]), int(record["track_id"]), _bbox_key(record["bbox"]),
+               model_fingerprint, preprocessing_fingerprint)
+        # Temporal validation depends on the selected assignment's neighbors.
+        # Restore the original inference result before validating a new selection.
+        if existing.get(key) != record:
+            recovered += 1
+        existing[key] = record
+    # Imported/final caches can contain assignment-dependent interpolation. A
+    # matching original journal unit was restored above; without one, infer the
+    # crop again instead of treating a synthetic estimate as raw model output.
+    existing = {
+        key: item for key, item in existing.items()
+        if item.get("temporal_status") in (None, "original")
+    }
+    records = list(existing.values())
     required: dict[tuple[int, int, tuple[float, ...]], dict[str, Any]] = {}
     for frame in assignments:
         for slot in ("P1", "P2"):
@@ -521,10 +746,11 @@ def enrich_pose_cache(
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
             raise RuntimeError(f"failed to open pose source: {video_path}")
-        estimator = estimator_factory(
-            model_asset_path=resolved_model_asset, running_mode="image"
-        )
+        estimator = None
         try:
+            estimator = estimator_factory(
+                model_asset_path=resolved_model_asset, running_mode="image"
+            )
             last_frame = max(missing_by_frame)
             progress = tqdm(
                 range(last_frame + 1),
@@ -538,42 +764,22 @@ def enrich_pose_cache(
                     raise RuntimeError(f"video ended before required pose frame {frame_index}")
                 for key in missing_by_frame.get(frame_index, []):
                     assignment = required[key]
-                    attempts = []
-                    paddings = [pose_crop_padding]
-                    if pose_crop_padding != POSE_RETRY_PADDING:
-                        paddings.append(POSE_RETRY_PADDING)
-                    for padding in paddings:
-                        pose_bbox = expand_pose_bbox(assignment["bbox"], (image.shape[1], image.shape[0]), padding)
-                        x1, y1, x2, y2 = [int(round(value)) for value in pose_bbox]
-                        pose_bbox = [float(x1), float(y1), float(x2), float(y2)]
-                        crop = image[y1:y2, x1:x2]
-                        landmarks = None
-                        status = "invalid_crop"
-                        if crop.size:
-                            result = estimator.estimate_pose(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
-                            landmarks = result.to_raw_landmarks() if result.detected else None
-                            status = "detected" if landmarks else "no_pose"
-                        attempts.append((pose_quality(landmarks), landmarks, pose_bbox, status))
-                        if attempts[-1][0] >= POSE_QUALITY_THRESHOLD:
-                            break
-                    quality, landmarks, pose_bbox, status = max(attempts, key=lambda item: item[0])
-                    if landmarks and quality < POSE_QUALITY_THRESHOLD:
-                        status = "low_quality"
                     record = {
                         "type": "pose", "frame": key[0], "track_id": key[1],
                         "bbox": list(key[2]), "raw_artifact_fingerprint": raw_fingerprint,
-                        "pose_bbox": pose_bbox,
                         "pose_model_fingerprint": model_fingerprint,
                         "preprocessing_fingerprint": preprocessing_fingerprint,
-                        "status": status, "temporal_status": "original",
-                        "pose_quality": quality, "pose_attempts": len(attempts), "pose_landmarks": landmarks,
+                        **_estimate_pose_record(image, assignment["bbox"], estimator, pose_crop_padding),
                     }
+                    _validate_pose_unit(record)
+                    _atomic_json_lines(unit_directory / _pose_unit_name(record), [record])
                     new_records.append(record)
                     existing[(*key, model_fingerprint, preprocessing_fingerprint)] = record
                     computed += 1
                     progress.set_postfix(computed=f"{computed}/{len(missing)}", refresh=False)
         finally:
-            estimator.close()
+            if estimator is not None:
+                estimator.close()
             cap.release()
     cache_metadata = {
         "type": "metadata", "schema": "pose_cache", "schema_version": POSE_CACHE_SCHEMA_VERSION,
@@ -582,11 +788,8 @@ def enrich_pose_cache(
         "preprocessing": _pose_preprocessing(pose_crop_padding),
         "preprocessing_fingerprint": preprocessing_fingerprint,
     }
-    if new_records or metadata is None or cache_needs_upgrade:
-        with Path(pose_cache_path).open("w", encoding="utf-8") as handle:
-            handle.write(json.dumps(cache_metadata, separators=(",", ":")) + "\n")
-            for item in [*records, *new_records]:
-                handle.write(json.dumps(item, separators=(",", ":")) + "\n")
+    if new_records or recovered or metadata is None or cache_needs_upgrade:
+        _atomic_json_lines(pose_cache_path, [cache_metadata, *records, *new_records])
     active = {
         (frame, track_id, bbox): item
         for (frame, track_id, bbox, fingerprint, preprocessing), item in existing.items()
@@ -745,6 +948,9 @@ def interpret_players(
     pose_model_asset: str | Path | None = None,
     pose_crop_padding: float = POSE_CROP_PADDING,
     estimator_factory: Callable[..., Any] = create_pose_estimator,
+    pose_work_dir: str | Path | None = None,
+    pose_backend_identity: dict[str, Any] | None = None,
+    assignment_policy: AssignmentPolicy = AssignmentPolicy(),
 ) -> tuple[list[dict[str, Any]], int]:
     raw_metadata, observations = load_person_tracks(person_tracks_path)
     frame_size = tuple(map(int, raw_metadata["frame_size"]))
@@ -777,24 +983,26 @@ def interpret_players(
         raise ValueError("source identity does not match player-processing video")
     assignments = assign_singles_slots(
         observations, homography, frame_count, float(info["fps"]), frame_size=frame_size,
+        policy=assignment_policy,
     )
     cache, computed = enrich_pose_cache(
         video_path, assignments, person_tracks_path, pose_cache_path,
         pose_model_asset=pose_model_asset, pose_crop_padding=pose_crop_padding,
         estimator_factory=estimator_factory,
+        pose_work_dir=pose_work_dir, pose_backend_identity=pose_backend_identity,
     )
     apply_temporal_pose_validation(assignments, cache, frame_size)
     cache_metadata, cache_records = load_pose_cache(pose_cache_path)
     if cache_metadata is not None:
-        with Path(pose_cache_path).open("w", encoding="utf-8") as handle:
-            handle.write(json.dumps(cache_metadata, separators=(",", ":")) + "\n")
-            for item in cache_records:
-                active_item = cache.get((int(item["frame"]), int(item["track_id"]), _bbox_key(item["bbox"])))
-                if (active_item is not None
-                        and item.get("preprocessing_fingerprint") == active_item.get("preprocessing_fingerprint")
-                        and item.get("pose_model_fingerprint") == active_item.get("pose_model_fingerprint")):
-                    item = active_item
-                handle.write(json.dumps(item, separators=(",", ":")) + "\n")
+        validated_records = []
+        for item in cache_records:
+            active_item = cache.get((int(item["frame"]), int(item["track_id"]), _bbox_key(item["bbox"])))
+            if (active_item is not None
+                    and item.get("preprocessing_fingerprint") == active_item.get("preprocessing_fingerprint")
+                    and item.get("pose_model_fingerprint") == active_item.get("pose_model_fingerprint")):
+                item = active_item
+            validated_records.append(item)
+        _atomic_json_lines(pose_cache_path, [cache_metadata, *validated_records])
     rows = derive_activity_and_rows(assignments, cache, frame_size, homography)
     assignment_metadata = {
         "type": "metadata", "schema": "player_assignments", "schema_version": 3,
@@ -820,6 +1028,7 @@ def interpret_players(
             "minimum_center_access": MIN_CENTER_ACCESS,
             "minimum_score": MIN_TOTAL_SCORE,
             "score_tolerance": SCORE_TOLERANCE,
+            "assignment_policy": assignment_policy.metadata(),
             "track_handoff": {
                 "enabled_for": "selected_track_absent",
                 "minimum_detection_confidence": HANDOFF_MIN_DETECTION_CONFIDENCE,
@@ -836,7 +1045,10 @@ def interpret_players(
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        epilog="Use separate assignment, pose-cache, and player CSV paths for diagnostic runs.",
+    )
     parser.add_argument("--video", required=True)
     parser.add_argument("--person-tracks", required=True)
     parser.add_argument("--court-calibration", required=True)
@@ -845,6 +1057,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--players-csv", required=True)
     parser.add_argument("--pose-model-asset")
     parser.add_argument("--pose-crop-padding", type=float, choices=(0.15, 0.20, 0.25), default=POSE_CROP_PADDING)
+    parser.add_argument(
+        "--replacement-guard", action=argparse.BooleanOptionalAction,
+        default=AssignmentPolicy().replacement_guard,
+        help="confidence gate for replacing a reliable incumbent (enabled by default)",
+    )
+    parser.add_argument("--same-id-reacquisition", action="store_true",
+                        help="diagnostic cross-period return of a recently seen raw track")
     parser.add_argument("--tracks-csv", help="shuttle tracks used when rendering --preview")
     parser.add_argument("--preview", help="rendered layered MP4 output")
     args = parser.parse_args(argv)
@@ -854,6 +1073,7 @@ def main(argv: list[str] | None = None) -> int:
         args.video, args.person_tracks, args.court_calibration, args.pose_cache,
         args.assignments, args.players_csv, pose_model_asset=args.pose_model_asset,
         pose_crop_padding=args.pose_crop_padding,
+        assignment_policy=AssignmentPolicy(args.replacement_guard, args.same_id_reacquisition),
     )
     if args.preview:
         from src.pose_estimator import pose_connections

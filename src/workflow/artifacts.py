@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import shutil
 import tempfile
@@ -30,7 +31,9 @@ def canonical_json_sha256(value: Mapping[str, Any]) -> str:
 def atomic_write_json(path: str | Path, value: Mapping[str, Any]) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", dir=path.parent
+    )
     temporary = Path(temporary_name)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
@@ -45,6 +48,26 @@ def atomic_write_json(path: str | Path, value: Mapping[str, Any]) -> Path:
     return path
 
 
+def validate_person_tracks(path: Path, identity: SourceIdentity) -> None:
+    """Validate observation geometry and frame indices against the source."""
+    from InPlay.heuristic.person_tracks import load_person_tracks
+
+    metadata, records = load_person_tracks(path)
+    if (
+        metadata.get("frame_count") != identity.frame_count
+        or metadata.get("frame_size") != [identity.width, identity.height]
+        or not math.isclose(
+            float(metadata.get("fps", 0)),
+            identity.fps_numerator / identity.fps_denominator,
+            rel_tol=0,
+            abs_tol=1e-6,
+        )
+    ):
+        raise ValueError("person observations do not match the source video")
+    if any(not 0 <= int(row["frame"]) < identity.frame_count for row in records):
+        raise ValueError("person observation frame is outside the source video")
+
+
 def import_artifact(
     source: SourceEntry, kind: str, external_path: str | Path, *, force: bool = False
 ) -> Path:
@@ -54,6 +77,10 @@ def import_artifact(
     attribute, expected_schema = IMPORTABLE_ARTIFACTS[kind]
     destination = Path(getattr(source, attribute))
     external = Path(external_path).expanduser().resolve()
+    if kind == "person-tracks":
+        from .publication import recover
+
+        recover(destination.with_name("person-tracks.manifest.json"))
     if destination.exists() and not force:
         raise FileExistsError(f"canonical artifact already exists: {destination}")
     with external.open(encoding="utf-8") as handle:
@@ -64,22 +91,45 @@ def import_artifact(
     if metadata.get("schema") != expected_schema:
         raise ValueError(f"expected {expected_schema} artifact")
     identity = SourceIdentity.read(source.identity_path)
-    artifact_video_sha = metadata.get("source_video_sha256") or metadata.get("video_sha256")
+    artifact_video_sha = metadata.get("source_video_sha256") or metadata.get(
+        "video_sha256"
+    )
     if artifact_video_sha is not None and artifact_video_sha != identity.video_sha256:
         raise ValueError("artifact video fingerprint differs from source identity")
     frame_count = metadata.get("frame_count")
     if frame_count is not None and int(frame_count) != identity.frame_count:
         raise ValueError("artifact frame count differs from source identity")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{destination.name}.", dir=destination.parent)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.", dir=destination.parent
+    )
     os.close(descriptor)
     temporary = Path(temporary_name)
     try:
         shutil.copyfile(external, temporary)
-        temporary.replace(destination)
-    except BaseException:
+        if kind == "person-tracks":
+            from .publication import publish
+
+            validate_person_tracks(temporary, identity)
+            publish(
+                [temporary],
+                [destination],
+                destination.with_name("person-tracks.manifest.json"),
+                {
+                    "schema": "baddievision_pipeline_stage",
+                    "schema_version": 1,
+                    "inputs": {
+                        "origin": "validated_import",
+                        "identity": identity.fingerprint,
+                        "imported_file_sha256": sha256_file(external),
+                    },
+                    "outputs": {destination.name: sha256_file(temporary)},
+                },
+            )
+        else:
+            temporary.replace(destination)
+    finally:
         temporary.unlink(missing_ok=True)
-        raise
     return destination
 
 
@@ -101,7 +151,9 @@ def import_calibration(
     if [int(image_size[0]), int(image_size[1])] != [identity.width, identity.height]:
         raise ValueError("calibration image_size does not match source identity")
     if source.calibration_path.exists() and not force:
-        raise FileExistsError(f"canonical calibration already exists: {source.calibration_path}")
+        raise FileExistsError(
+            f"canonical calibration already exists: {source.calibration_path}"
+        )
     # Metadata is embedded in the calibration so downstream consumers have one
     # file and one authority.  The legacy path is informational only.
     value["artifact_metadata"] = {
@@ -140,7 +192,9 @@ def register_native_calibration(source: SourceEntry, *, source_frame: int) -> Pa
 
 def calibration_fingerprint(source: SourceEntry) -> str:
     if not source.calibration_path.is_file():
-        raise FileNotFoundError(f"canonical calibration is missing: {source.calibration_path}")
+        raise FileNotFoundError(
+            f"canonical calibration is missing: {source.calibration_path}"
+        )
     value = json.loads(source.calibration_path.read_text(encoding="utf-8"))
     identity = SourceIdentity.read(source.identity_path)
     metadata = value.get("artifact_metadata", {})

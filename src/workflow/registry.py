@@ -6,7 +6,7 @@ import hashlib
 import json
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -123,7 +123,12 @@ class SourceStatus:
 
     @property
     def annotation_ready(self) -> bool:
-        return self.enabled and self.video and self.identity and (self.frozen_candidates or self.candidates)
+        return (
+            self.enabled
+            and self.video
+            and self.identity
+            and (self.frozen_candidates or self.candidates)
+        )
 
     @property
     def experiment_ready(self) -> bool:
@@ -141,12 +146,20 @@ class SourceStatus:
     def rally_ready(self) -> bool:
         """Rally inference deliberately has no shuttle dependency."""
         rally_problems = tuple(
-            problem for problem in self.problems
-            if not problem.startswith(("candidate artifact", "frozen candidate artifact"))
+            problem
+            for problem in self.problems
+            if not problem.startswith(
+                ("candidate artifact", "frozen candidate artifact")
+            )
         )
         return (
-            self.enabled and self.video and self.identity and self.person_tracks
-            and self.assignments and self.pose_cache and self.calibration
+            self.enabled
+            and self.video
+            and self.identity
+            and self.person_tracks
+            and self.assignments
+            and self.pose_cache
+            and self.calibration
             and not rally_problems
         )
 
@@ -198,21 +211,29 @@ class SourceCatalog:
             raise FileNotFoundError(f"video does not exist: {video}")
         source_id = source_id or video.stem
         if not _SOURCE_ID.fullmatch(source_id):
-            raise ValueError("source ID may contain only letters, digits, '.', '_' and '-'")
+            raise ValueError(
+                "source ID may contain only letters, digits, '.', '_' and '-'"
+            )
         identity = inspect_source(source_id, video)
         if source_id in self.sources:
             current = self.sources[source_id]
             if (
                 current.video_path == video
                 and current.identity_path.is_file()
-                and SourceIdentity.read(current.identity_path) == identity
+                and replace(
+                    SourceIdentity.read(current.identity_path), parent_video=None
+                )
+                == identity
             ):
                 return current
-            raise ValueError(f"source ID already refers to a different video: {source_id}")
+            raise ValueError(
+                f"source ID already refers to a different video: {source_id}"
+            )
         for current in self.sources.values():
             if (
                 current.identity_path.is_file()
-                and SourceIdentity.read(current.identity_path).video_sha256 == identity.video_sha256
+                and SourceIdentity.read(current.identity_path).video_sha256
+                == identity.video_sha256
             ):
                 raise ValueError(f"video is already registered as {current.source_id}")
         output = (
@@ -225,7 +246,12 @@ class SourceCatalog:
             video_path=video,
             artifact_root=output,
         )
-        identity.write(entry.identity_path)
+        if entry.identity_path.exists():
+            previous = SourceIdentity.read(entry.identity_path)
+            if replace(previous, parent_video=None) != identity:
+                raise ValueError("artifact root belongs to a different source identity")
+        else:
+            identity.write(entry.identity_path)
         self.sources[source_id] = entry
         self.write()
         return entry
@@ -266,13 +292,18 @@ class SourceCatalog:
                 identity = SourceIdentity.read(source.identity_path)
                 if identity.source_id != source.source_id:
                     problems.append("source identity ID differs from catalog")
-                if source.video_path.is_file() and _sha256(source.video_path) != identity.video_sha256:
+                if (
+                    source.video_path.is_file()
+                    and _sha256(source.video_path) != identity.video_sha256
+                ):
                     problems.append("video fingerprint changed")
             except (OSError, ValueError, KeyError, json.JSONDecodeError):
                 problems.append("source identity is invalid")
         if source.calibration_path.is_file():
             try:
-                calibration = json.loads(source.calibration_path.read_text(encoding="utf-8"))
+                calibration = json.loads(
+                    source.calibration_path.read_text(encoding="utf-8")
+                )
                 if "image_size" not in calibration:
                     problems.append("calibration has no image_size")
                 metadata = calibration.get("artifact_metadata", {})
@@ -303,7 +334,9 @@ class SourceCatalog:
                     != _sha256(source.calibration_path)
                 ):
                     assignments_valid = False
-                    problems.append("player assignments source/calibration lineage differs")
+                    problems.append(
+                        "player assignments source/calibration lineage differs"
+                    )
             except (OSError, json.JSONDecodeError):
                 assignments_valid = False
                 problems.append("player assignments metadata is invalid")
@@ -317,12 +350,21 @@ class SourceCatalog:
                 continue
             try:
                 metadata = json.loads(path.open(encoding="utf-8").readline())
-                artifact_count = metadata.get("source_frame_count", metadata.get("frame_count"))
+                artifact_count = metadata.get(
+                    "source_frame_count", metadata.get("frame_count")
+                )
                 if metadata.get("schema") != "shuttle_candidates":
                     raise ValueError("wrong schema")
-                if identity is not None and artifact_count is not None and int(artifact_count) != identity.frame_count:
+                if (
+                    identity is not None
+                    and artifact_count is not None
+                    and int(artifact_count) != identity.frame_count
+                ):
                     raise ValueError("frame count differs")
-                if identity is not None and metadata.get("source_frame_range") not in (None, [0, identity.frame_count - 1]):
+                if identity is not None and metadata.get("source_frame_range") not in (
+                    None,
+                    [0, identity.frame_count - 1],
+                ):
                     raise ValueError("frame range differs")
             except (OSError, ValueError, json.JSONDecodeError):
                 if path == source.candidates_path:
@@ -333,8 +375,13 @@ class SourceCatalog:
         person_tracks_valid = source.person_tracks_path.is_file()
         if person_tracks_valid and identity is not None:
             try:
-                metadata = json.loads(source.person_tracks_path.open(encoding="utf-8").readline())
-                if metadata.get("schema") != "person_tracks" or int(metadata.get("frame_count", -1)) != identity.frame_count:
+                metadata = json.loads(
+                    source.person_tracks_path.open(encoding="utf-8").readline()
+                )
+                if (
+                    metadata.get("schema") != "person_tracks"
+                    or int(metadata.get("frame_count", -1)) != identity.frame_count
+                ):
                     raise ValueError("person-track identity differs")
             except (OSError, ValueError, json.JSONDecodeError):
                 person_tracks_valid = False
@@ -342,9 +389,14 @@ class SourceCatalog:
         pose_valid = source.pose_cache_path.is_file()
         if pose_valid and person_tracks_valid:
             try:
-                metadata = json.loads(source.pose_cache_path.open(encoding="utf-8").readline())
+                metadata = json.loads(
+                    source.pose_cache_path.open(encoding="utf-8").readline()
+                )
                 expected = f"sha256:{_sha256(source.person_tracks_path)}"
-                if metadata.get("schema") != "pose_cache" or metadata.get("raw_artifact_fingerprint") != expected:
+                if (
+                    metadata.get("schema") != "pose_cache"
+                    or metadata.get("raw_artifact_fingerprint") != expected
+                ):
                     raise ValueError("pose input fingerprint differs")
             except (OSError, ValueError, json.JSONDecodeError):
                 pose_valid = False
@@ -364,13 +416,21 @@ class SourceCatalog:
         )
 
     def write_annotation_config(
-        self, output: str | Path, *, source_ids: Iterable[str] | None = None, stage: str = "frozen"
+        self,
+        output: str | Path,
+        *,
+        source_ids: Iterable[str] | None = None,
+        stage: str = "frozen",
     ) -> Path:
         output = Path(output).expanduser().resolve()
         rows = []
         for source in self.select(source_ids):
             candidate = source.candidate_path(stage)
-            if stage == "frozen" and not candidate.is_file() and source.candidates_path.is_file():
+            if (
+                stage == "frozen"
+                and not candidate.is_file()
+                and source.candidates_path.is_file()
+            ):
                 candidate = source.candidates_path
             if not source.video_path.is_file() or not candidate.is_file():
                 raise ValueError(f"source is not annotation-ready: {source.source_id}")
@@ -384,7 +444,9 @@ class SourceCatalog:
         if not rows:
             raise ValueError("no annotation-ready sources selected")
         output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(json.dumps({"sources": rows}, indent=2) + "\n", encoding="utf-8")
+        output.write_text(
+            json.dumps({"sources": rows}, indent=2) + "\n", encoding="utf-8"
+        )
         return output
 
     def write_experiment(

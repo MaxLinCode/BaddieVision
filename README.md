@@ -123,7 +123,8 @@ media and inference assets belong in a verified release.
 
 ## Other workflows
 
-- [Source registration, calibration, and annotation](docs/workflow.md)
+- [Shared extraction, recovery, calibration, and annotation](docs/workflow.md)
+- [Single maintained local/Colab/Kaggle extraction notebook](notebooks/Single_Video_Feature_Extraction.ipynb)
 - [Annotation platform](docs/annotation-platform.md)
 - [Court-space shot features](docs/plans/court-space-player-anchor.md)
 - [Research evaluation](docs/independent-rally-segmenter.md)

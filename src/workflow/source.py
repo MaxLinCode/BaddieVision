@@ -1,0 +1,129 @@
+"""Source registration, verification, calibration, and device selection."""
+
+from __future__ import annotations
+
+import json
+import sys
+from dataclasses import replace
+from pathlib import Path
+
+from .artifacts import (
+    calibration_fingerprint,
+    import_calibration,
+    register_native_calibration,
+)
+from .identity import SourceIdentity, inspect_source, sha256_file
+from .registry import SourceCatalog, SourceEntry
+
+
+def verify_source(source: SourceEntry) -> SourceIdentity:
+    if not source.enabled:
+        raise ValueError(f"source is disabled: {source.source_id}")
+    identity = SourceIdentity.read(source.identity_path)
+    if inspect_source(source.source_id, source.video_path) != replace(
+        identity, parent_video=None
+    ):
+        raise ValueError("source video identity changed; register it as a new source")
+    return identity
+
+
+def resolve_source(
+    catalog: SourceCatalog,
+    *,
+    source_id: str | None = None,
+    video: Path | None = None,
+    output_dir: Path | None = None,
+) -> SourceEntry:
+    if video is None:
+        if source_id is None:
+            raise ValueError("provide --video FILE or --source ID")
+        source = catalog.select([source_id])[0]
+        if output_dir is not None and output_dir.resolve() != source.artifact_root:
+            raise ValueError(
+                "--output-dir differs from the registered source artifact root"
+            )
+    else:
+        video = Path(video).expanduser().resolve()
+        if output_dir is None:
+            raise ValueError("--output-dir is required with --video")
+        output_dir = Path(output_dir).expanduser().resolve()
+        previous = output_dir / "source.json"
+        if previous.exists() and replace(
+            SourceIdentity.read(previous), parent_video=None
+        ) != inspect_source(source_id or video.stem, video):
+            raise ValueError(
+                "output directory belongs to a different source; choose a new --output-dir"
+            )
+        source = catalog.add(video, source_id=source_id, output_dir=output_dir)
+        if source.artifact_root != output_dir:
+            raise ValueError(
+                "video is already registered with a different output directory"
+            )
+    verify_source(source)
+    return source
+
+
+def select_device(requested: str) -> str:
+    import torch
+
+    available = {
+        "cpu": True,
+        "cuda": torch.cuda.is_available(),
+        "mps": torch.backends.mps.is_available(),
+    }
+    if requested == "auto":
+        return next(device for device in ("cuda", "mps", "cpu") if available[device])
+    if requested not in available or not available[requested]:
+        raise ValueError(
+            f"requested device is unavailable: {requested}; use --device cpu or auto"
+        )
+    return requested
+
+
+def calibrate_source(
+    source: SourceEntry, external: Path | None, *, force: bool
+) -> None:
+    from src.court_projection import CourtHomography
+
+    if external is not None:
+        external = external.expanduser().resolve()
+        if not external.is_file():
+            raise FileNotFoundError(f"calibration file is missing: {external}")
+        CourtHomography.load(external)
+        if external != source.calibration_path.resolve():
+            if source.calibration_path.is_file():
+                existing = json.loads(
+                    source.calibration_path.read_text(encoding="utf-8")
+                )
+                imported = existing.get("artifact_metadata", {}).get(
+                    "imported_file_sha256"
+                )
+                if imported != sha256_file(external):
+                    if not force:
+                        raise ValueError("calibration changed; rerun with --force")
+                    import_calibration(source, external, force=True)
+            else:
+                import_calibration(source, external)
+    if not source.calibration_path.is_file():
+        print(
+            "Court calibration is missing. Opening the browser calibration UI. "
+            "Save a calibration to continue, or cancel and pass --calibration FILE.",
+            file=sys.stderr,
+            flush=True,
+        )
+        try:
+            from src.calibrate_court import main as calibrate_main
+
+            frame = calibrate_main(
+                [str(source.video_path), str(source.calibration_path), "--open-browser"]
+            )
+            if not source.calibration_path.is_file():
+                raise ValueError("no calibration was saved")
+            register_native_calibration(source, source_frame=frame)
+        except (KeyboardInterrupt, OSError, RuntimeError, ValueError) as exc:
+            raise ValueError(
+                "calibration was not completed; rerun with --calibration FILE "
+                "or complete the browser UI"
+            ) from exc
+    CourtHomography.load(source.calibration_path)
+    calibration_fingerprint(source)
