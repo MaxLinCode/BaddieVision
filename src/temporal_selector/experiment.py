@@ -90,6 +90,11 @@ def run_experiment(
     )
     all_predictions: list[dict[str, Any]] = []
     training_summaries: dict[str, Any] = {}
+    selection_metadata = {
+        "selection_policy": dataset.manifest.get("selection_policy", "legacy"),
+        "selection_supervision_counts": dataset.manifest.get("selection_supervision_counts", {}),
+        "target_reason_counts": dataset.manifest.get("target_reason_counts", {}),
+    }
     source_ids = {window.source_id for window in dataset.windows}
     for fold_index, fold in enumerate(manifest.folds):
         if not set(fold.training_source_ids + fold.evaluation_source_ids) <= source_ids:
@@ -221,6 +226,7 @@ def run_experiment(
                 "fold": asdict(fold),
                 "crossfit_fingerprint": manifest.fingerprint,
                 "dataset_fingerprint": dataset.manifest["dataset_fingerprint"],
+                **selection_metadata,
                 "seed": seed,
                 "epochs": epochs,
                 "batch_size": batch_size,
@@ -283,6 +289,7 @@ def run_experiment(
         "boundary_weight": boundary_weight,
         "boundary_window_seconds": boundary_window_seconds,
         "dataset_fingerprint": dataset.manifest["dataset_fingerprint"],
+        **selection_metadata,
         "crossfit_fingerprint": manifest.fingerprint,
         "training": training_summaries,
         "folds": fold_metrics,
