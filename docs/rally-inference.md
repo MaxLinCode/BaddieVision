@@ -18,6 +18,19 @@ missing, canceled, invalid, or mismatched calibration stops the pipeline before
 player extraction. A browser URL is printed for environments without browser
 launch support. Supply a calibration file for unattended execution.
 
+To run inference on a remote CUDA GPU, use video and calibration paths available
+on the remote host.
+
+```bash
+./scripts/gpu submit -- python -m src.workflow rally predict \
+  --video videos/match.mp4 --output-dir outputs/match \
+  --calibration features/match/court/calibration.json \
+  --model rally-six-source-v1 --device cuda
+```
+
+The standalone `--` marks the start of the command to run remotely.
+See the [remote GPU guide](remote-gpu.md) for SSH setup and fetching results.
+
 Use `--source-id match-a` to name a new source. For a registered source:
 
 ```bash

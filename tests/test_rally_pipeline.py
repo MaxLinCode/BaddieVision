@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import csv
 import json
+import subprocess
+import sys
 from dataclasses import asdict
 from pathlib import Path
 
@@ -496,6 +498,79 @@ def test_manual_and_pipeline_stages_share_completion_policy(pipeline):
     )
     run_pipeline(**kwargs)
     assert calls == {"person": 1, "players": 1}
+
+
+def test_players_reports_rollback_and_uses_committed_tracks(pipeline, capsys):
+    from src.workflow.stages import run_player_stage
+
+    kwargs, _ = pipeline
+    run_pipeline(**kwargs, overlay=False)
+    source = kwargs["catalog"].select([kwargs["source_id"]])[0]
+    tracks = source.person_tracks_path
+    receipt = tracks.with_name("person-tracks.manifest.json")
+    committed_hash = sha256_file(tracks)
+    replacement = tracks.with_name("replacement.jsonl")
+    replacement.write_text(
+        json.dumps({**json.loads(tracks.read_text()), "revision": 2}) + "\n"
+    )
+    script = """
+import os, sys
+from pathlib import Path
+from src.workflow.publication import publish
+
+replacement, tracks, receipt = map(Path, sys.argv[1:])
+replace = Path.replace
+
+def interrupt(path, destination):
+    result = replace(path, destination)
+    if destination == tracks:
+        os._exit(17)
+    return result
+
+Path.replace = interrupt
+publish([replacement], [tracks], receipt, {"revision": 2})
+"""
+    process = subprocess.run(
+        [sys.executable, "-c", script, replacement, tracks, receipt], check=False
+    )
+    assert process.returncode == 17
+    assert sha256_file(tracks) != committed_hash
+
+    run_player_stage(
+        source,
+        pose_model=kwargs["output_dir"].parent / "pose.task",
+        interpreter=kwargs["player_interpreter"],
+        force=True,
+    )
+    message = capsys.readouterr().err
+    assert "Rolled back an interrupted publication" in message
+    assert str(receipt) in message
+    assert sha256_file(tracks) == committed_hash
+    assignments = json.loads(source.assignments_path.read_text().splitlines()[0])
+    assert assignments["raw_artifact_fingerprint"] == f"sha256:{committed_hash}"
+
+
+@pytest.mark.parametrize("problem", ["missing_receipt", "wrong_source", "wrong_hash"])
+def test_players_refuses_unverified_person_tracks(pipeline, problem):
+    from src.workflow.stages import run_player_stage
+
+    kwargs, calls = pipeline
+    run_pipeline(**kwargs, overlay=False)
+    source = kwargs["catalog"].select([kwargs["source_id"]])[0]
+    tracks = source.person_tracks_path
+    receipt = tracks.with_name("person-tracks.manifest.json")
+    if problem == "missing_receipt":
+        receipt.unlink()
+    elif problem == "wrong_source":
+        value = json.loads(receipt.read_text())
+        value["inputs"]["identity"] = "different-source"
+        receipt.write_text(json.dumps(value))
+    else:
+        tracks.write_text(tracks.read_text() + "\n")
+
+    with pytest.raises(ValueError, match="committed (person tracks|receipt)"):
+        run_player_stage(source, interpreter=kwargs["player_interpreter"], force=True)
+    assert calls["players"] == 1
 
 
 def test_inference_edit_and_pose_backend_rebuild_preserve_person_cache(

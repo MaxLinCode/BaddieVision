@@ -79,7 +79,7 @@ def test_failure_before_receipt_commit_removes_outputs_without_previous_versions
 
 
 @pytest.mark.parametrize("point", ["first_output", "second_output", "receipt"])
-def test_next_process_recovers_abrupt_exit_mid_publication(tmp_path, point):
+def test_next_process_recovers_abrupt_exit_mid_publication(tmp_path, point, capsys):
     staged, outputs, receipt = _bundle(tmp_path)
     previous_receipt = receipt.read_bytes()
     script = r'''
@@ -103,11 +103,15 @@ publish([directory / "staged-a", directory / "staged-b"],
     assert process.returncode == 17
 
     assert recover(receipt)
+    message = capsys.readouterr().err
+    assert str(receipt) in message
 
     if point == "receipt":
+        assert "Kept the committed outputs" in message
         assert [path.read_text() for path in outputs] == ["new-0", "new-1"]
         assert json.loads(receipt.read_text()) == {"revision": 2}
     else:
+        assert "Rolled back an interrupted publication" in message
         assert [path.read_text() for path in outputs] == ["old-0", "old-1"]
         assert receipt.read_bytes() == previous_receipt
     assert not recover(receipt)

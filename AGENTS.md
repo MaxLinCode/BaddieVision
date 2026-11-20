@@ -1,5 +1,46 @@
 # Repository guidance
 
+## Local worktrees
+
+Create new local Git worktrees under this repository's `.worktrees/<name>/`
+directory, on `codex/` branches, unless the user requests another location.
+Keep large/private data in the main checkout's ignored `.local-data/` directory
+and reference it explicitly from worktrees; do not duplicate or delete it when
+creating or removing a worktree. Worktree removal is for disposable code only.
+
+## Preserve local data
+
+Repository scrubbing means removing private assets from Git tracking, not
+deleting their local copies. Preserve videos, annotations, features, calibration,
+checkpoints, and experiment outputs on disk. Use `.gitignore` and
+`git rm --cached` when untracking data. Never delete or trash those assets as
+part of a repository cleanup. `.local-data/` is an ignored recovery/data area;
+do not remove or clean it, including with `git clean -x`.
+
+Start each substantial feature in its own worktree and draft pull request.
+Keep the main checkout for integration and local data. From that checkout:
+
+```sh
+git fetch origin main
+git worktree add -b codex/<name> .worktrees/<name> origin/main
+```
+
+Run the installer below from a checkout containing it to prevent accidental
+`git commit` on local `main`. The hooks also reject commits with tracked
+`.local-data/` files and pushes whose history touches that directory. They are
+shared across linked worktrees. The installer preserves custom hooks, and CI
+also rejects tracked `.local-data/` files.
+
+```sh
+./scripts/install-main-guard
+```
+
+From the feature worktree, push the feature branch and open a draft PR against
+`main`. For dependent changes, open the draft against its prerequisite branch,
+then retarget to `main` after that PR lands. Run focused tests and keep the PR
+scoped to one feature. GitHub requires a PR and the **Python 3.11 / CPU** check
+for changes to `main`.
+
 ## Shot-classifier features
 
 The per-frame shot-classifier schema is ordered as:
@@ -41,3 +82,16 @@ Apple MPS is available on the host but may appear unavailable from inside the
 sandbox. Do not treat a sandboxed `torch.backends.mps.is_available()` result as
 authoritative for experiment runs. Run MPS training outside the sandbox when
 host acceleration is required.
+
+For CUDA inference or training over SSH, use the launcher described in
+`docs/remote-gpu.md`. Set worktree-specific GPU settings in the ignored `.env`
+and use remote input paths when submitting jobs.
+
+## Private configuration and credentials
+
+Keep personal device aliases, hostnames, IP addresses, usernames, and
+machine-specific paths in ignored local configuration. Use placeholders in
+tracked code, docs, and tests. Keep SSH private keys in the user's SSH setup and
+other credentials in their local credential store. Keep secrets out of commits,
+PR text, shared logs, command arguments, and remote job snapshots. Check
+outgoing diffs and artifacts for private values before sharing them.

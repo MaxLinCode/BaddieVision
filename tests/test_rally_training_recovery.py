@@ -270,3 +270,33 @@ def test_run_records_config_and_rejects_changed_resume_identity(tmp_path):
     dataset.annotation_fingerprint = "labels-v2"
     with pytest.raises(ValueError, match="identity has changed"):
         training._prepare_rally_run(output, dataset, recipe, {"A": ["a"]}, resume=True)
+
+
+def test_camera_key_order_preserves_fold_paths_on_resume(tmp_path):
+    from types import SimpleNamespace
+
+    dataset = SimpleNamespace(
+        manifest={"dataset_fingerprint": "data-v1"}, annotation_fingerprint="labels-v1"
+    )
+    recipe = RallyTrainingRecipe(device="cpu", epochs=1)
+    groups = {"South": ["s1"], "North": ["n1", "n2"]}
+    output, ordered = training._prepare_rally_run(
+        tmp_path / "run", dataset, recipe, groups, resume=False
+    )
+    folds = training.camera_held_out_folds(ordered)
+    assert [(fold.fold_id, fold.held_out_camera) for fold in folds] == [
+        ("A", "North"), ("B", "South")
+    ]
+
+    _, reordered = training._prepare_rally_run(
+        output, dataset, recipe, dict(reversed(list(groups.items()))), resume=True
+    )
+    assert training.camera_held_out_folds(reordered) == folds
+
+    for changed in (
+        {"South": ["s1"], "North": ["n2", "n1"]},
+        {"South": ["s1", "n2"], "North": ["n1"]},
+        {**groups, "East": ["e1"]},
+    ):
+        with pytest.raises(ValueError, match="identity has changed"):
+            training._prepare_rally_run(output, dataset, recipe, changed, resume=True)
