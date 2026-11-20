@@ -26,6 +26,8 @@ PERSONAL_HOME = re.compile(r"/(?:Users|home)/[A-Za-z0-9_.-]+/")
 def private_path_reason(name: str) -> str | None:
     """Use paths, rather than ignore rules, so force-added assets also fail."""
     path = PurePosixPath(name)
+    if path.parts[:1] == (".local-data",):
+        return "private local recovery data"
     if path.name.endswith(".private-provenance.json"):
         return "private sample provenance"
     if any(part == ".annotation" or part.startswith(".annotation-") for part in path.parts):

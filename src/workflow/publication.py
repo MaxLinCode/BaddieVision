@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import shutil
+import sys
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
@@ -85,15 +86,15 @@ def _cleanup(transaction: Path) -> None:
     _sync_directory(transaction.parent)
 
 
-def _recover(receipt: Path) -> bool:
+def _recover(receipt: Path) -> str | None:
     transaction = _transaction_directory(receipt)
     if not transaction.exists():
-        return False
+        return None
     journal_path = transaction / "journal.json"
     if not journal_path.exists():
         # Preparation never changes canonical paths before publishing this journal.
         _cleanup(transaction)
-        return True
+        return "Discarded an interrupted publication before any outputs changed"
     journal = json.loads(journal_path.read_text(encoding="utf-8"))
     if journal.get("schema") != "stage_publication" or journal.get("receipt") != str(
         receipt
@@ -101,7 +102,8 @@ def _recover(receipt: Path) -> bool:
         raise ValueError(f"invalid stage publication journal: {journal_path}")
     if journal.get("state") in {"committed", "rolled_back"}:
         _cleanup(transaction)
-        return True
+        state = journal["state"].replace("_", " ")
+        return f"Finished cleanup of a publication that was already {state}"
     committed = receipt.is_file() and _digest(receipt) == journal["new_receipt_sha256"]
     if committed:
         committed = all(
@@ -113,7 +115,7 @@ def _recover(receipt: Path) -> bool:
         journal["state"] = "committed"
         _atomic_bytes(journal_path, _json_bytes(journal))
         _cleanup(transaction)
-        return True
+        return "Kept the committed outputs after an interrupted publication"
     # Backups are copied, never consumed: interruption during rollback is safe.
     for output in [*journal["outputs"], journal["previous_receipt"]]:
         destination = Path(output["path"])
@@ -140,7 +142,23 @@ def _recover(receipt: Path) -> bool:
     journal["state"] = "rolled_back"
     _atomic_bytes(journal_path, _json_bytes(journal))
     _cleanup(transaction)
+    return "Rolled back an interrupted publication to its previous state"
+
+
+def _report_recovery(receipt: Path) -> bool:
+    outcome = _recover(receipt)
+    if outcome is None:
+        return False
+    print(f"{outcome} ({receipt})", file=sys.stderr, flush=True)
     return True
+
+
+@contextmanager
+def recovered_publication(receipt_path: str | Path):
+    """Recover the bundle and hold the receipt lock while consuming it."""
+    receipt = Path(receipt_path).expanduser().resolve()
+    with _lock(receipt):
+        yield _report_recovery(receipt)
 
 
 def recover(receipt_path: str | Path) -> bool:
@@ -149,9 +167,8 @@ def recover(receipt_path: str | Path) -> bool:
     Call before inspecting a stage receipt or reading its canonical outputs.
     Returns whether an interrupted publication was found and recovered.
     """
-    receipt = Path(receipt_path).expanduser().resolve()
-    with _lock(receipt):
-        return _recover(receipt)
+    with recovered_publication(receipt_path) as recovered:
+        return recovered
 
 
 def publish(
@@ -176,7 +193,7 @@ def publish(
         raise ValueError("publication output and receipt paths must be distinct")
     new_receipt = _json_bytes(receipt_value)
     with _lock(receipt):
-        _recover(receipt)
+        _report_recovery(receipt)
         transaction = _transaction_directory(receipt)
         transaction.mkdir()
         _sync_directory(transaction.parent)
@@ -215,7 +232,7 @@ def publish(
                 _sync_directory(destination.parent)
             _atomic_bytes(receipt, new_receipt)
         except BaseException:
-            _recover(receipt)
+            _report_recovery(receipt)
             raise
         _recover(receipt)
     return receipt

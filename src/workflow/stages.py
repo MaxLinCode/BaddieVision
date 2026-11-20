@@ -21,7 +21,7 @@ from .artifacts import (
 )
 from .identity import SourceIdentity, sha256_file
 from .registry import SourceEntry
-from .publication import publish, recover
+from .publication import publish, recover, recovered_publication
 from .source import verify_source as verify_source
 
 
@@ -443,60 +443,83 @@ def run_player_stage(
     interpreter_identity: str | None = None,
 ) -> bool:
     identity = verify_source(source)
-    validate_person_tracks(source.person_tracks_path, identity)
-    from src.pose_estimator import ensure_pose_model_asset
-
-    pose_model = Path(ensure_pose_model_asset(pose_model))
-    inputs = {
-        "identity": identity.fingerprint,
-        "person_tracks_sha256": sha256_file(source.person_tracks_path),
-        "calibration_sha256": calibration_fingerprint(source),
-        "pose_sha256": sha256_file(pose_model),
-        "pose_crop_padding": pose_crop_padding,
-        "implementation": implementation_identity("pose"),
-        "backend": backend_identity(interpreter, interpreter_identity),
-    }
-    outputs = [
-        source.assignments_path,
-        source.pose_cache_path,
-        source.artifact_root / "players" / "features.csv",
-    ]
-
-    def execute(paths):
-        callback = interpreter
-        if callback is None:
-            from InPlay.heuristic.player_interpretation import interpret_players
-
-            callback = interpret_players
-        if source.pose_cache_path.is_file():
-            shutil.copyfile(source.pose_cache_path, paths[1])
-        kwargs = {
-            "pose_model_asset": pose_model,
-            "pose_crop_padding": pose_crop_padding,
-        }
-        if "pose_work_dir" in inspect.signature(callback).parameters:
-            kwargs["pose_work_dir"] = source.artifact_root / "players" / ".pose-work"
+    tracks = source.person_tracks_path
+    receipt = tracks.with_name("person-tracks.manifest.json")
+    with recovered_publication(receipt):
+        try:
+            committed = json.loads(receipt.read_text(encoding="utf-8"))
+            tracks_sha256 = sha256_file(tracks)
+        except (OSError, ValueError) as exc:
+            raise ValueError(
+                f"cannot verify committed person tracks at {tracks}; "
+                "run stage person-tracks or import the tracks"
+            ) from exc
         if (
-            interpreter is not None or interpreter_identity is not None
-        ) and "pose_backend_identity" in inspect.signature(callback).parameters:
-            kwargs["pose_backend_identity"] = {"interpreter": inputs["backend"]}
-        callback(
-            source.video_path,
-            source.person_tracks_path,
-            source.calibration_path,
-            paths[1],
-            paths[0],
-            paths[2],
-            **kwargs,
-        )
+            not isinstance(committed, dict)
+            or committed.get("schema") != "baddievision_pipeline_stage"
+            or committed.get("schema_version") != 1
+            or not isinstance(committed.get("inputs"), dict)
+            or committed["inputs"].get("identity") != identity.fingerprint
+            or committed.get("outputs") != {tracks.name: tracks_sha256}
+        ):
+            raise ValueError(
+                f"person tracks differ from the committed receipt at {receipt}; "
+                "rebuild or reimport the tracks"
+            )
+        validate_person_tracks(tracks, identity)
+        from src.pose_estimator import ensure_pose_model_asset
 
-    return run_stage(
-        source,
-        "pose",
-        inputs,
-        outputs,
-        source.artifact_root / "players" / "players.manifest.json",
-        execute,
-        lambda paths: _player_stage_valid(paths, source, identity),
-        force=force,
-    )
+        pose_model = Path(ensure_pose_model_asset(pose_model))
+        inputs = {
+            "identity": identity.fingerprint,
+            "person_tracks_sha256": tracks_sha256,
+            "calibration_sha256": calibration_fingerprint(source),
+            "pose_sha256": sha256_file(pose_model),
+            "pose_crop_padding": pose_crop_padding,
+            "implementation": implementation_identity("pose"),
+            "backend": backend_identity(interpreter, interpreter_identity),
+        }
+        outputs = [
+            source.assignments_path,
+            source.pose_cache_path,
+            source.artifact_root / "players" / "features.csv",
+        ]
+
+        def execute(paths):
+            callback = interpreter
+            if callback is None:
+                from InPlay.heuristic.player_interpretation import interpret_players
+
+                callback = interpret_players
+            if source.pose_cache_path.is_file():
+                shutil.copyfile(source.pose_cache_path, paths[1])
+            kwargs = {
+                "pose_model_asset": pose_model,
+                "pose_crop_padding": pose_crop_padding,
+            }
+            if "pose_work_dir" in inspect.signature(callback).parameters:
+                kwargs["pose_work_dir"] = source.artifact_root / "players" / ".pose-work"
+            if (
+                interpreter is not None or interpreter_identity is not None
+            ) and "pose_backend_identity" in inspect.signature(callback).parameters:
+                kwargs["pose_backend_identity"] = {"interpreter": inputs["backend"]}
+            callback(
+                source.video_path,
+                tracks,
+                source.calibration_path,
+                paths[1],
+                paths[0],
+                paths[2],
+                **kwargs,
+            )
+
+        return run_stage(
+            source,
+            "pose",
+            inputs,
+            outputs,
+            source.artifact_root / "players" / "players.manifest.json",
+            execute,
+            lambda paths: _player_stage_valid(paths, source, identity),
+            force=force,
+        )
