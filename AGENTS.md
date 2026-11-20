@@ -41,3 +41,16 @@ Apple MPS is available on the host but may appear unavailable from inside the
 sandbox. Do not treat a sandboxed `torch.backends.mps.is_available()` result as
 authoritative for experiment runs. Run MPS training outside the sandbox when
 host acceleration is required.
+
+For CUDA inference or training over SSH, use the launcher described in
+`docs/remote-gpu.md`. Set worktree-specific GPU settings in the ignored `.env`
+and use remote input paths when submitting jobs.
+
+## Private configuration and credentials
+
+Keep personal device aliases, hostnames, IP addresses, usernames, and
+machine-specific paths in ignored local configuration. Use placeholders in
+tracked code, docs, and tests. Keep SSH private keys in the user's SSH setup and
+other credentials in their local credential store. Keep secrets out of commits,
+PR text, shared logs, command arguments, and remote job snapshots. Check
+outgoing diffs and artifacts for private values before sharing them.

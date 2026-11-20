@@ -68,6 +68,7 @@ yolov8/shuttle_test/
 # Logs and local plots
 *.log
 runs/
+.remote-gpu/
 .codex/visualizations/
 
 # Portable data packages for Colab/Kaggle/Drive
