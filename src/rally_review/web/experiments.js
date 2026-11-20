@@ -116,7 +116,7 @@ async function loadRecording(force = false) {
     const payload = await readJSON("/api/metrics?" + selection, request.signal);
     if (metricsRequest !== request) return;
     setup(validate(payload.data));
-    configureOverlays(playerQuery, payload.data.overlayChunkSize);
+    configureOverlays(playerQuery, payload.data);
     matchDuration();
     installedKey = requestKey;
     status.textContent = payload.warnings.join(" ");

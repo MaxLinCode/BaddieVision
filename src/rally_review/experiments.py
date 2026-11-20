@@ -91,6 +91,7 @@ class Source:
     assignments: Path | None = None
     poses: Path | None = None
     label_pairs: tuple[tuple[Path, Path], ...] = ()
+    shuttle: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -134,7 +135,7 @@ def resolve_source(root, directory, sid, catalogs, configs):
         if not parent.is_relative_to(root):
             break
         nearby.extend(path for name in CONFIG_NAMES if (path := local_file(root, parent, name)))
-    video = assignments = poses = None
+    video = assignments = poses = shuttle = None
     labels = []
     for parent in (directory, *directory.parents):
         if not parent.is_relative_to(root):
@@ -165,6 +166,12 @@ def resolve_source(root, directory, sid, catalogs, configs):
                     poses = local_file(root, parent, entry.get("pose_cache_path"))
                     if poses is None and artifact:
                         poses = local_file(root, artifact, "players/poses.jsonl")
+                if shuttle is None:
+                    shuttle = local_file(root, parent, entry.get("candidates_path"))
+                    if shuttle is None and artifact:
+                        shuttle = local_file(root, artifact, "shuttle/candidates.frozen.jsonl")
+                        if shuttle is None:
+                            shuttle = local_file(root, artifact, "shuttle/candidates.pilot.jsonl")
                 pair = label_pair(root, parent, dataset.get("rally_intervals_path"), dataset.get("rally_manifest_path"))
                 if pair:
                     labels.append(pair)
@@ -178,7 +185,7 @@ def resolve_source(root, directory, sid, catalogs, configs):
         # Standalone inference directories can keep video.mp4 alongside predictions.
         # For deeper layouts use the source catalog, which disambiguates recordings.
         video = local_file(root, directory, f"{sid}_input.mp4") or local_file(root, directory, "video.mp4")
-    return Source(video, assignments, poses, tuple(dict.fromkeys(labels)))
+    return Source(video, assignments, poses, tuple(dict.fromkeys(labels)), shuttle)
 
 
 def discover(root):
@@ -250,6 +257,26 @@ def normalize_score(row, stem):
     return round(value, 4)
 
 
+def normalized_coordinates(value, size):
+    if isinstance(value, list) and len(value) == size and all(
+        type(item) in (int, float) and 0 <= item <= 1 for item in value
+    ):
+        return value
+    return None
+
+
+def shuttle_evidence(provenance, count, candidate, peak=None):
+    candidate = candidate if isinstance(candidate, dict) else {}
+    position = candidate.get("peak_position_normalized") or candidate.get("center_normalized")
+    return {
+        "provenance": provenance,
+        "count": count,
+        "position": normalized_coordinates(position, 2),
+        "box": normalized_coordinates(candidate.get("bbox_normalized"), 4),
+        "peak": peak,
+    }
+
+
 @lru_cache(maxsize=24)
 def load_prediction(path, version, sid, count):
     metadata = {}
@@ -258,6 +285,7 @@ def load_prediction(path, version, sid, count):
     targets = [None] * count
     thresholds = set()
     frames = set()
+    shuttle = {}
     for row in records(path):
         if row.get("type") == "metadata":
             metadata = row
@@ -280,6 +308,9 @@ def load_prediction(path, version, sid, count):
         value = row.get("inplay_target")
         if value in (0, 1):
             targets[frame] = int(value)
+        candidate_count = row.get("candidate_count")
+        if type(candidate_count) is int and candidate_count >= 0:
+            shuttle[frame] = shuttle_evidence("model_input", candidate_count, row.get("selected_position"))
     if not frames:
         raise ValueError("No frame scores for this recording")
     if len(thresholds) > 1 or any(not 0 <= t <= 1 for t in thresholds):
@@ -287,7 +318,7 @@ def load_prediction(path, version, sid, count):
     payload = {name: values for name, values in layers.items() if name == "inplay" or any(v is not None for v in values)}
     payload.update(decoded="".join(decoded), threshold=next(iter(thresholds), None))
     hashes = metadata.get("input_artifact_sha256") or {}
-    return payload, targets, hashes
+    return payload, targets, hashes, shuttle
 
 
 @lru_cache(maxsize=12)
@@ -320,6 +351,53 @@ def video_timing(path, version):
 def digest(path, version):
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+@lru_cache(maxsize=8)
+def load_shuttle_sidecar(path, version, sid, count, video, video_version):
+    rows = iter(records(path))
+    metadata = next(rows, {})
+    video_hash = metadata.get("source_video_sha256") or metadata.get("video_sha256")
+    if (
+        metadata.get("type") != "metadata"
+        or metadata.get("source_id", sid) != sid
+        or metadata.get("source_frame_index_space", "zero_based_working_video") != "zero_based_working_video"
+        or metadata.get("source_frame_count", metadata.get("frame_count", count)) != count
+        or (video_hash and video_hash != digest(video, video_version))
+    ):
+        raise ValueError("Shuttle candidates do not match the source-local video")
+
+    frames = {}
+    for row in rows:
+        frame = row.get("frame")
+        if row.get("type") != "frame" or type(frame) is not int or not 0 <= frame < count or frame in frames:
+            raise ValueError("Invalid or duplicate shuttle candidate frame")
+        candidates = row.get("frozen_candidates", row.get("candidates"))
+        if not isinstance(candidates, list) or not all(isinstance(candidate, dict) for candidate in candidates):
+            raise ValueError("Expected a list of shuttle candidates")
+
+        def peak(candidate):
+            value = candidate.get("peak_activation", candidate.get("peak_value", 0))
+            if type(value) not in (int, float) or not 0 <= value <= 1:
+                raise ValueError("Invalid shuttle peak activation")
+            return value
+
+        top = max(candidates, key=peak, default=None)
+        frames[frame] = shuttle_evidence(
+            "external_diagnostic", len(candidates), top, peak(top) if top is not None else None
+        )
+    return frames
+
+
+def external_shuttle(run, sid, count, video, video_version, warnings):
+    path = run.source.shuttle
+    if path is None:
+        return {}
+    try:
+        return load_shuttle_sidecar(path, stamp(path), sid, count, video, video_version)
+    except READ_ERRORS as error:
+        warnings.append(f"Shuttle sidecar unavailable: {error}")
+        return {}
 
 
 @lru_cache(maxsize=12)
@@ -389,8 +467,6 @@ class PlayerReview:
 
     def chunk(self, start):
         count = len(self.states[0])
-        if not 0 <= start < count or start % OVERLAY_CHUNK:
-            raise ValueError(f"Overlay start must be a multiple of {OVERLAY_CHUNK} inside the source")
         frames = []
         for frame in range(start, min(start + OVERLAY_CHUNK, count)):
             overlay = []
@@ -464,8 +540,27 @@ def recording_overlays(recording, run, start):
     video = run.source.video
     if video is None:
         raise ValueError("Source video is unavailable")
-    _, times = video_timing(video, stamp(video))
-    return source_player_review(run.source, recording.source_id, len(times)).chunk(start)
+    video_version = stamp(video)
+    _, times = video_timing(video, video_version)
+    count = len(times)
+    if not 0 <= start < count or start % OVERLAY_CHUNK:
+        raise ValueError(f"Overlay start must be a multiple of {OVERLAY_CHUNK} inside the source")
+    sid = recording.source_id
+    warnings = []
+    output = {"start": start, "frames": None, "warnings": warnings}
+    if run.source.assignments:
+        try:
+            output.update(source_player_review(run.source, sid, count).chunk(start))
+        except READ_ERRORS as error:
+            warnings.append(f"Player overlays unavailable: {error}")
+
+    _, _, _, inline = load_prediction(run.predictions, stamp(run.predictions), sid, count)
+    sidecar = external_shuttle(run, sid, count, video, video_version, warnings)
+    if inline or sidecar:
+        output["shuttle"] = [
+            inline.get(frame, sidecar.get(frame)) for frame in range(start, min(start + OVERLAY_CHUNK, count))
+        ]
+    return output
 
 
 def target_intervals(values, valid):
@@ -492,13 +587,16 @@ def recording_metrics(recording, selected):
     models = []
     target_values = [None] * count
     warnings = []
-    for run in selected:
+    primary_inline = {}
+    for index, run in enumerate(selected):
         if run.source.video != video:
             raise ValueError("Selected runs resolve to different source videos")
-        model, targets, hashes = load_prediction(run.predictions, stamp(run.predictions), sid, count)
+        model, targets, hashes, inline = load_prediction(run.predictions, stamp(run.predictions), sid, count)
         if hashes.get("video") and hashes["video"] != digest(video, video_version):
             raise ValueError(f"{run.name}: prediction video fingerprint differs from the source")
         models.append(dict(model, name=run.name))
+        if index == 0:
+            primary_inline = inline
         for i, target in enumerate(targets):
             if target is not None:
                 if target_values[i] is not None and target_values[i] != target:
@@ -527,7 +625,7 @@ def recording_metrics(recording, selected):
             player_review = source_player_review(source, sid, count)
             output["players"] = player_review.states
             if player_review.available:
-                output["overlayChunkSize"] = OVERLAY_CHUNK
+                output["playerOverlays"] = True
         except READ_ERRORS as error:
             warnings.append(f"Player lanes unavailable: {error}")
         else:
@@ -535,4 +633,9 @@ def recording_metrics(recording, selected):
                 (run.source.assignments, run.source.poses) != (source.assignments, source.poses) for run in selected[1:]
             ):
                 warnings.append(f"Player lanes show observations from {selected[0].name}.")
+    sidecar = external_shuttle(selected[0], sid, count, video, video_version, warnings)
+    if primary_inline or sidecar:
+        output["shuttleOverlays"] = True
+    if output.get("playerOverlays") or output.get("shuttleOverlays"):
+        output["overlayChunkSize"] = OVERLAY_CHUNK
     return output, warnings

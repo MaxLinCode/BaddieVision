@@ -13,6 +13,8 @@ const playerCanvas = el("player-overlay");
 const playerContext = playerCanvas.getContext("2d");
 const boxesToggle = el("boxes-toggle");
 const posesToggle = el("poses-toggle");
+const shuttleToggle = el("shuttle-toggle");
+const shuttleDetail = el("shuttle-detail");
 
 let overlays = null;
 let presentedFrame = null;
@@ -24,18 +26,19 @@ function overlayStatus(message = "") {
   node.hidden = !message;
 }
 
-function configureOverlays(query, chunkSize) {
+function configureOverlays(query, metrics) {
   overlays?.controller.abort();
   if (callbackId != null) video.cancelVideoFrameCallback?.(callbackId);
   callbackId = null;
-  overlays = query && chunkSize ? {
-    query, chunkSize,
+  overlays = query && metrics?.overlayChunkSize ? {
+    query, chunkSize: metrics.overlayChunkSize,
     controller: new AbortController(),
     chunks: new Map(),
     pending: new Set(),
   } : null;
-  boxesToggle.disabled = posesToggle.disabled = !overlays;
-  overlayStatus(query && !overlays ? "No saved player observations for this run." : "");
+  boxesToggle.disabled = posesToggle.disabled = !metrics?.playerOverlays;
+  shuttleToggle.disabled = !metrics?.shuttleOverlays;
+  overlayStatus(query && !overlays ? "No saved overlays for this run." : "");
   presentedFrame = overlays && video.readyState >= 2 ? frameAt(video.currentTime) : null;
   watchVideoFrames();
   drawPlayerOverlay();
@@ -60,7 +63,7 @@ async function requestOverlayChunk(start) {
     const query = new URLSearchParams(session.query);
     query.set("start", start);
     const response = await fetch("/api/overlays?" + query, { signal: session.controller.signal });
-    if (!response.ok) throw new Error("Could not load the saved player observations.");
+    if (!response.ok) throw new Error("Could not load the saved overlays.");
     const chunk = await response.json();
     if (overlays !== session) return;
     session.chunks.set(start, chunk);
@@ -85,8 +88,11 @@ function drawPlayerOverlay() {
   if (playerCanvas.height !== height) playerCanvas.height = height;
   ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
   ctx.clearRect(0, 0, bounds.width, bounds.height);
+  shuttleDetail.hidden = true;
+  const showPlayers = !boxesToggle.disabled && (boxesToggle.checked || posesToggle.checked);
+  const showShuttle = !shuttleToggle.disabled && shuttleToggle.checked;
   if (!overlays || !data || presentedFrame == null || !width || !height ||
-      !video.videoWidth || !video.videoHeight || (!boxesToggle.checked && !posesToggle.checked)) return;
+      !video.videoWidth || !video.videoHeight || (!showPlayers && !showShuttle)) return;
 
   const first = Math.floor(presentedFrame / overlays.chunkSize) * overlays.chunkSize;
   const chunk = overlays.chunks.get(first);
@@ -94,13 +100,12 @@ function drawPlayerOverlay() {
   if (!video.paused && presentedFrame - first >= overlays.chunkSize / 2) requestOverlayChunk(first + overlays.chunkSize);
   if (!chunk) return;
   const imageSize = chunk.imageSize;
-  if (imageSize && (imageSize[0] !== video.videoWidth || imageSize[1] !== video.videoHeight)) {
-    overlayStatus("Saved player observations have different image dimensions from this video.");
-    return;
-  }
-  overlayStatus();
-  const roles = chunk.frames[presentedFrame - first];
-  if (!roles) return;
+  const warnings = [...chunk.warnings];
+  const playersAligned = !imageSize || (imageSize[0] === video.videoWidth && imageSize[1] === video.videoHeight);
+  if (showPlayers && !playersAligned) warnings.push("Saved player observations have different image dimensions from this video.");
+  overlayStatus(warnings.join(" "));
+  const offset = presentedFrame - first;
+  const roles = showPlayers && playersAligned ? chunk.frames?.[offset] ?? [] : [];
 
   const scale = Math.min(bounds.width / video.videoWidth, bounds.height / video.videoHeight);
   const displayedWidth = video.videoWidth * scale;
@@ -163,7 +168,32 @@ function drawPlayerOverlay() {
       ctx.fill();
     }
   });
+  if (showShuttle) {
+    const evidence = chunk.shuttle?.[offset];
+    shuttleDetail.textContent = drawShuttleEvidence(ctx, evidence, left, top, displayedWidth, displayedHeight);
+    shuttleDetail.hidden = false;
+  }
   ctx.restore();
+}
+
+function drawShuttleEvidence(ctx, evidence, left, top, width, height) {
+  if (!evidence) return "No saved shuttle evidence for this frame.";
+  const x = value => left + value * width;
+  const y = value => top + value * height;
+  ctx.strokeStyle = "#ffe36e";
+  ctx.lineWidth = 2;
+  if (evidence.box) {
+    const [x1, y1, x2, y2] = evidence.box;
+    ctx.strokeRect(x(x1), y(y1), (x2 - x1) * width, (y2 - y1) * height);
+  }
+  if (evidence.position) {
+    ctx.beginPath();
+    ctx.arc(x(evidence.position[0]), y(evidence.position[1]), 7, 0, 2 * Math.PI);
+    ctx.stroke();
+  }
+  const provenance = evidence.provenance === "model_input" ? "model input" : "external diagnostic";
+  const peak = evidence.peak == null ? "" : " · peak " + evidence.peak.toFixed(3);
+  return "Shuttle · " + provenance + " · candidates " + evidence.count + peak;
 }
 
 function setOverlayFrameFromVideo() {
@@ -177,5 +207,5 @@ video.addEventListener("seeking", () => { presentedFrame = null; drawPlayerOverl
 video.addEventListener("seeked", setOverlayFrameFromVideo);
 video.addEventListener("emptied", () => { presentedFrame = null; drawPlayerOverlay(); });
 if (!video.requestVideoFrameCallback) video.addEventListener("timeupdate", setOverlayFrameFromVideo);
-boxesToggle.onchange = posesToggle.onchange = drawPlayerOverlay;
+boxesToggle.onchange = posesToggle.onchange = shuttleToggle.onchange = drawPlayerOverlay;
 new ResizeObserver(drawPlayerOverlay).observe(el("video-stage"));
