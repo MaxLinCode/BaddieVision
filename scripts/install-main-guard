@@ -2,15 +2,16 @@
 set -eu
 
 if git config --get core.hooksPath >/dev/null; then
-    echo "Git already uses a configured hooks path. Add the main-branch guard to your existing pre-commit hook." >&2
+    echo "Git already uses a configured hooks path. Integrate these checks into your existing hooks." >&2
     exit 1
 fi
 
 hooks="$(git rev-parse --path-format=absolute --git-common-dir)/hooks"
-hook="$hooks/pre-commit"
 mkdir -p "$hooks"
+prepared="$(mktemp -d "$hooks/.baddievision-hooks.XXXXXX")"
+trap 'rm -r "$prepared"' EXIT
 
-if ! (set -C; cat > "$hook" <<'HOOK'
+cat > "$prepared/legacy-pre-commit" <<'HOOK'
 #!/bin/sh
 # BaddieVision local main-branch guard
 if [ "$(git symbolic-ref --quiet --short HEAD)" = main ]; then
@@ -18,9 +19,56 @@ if [ "$(git symbolic-ref --quiet --short HEAD)" = main ]; then
     exit 1
 fi
 HOOK
-) 2>/dev/null; then
-    echo "A pre-commit hook already exists or the hook could not be created. Existing hooks are preserved." >&2
+
+cat > "$prepared/pre-commit" <<'HOOK'
+#!/bin/sh
+set -eu
+if [ "$(git symbolic-ref --quiet HEAD || :)" = refs/heads/main ]; then
+    echo "Commit from a feature worktree on a codex/ branch." >&2
     exit 1
 fi
-chmod +x "$hook"
-echo "Installed the local main-branch commit guard in $hook"
+
+private_paths="$(git ls-files -- .local-data)"
+if [ -n "$private_paths" ]; then
+    echo "Remove .local-data/ files from the index before committing. Keep the local copies." >&2
+    exit 1
+fi
+HOOK
+
+cat > "$prepared/pre-push" <<'HOOK'
+#!/bin/sh
+set -eu
+while read -r local_ref local_oid remote_ref remote_oid; do
+    if [ "$local_ref" = "(delete)" ]; then
+        continue
+    fi
+    # Include merged branches and files deleted by later commits.
+    private_commit="$(git log --full-history -1 --format=%H "$local_oid" -- .local-data)"
+    if [ -n "$private_commit" ]; then
+        echo "Push blocked: commit $private_commit touches .local-data/. Remove private data from history before pushing." >&2
+        exit 1
+    fi
+done
+HOOK
+
+for name in pre-commit pre-push; do
+    hook="$hooks/$name"
+    if [ -L "$hook" ] || { [ -e "$hook" ] && [ ! -f "$hook" ]; }; then
+        echo "Existing $name hook preserved. Integrate these checks manually." >&2
+        exit 1
+    fi
+    if [ ! -f "$hook" ] || cmp -s "$prepared/$name" "$hook"; then
+        continue
+    fi
+    if [ "$name" = pre-commit ] && cmp -s "$prepared/legacy-pre-commit" "$hook"; then
+        continue
+    fi
+    echo "Existing $name hook preserved. Integrate these checks manually." >&2
+    exit 1
+done
+
+for name in pre-commit pre-push; do
+    chmod +x "$prepared/$name"
+    mv "$prepared/$name" "$hooks/$name"
+done
+echo "Installed the local commit and push guards in $hooks"

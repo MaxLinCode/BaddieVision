@@ -25,9 +25,11 @@ git fetch origin main
 git worktree add -b codex/<name> .worktrees/<name> origin/main
 ```
 
-Run the installer below from a checkout containing it to guard local commits
-to `main`. It shares the hook across linked worktrees and checks for an
-existing hook before installing.
+Run the installer below from a checkout containing it to prevent accidental
+`git commit` on local `main`. The hooks also reject commits with tracked
+`.local-data/` files and pushes whose history touches that directory. They are
+shared across linked worktrees. The installer preserves custom hooks, and CI
+also rejects tracked `.local-data/` files.
 
 ```sh
 ./scripts/install-main-guard
