@@ -1,5 +1,44 @@
 # Repository guidance
 
+## Local worktrees
+
+Create new local Git worktrees under this repository's `.worktrees/<name>/`
+directory, on `codex/` branches, unless the user requests another location.
+Keep large/private data in the main checkout's ignored `.local-data/` directory
+and reference it explicitly from worktrees; do not duplicate or delete it when
+creating or removing a worktree. Worktree removal is for disposable code only.
+
+## Preserve local data
+
+Repository scrubbing means removing private assets from Git tracking, not
+deleting their local copies. Preserve videos, annotations, features, calibration,
+checkpoints, and experiment outputs on disk. Use `.gitignore` and
+`git rm --cached` when untracking data. Never delete or trash those assets as
+part of a repository cleanup. `.local-data/` is an ignored recovery/data area;
+do not remove or clean it, including with `git clean -x`.
+
+Start each substantial feature in its own worktree and draft pull request.
+Keep the main checkout for integration and local data. From that checkout:
+
+```sh
+git fetch origin main
+git worktree add -b codex/<name> .worktrees/<name> origin/main
+```
+
+Run the installer below from a checkout containing it to guard local commits
+to `main`. It shares the hook across linked worktrees and checks for an
+existing hook before installing.
+
+```sh
+./scripts/install-main-guard
+```
+
+From the feature worktree, push the feature branch and open a draft PR against
+`main`. For dependent changes, open the draft against its prerequisite branch,
+then retarget to `main` after that PR lands. Run focused tests and keep the PR
+scoped to one feature. GitHub requires a PR and the **Python 3.11 / CPU** check
+for changes to `main`.
+
 ## Shot-classifier features
 
 The per-frame shot-classifier schema is ordered as:

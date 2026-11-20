@@ -89,3 +89,6 @@ yolov8/shuttle-yolo-dataset/labels/
 *.private-provenance.json
 release/
 InPlay/*.local.json
+
+# Private local data and recovered assets: retain on disk, never commit.
+/.local-data/

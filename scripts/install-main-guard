@@ -1,0 +1,26 @@
+#!/bin/sh
+set -eu
+
+if git config --get core.hooksPath >/dev/null; then
+    echo "Git already uses a configured hooks path. Add the main-branch guard to your existing pre-commit hook." >&2
+    exit 1
+fi
+
+hooks="$(git rev-parse --path-format=absolute --git-common-dir)/hooks"
+hook="$hooks/pre-commit"
+mkdir -p "$hooks"
+
+if ! (set -C; cat > "$hook" <<'HOOK'
+#!/bin/sh
+# BaddieVision local main-branch guard
+if [ "$(git symbolic-ref --quiet --short HEAD)" = main ]; then
+    echo "Commit from a feature worktree on a codex/ branch." >&2
+    exit 1
+fi
+HOOK
+) 2>/dev/null; then
+    echo "A pre-commit hook already exists or the hook could not be created. Existing hooks are preserved." >&2
+    exit 1
+fi
+chmod +x "$hook"
+echo "Installed the local main-branch commit guard in $hook"
