@@ -10,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 
-# These names and extraction settings form the full_audio feature contract.
+# These names and extraction settings form the rally audio feature contract.
 RALLY_AUDIO_FEATURE_NAMES = (
     "audio_log_rms",
     "audio_log_peak",
@@ -46,8 +46,31 @@ def rally_audio_runtime() -> dict[str, str]:
     }
 
 
+def _rolling_zscore(
+    values: np.ndarray, valid: np.ndarray, timestamps: np.ndarray
+) -> np.ndarray:
+    """Standardize each feature over valid frames in the trailing 10 seconds."""
+    start = np.searchsorted(timestamps, timestamps - 10.0, side="right")
+    observed = np.where(valid, values, 0).astype(np.float64)
+
+    def rolling_sum(series: np.ndarray) -> np.ndarray:
+        prefix = np.vstack((np.zeros((1, series.shape[1])), np.cumsum(series, axis=0)))
+        return prefix[1:] - prefix[start]
+
+    counts = rolling_sum(valid)
+    divisor = np.maximum(counts, 1)
+    mean = rolling_sum(observed) / divisor
+    variance = np.maximum(rolling_sum(observed**2) / divisor - mean**2, 0)
+    std = np.sqrt(variance)
+    result = np.zeros_like(values)
+    np.divide(
+        observed - mean, std, out=result, where=valid & (counts > 1) & (std > 1e-6)
+    )
+    return result
+
+
 def read_rally_audio(
-    video: Path, *, frame_count: int, fps: float
+    video: Path, *, frame_count: int, fps: float, rolling_zscore: bool = False
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return finite audio values and a per-feature coverage mask for every frame."""
     values = np.zeros((frame_count, len(RALLY_AUDIO_FEATURE_NAMES)), dtype=np.float32)
@@ -121,10 +144,9 @@ def read_rally_audio(
                 "rally audio requires a presentation timestamp for each source frame"
             )
     ends = np.append(times[1:], times[-1] + 1 / fps)
+    timestamps = (times + ends) / 2
     first_sample = round(audio_start * _SAMPLE_RATE)
-    centers = (
-        np.rint((times + ends) * (0.5 * _SAMPLE_RATE)).astype(np.int64) - first_sample
-    )
+    centers = np.rint(timestamps * _SAMPLE_RATE).astype(np.int64) - first_sample
 
     pcm = _run_media_tool(
         "ffmpeg",
@@ -179,4 +201,6 @@ def read_rally_audio(
         rise = np.maximum(spectrum[has_history] - previous, 0)
         values[indices[has_history], -1] = np.log1p(10 * rise.sum(axis=1))
         valid[indices[has_history], -1] = True
+    if rolling_zscore:
+        values = _rolling_zscore(values, valid, timestamps)
     return values, valid

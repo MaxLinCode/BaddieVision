@@ -73,3 +73,24 @@ per source. The checkpoint and release manifest identify the feature view
 automatically. Export the trained checkpoint with
 [the existing inference exporter](rally-inference.md#export-the-existing-production-checkpoint)
 and use its manifest for prediction.
+
+### Rolling normalization and audio dropout
+
+Use `full_audio_zscore` to standardize all seven audio channels over the trailing
+10 seconds of the source recording. Each channel uses only its observed samples,
+with windows shortened at the start of a recording. Invalid entries stay masked.
+Constant or single-observation histories emit zero. Validation and inference use
+the same timestamp-based normalization.
+
+```bash
+python -m src.temporal_selector.rally_experiment \
+  --config config/rally-experiment.local.json --clean-only \
+  --feature-view full_audio_zscore --audio-dropout 0.4 \
+  --output-dir outputs/rally-audio-zscore
+```
+
+The dropout probability applies independently each time a training window is
+sampled. A dropped window has zero values and false validity for all audio
+channels across all its frames. Validation, held-out scoring, and inference use
+the available audio. The resolved recipe and recovery checkpoints record the
+dropout probability.

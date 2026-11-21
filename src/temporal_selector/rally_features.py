@@ -47,6 +47,7 @@ class RallyFeatureView:
     names: tuple[str, ...]
     full_indices: tuple[int, ...]
     uses_audio: bool = False
+    audio_rolling_zscore: bool = False
 
     @property
     def dimension(self) -> int:
@@ -75,7 +76,13 @@ def _names_for_fields(fields: Sequence[str], *, include_pose: bool = True) -> tu
     return selected
 
 
-def _view(name: str, names: Sequence[str], *, uses_audio: bool = False) -> RallyFeatureView:
+def _view(
+    name: str,
+    names: Sequence[str],
+    *,
+    uses_audio: bool = False,
+    audio_rolling_zscore: bool = False,
+) -> RallyFeatureView:
     requested = tuple(names)
     if len(requested) != len(set(requested)):
         raise AssertionError(f"duplicate feature in rally view {name}")
@@ -84,13 +91,20 @@ def _view(name: str, names: Sequence[str], *, uses_audio: bool = False) -> Rally
     missing = [feature for feature in requested if feature not in positions]
     if missing:
         raise AssertionError(f"unknown feature in rally view {name}: {missing}")
-    return RallyFeatureView(name, requested, tuple(positions[item] for item in requested), uses_audio)
+    return RallyFeatureView(
+        name, requested, tuple(positions[item] for item in requested),
+        uses_audio=uses_audio, audio_rolling_zscore=audio_rolling_zscore,
+    )
 
 
 RALLY_FEATURE_VIEWS: Final[Mapping[str, RallyFeatureView]] = {
     "full": _view("full", FULL_RALLY_FEATURE_NAMES),
     "full_audio": _view(
         "full_audio", FULL_RALLY_FEATURE_NAMES + RALLY_AUDIO_FEATURE_NAMES, uses_audio=True
+    ),
+    "full_audio_zscore": _view(
+        "full_audio_zscore", FULL_RALLY_FEATURE_NAMES + RALLY_AUDIO_FEATURE_NAMES,
+        uses_audio=True, audio_rolling_zscore=True,
     ),
     "calibrated_canonical": _view(
         "calibrated_canonical",
@@ -165,6 +179,7 @@ assert len(FULL_RALLY_FEATURE_NAMES) == 154
 assert {name: view.dimension for name, view in RALLY_FEATURE_VIEWS.items()} == {
     "full": 154,
     "full_audio": 161,
+    "full_audio_zscore": 161,
     "calibrated_canonical": 142,
     "no_position": 138,
     "image_position": 150,

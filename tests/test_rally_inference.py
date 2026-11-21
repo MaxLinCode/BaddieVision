@@ -13,6 +13,7 @@ import pytest
 import torch
 
 from src.temporal_selector.rally import RallySegmenter, RallySegmenterConfig
+from src.temporal_selector.rally_audio import _rolling_zscore
 from src.temporal_selector.rally_dataset import (
     RallyDataConfig,
     RallySourceConfig,
@@ -278,9 +279,45 @@ def test_audio_view_keeps_visual_features_and_aligns_delayed_track(source, tmp_p
             else:
                 assert not valid.any()
                 assert not window.frame_values[index, visual_dim:].any()
+    normalized = RallyWindowDataset(
+        RallyDataConfig((source,), None, None, feature_view="full_audio_zscore")
+    )
+    assert normalized.manifest["audio_coverage"] == with_audio.manifest["audio_coverage"]
+    for raw, standardized in zip(with_audio, normalized, strict=True):
+        torch.testing.assert_close(standardized.frame_validity, raw.frame_validity)
+        torch.testing.assert_close(standardized.frame_values[:, :visual_dim], raw.frame_values[:, :visual_dim])
+        if 3 in standardized.frame_indices:
+            first_observed = standardized.frame_indices.index(3)
+            assert not standardized.frame_values[first_observed, visual_dim:].any()
+
     rows = predict_source(
-        source, _model("full_audio"), preprocessing={"feature_view": "full_audio"},
+        source, _model("full_audio_zscore"), preprocessing={"feature_view": "full_audio_zscore"},
         decoder={"threshold": 0.49, "max_gap_seconds": 0, "minimum_duration_seconds": 0},
         batch_size=2,
     )
     assert [row["frame"] for row in rows] == list(range(11))
+
+
+def test_audio_zscore_uses_trailing_observed_values_for_all_seven_features():
+    times = np.array([0.0, 1.0, 2.0, 11.0, 11.5, 22.0])
+    values = np.arange(42, dtype=np.float32).reshape(6, 7) ** 2
+    values[:, -1] = 1.0
+    valid = np.ones_like(values, dtype=bool)
+    valid[2, ::2] = False
+    valid[3, 1::2] = False
+    expected = np.zeros_like(values)
+    for frame, timestamp in enumerate(times):
+        for feature in range(values.shape[1]):
+            if valid[frame, feature]:
+                series = values[
+                    (times > timestamp - 10.0) & (times <= timestamp) & valid[:, feature],
+                    feature,
+                ]
+                if len(series) > 1 and series.std() > 1e-6:
+                    expected[frame, feature] = (values[frame, feature] - series.mean()) / series.std()
+
+    actual = _rolling_zscore(values, valid, times)
+    np.testing.assert_allclose(actual, expected, atol=1e-6)
+    np.testing.assert_allclose(_rolling_zscore(values * 2 + 30, valid, times), actual, atol=1e-6)
+    normalized_prefix = _rolling_zscore(values[:4], valid[:4], times[:4])
+    np.testing.assert_array_equal(normalized_prefix, actual[:4])

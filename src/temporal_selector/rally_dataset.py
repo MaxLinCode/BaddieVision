@@ -310,7 +310,10 @@ class RallyWindowDataset(Dataset[RallyWindow]):
                 raise ValueError("source identity video fingerprint does not match rally annotations")
 
         audio = (
-            read_rally_audio(source.video_path, frame_count=frame_count, fps=fps)
+            read_rally_audio(
+                source.video_path, frame_count=frame_count, fps=fps,
+                rolling_zscore=self.feature_view.audio_rolling_zscore,
+            )
             if self.feature_view.uses_audio
             else None
         )

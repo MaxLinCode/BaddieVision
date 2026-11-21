@@ -454,6 +454,7 @@ class RallyTrainingRecipe:
     learning_rate: float = 3e-4
     gradient_clip_norm: float = 1.0
     device: str = "mps"
+    audio_dropout: float = 0.0
 
     def __post_init__(self) -> None:
         for name in ("epochs", "batch_size"):
@@ -466,6 +467,8 @@ class RallyTrainingRecipe:
             or self.seed < 0
         ):
             raise ValueError("seed must be a nonnegative integer")
+        if not 0.0 <= self.audio_dropout <= 1.0:
+            raise ValueError("audio_dropout must be between zero and one")
         if self.optimizer != "AdamW":
             raise ValueError("supported rally optimizer is AdamW")
         if self.sampling not in ("boundary_balanced", "uniform"):
