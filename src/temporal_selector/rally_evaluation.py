@@ -101,38 +101,69 @@ def chronological_camera_train_validation_split(
             source: int(by_source[source][0].metadata["frame_count"])
             for source in sources
         }
-        offsets: dict[str, int] = {}
-        total_frames = 0
-        for source in sources:
-            offsets[source] = total_frames
-            total_frames += frame_counts[source]
-        cut = int(total_frames * train_fraction)
-        fps_values = {
-            float(window.metadata["fps"])
+        fps = {source: float(by_source[source][0].metadata["fps"]) for source in sources}
+        if any(
+            not math.isfinite(fps[source])
+            or fps[source] <= 0
+            or any(float(window.metadata["fps"]) != fps[source] for window in by_source[source])
             for source in sources
-            for window in by_source[source]
-        }
-        if len(fps_values) != 1:
-            raise ValueError(
-                "sources from one camera must share FPS for guard bands"
-            )
-        guard_frames = round(next(iter(fps_values)) * guard_seconds)
-        train_range = (0, cut - guard_frames - 1)
-        validation_range = (cut + guard_frames, total_frames - 1)
+        ):
+            raise ValueError("each source must have a consistent positive FPS")
+
         camera_train: list[RallyWindow] = []
         camera_validation: list[RallyWindow] = []
-        for source in sources:
-            offset = offsets[source]
-            for window in by_source[source]:
-                first = offset + min(window.frame_indices)
-                last = offset + max(window.frame_indices)
-                if train_range[0] <= first and last <= train_range[1]:
-                    camera_train.append(window)
-                elif (
-                    validation_range[0] <= first
-                    and last <= validation_range[1]
-                ):
-                    camera_validation.append(window)
+        if len(set(fps.values())) == 1:
+            offsets: dict[str, int] = {}
+            total_frames = 0
+            for source in sources:
+                offsets[source] = total_frames
+                total_frames += frame_counts[source]
+            cut = int(total_frames * train_fraction)
+            guard_frames = round(next(iter(fps.values())) * guard_seconds)
+            train_range = (0, cut - guard_frames - 1)
+            validation_range = (cut + guard_frames, total_frames - 1)
+            for source in sources:
+                for window in by_source[source]:
+                    first = offsets[source] + min(window.frame_indices)
+                    last = offsets[source] + max(window.frame_indices)
+                    if train_range[0] <= first and last <= train_range[1]:
+                        camera_train.append(window)
+                    elif validation_range[0] <= first and last <= validation_range[1]:
+                        camera_validation.append(window)
+            split_metadata = {
+                "source_offsets": offsets,
+                "total_frames": total_frames,
+                "cut_frame": cut,
+                "guard_frames": guard_frames,
+                "train_global_range": list(train_range),
+                "validation_global_range": list(validation_range),
+            }
+        else:
+            time_offsets: dict[str, float] = {}
+            duration = 0.0
+            for source in sources:
+                time_offsets[source] = duration
+                duration += frame_counts[source] / fps[source]
+            cut_seconds = duration * train_fraction
+            train_end = cut_seconds - guard_seconds
+            validation_start = cut_seconds + guard_seconds
+            for source in sources:
+                for window in by_source[source]:
+                    first = time_offsets[source] + min(window.frame_indices) / fps[source]
+                    end = time_offsets[source] + (max(window.frame_indices) + 1) / fps[source]
+                    if first >= 0 and end <= train_end:
+                        camera_train.append(window)
+                    elif first >= validation_start and end <= duration + 1e-9:
+                        camera_validation.append(window)
+            split_metadata = {
+                "source_fps": fps,
+                "source_offsets_seconds": time_offsets,
+                "total_seconds": duration,
+                "cut_seconds": cut_seconds,
+                "train_time_range": [0, train_end],
+                "validation_time_range": [validation_start, duration],
+                "time_units": "seconds; frame indices remain source-local",
+            }
         if not camera_train or not camera_validation:
             raise ValueError(
                 f"camera {camera!r} produced an empty chronological partition"
@@ -142,20 +173,19 @@ def chronological_camera_train_validation_split(
         camera_metadata[str(camera)] = {
             "source_order": list(sources),
             "source_frame_counts": frame_counts,
-            "source_offsets": offsets,
-            "total_frames": total_frames,
-            "cut_frame": cut,
             "guard_seconds": guard_seconds,
-            "guard_frames": guard_frames,
-            "train_global_range": list(train_range),
-            "validation_global_range": list(validation_range),
+            **split_metadata,
             "train_window_ids": [window.window_id for window in camera_train],
             "validation_window_ids": [
                 window.window_id for window in camera_validation
             ],
         }
     return train, validation, {
-        "strategy": "per-training-camera-chronological-80-20",
+        "strategy": (
+            "per-training-camera-chronological-80-20-mixed-fps"
+            if any("source_fps" in metadata for metadata in camera_metadata.values())
+            else "per-training-camera-chronological-80-20"
+        ),
         "train_fraction": train_fraction,
         "guard_seconds": guard_seconds,
         "cameras": camera_metadata,
