@@ -312,7 +312,7 @@ class RallyWindowDataset(Dataset[RallyWindow]):
         audio = (
             read_rally_audio(
                 source.video_path, frame_count=frame_count, fps=fps,
-                rolling_zscore=self.feature_view.audio_rolling_zscore,
+                normalization=self.feature_view.audio_normalization,
             )
             if self.feature_view.uses_audio
             else None

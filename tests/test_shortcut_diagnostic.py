@@ -49,6 +49,7 @@ def test_registered_feature_views_have_exact_names_dimensions_and_masks() -> Non
         "full": 154,
         "full_audio": 161,
         "full_audio_zscore": 161,
+        "full_audio_centered_flux": 161,
         "calibrated_canonical": 142,
         "no_position": 138,
         "image_position": 150,

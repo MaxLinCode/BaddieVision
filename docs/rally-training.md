@@ -94,3 +94,16 @@ sampled. A dropped window has zero values and false validity for all audio
 channels across all its frames. Validation, held-out scoring, and inference use
 the available audio. The resolved recipe and recovery checkpoints record the
 dropout probability.
+
+### Centered spectral-flux baseline
+
+The `full_audio_centered_flux` view keeps log RMS, log peak, and the four
+spectral power bands at their original scales. It replaces spectral flux with
+its positive excess above the median of observed flux in a centered 1.5-second
+window. The scale is 1.4826 times the median absolute deviation, with a floor
+of 0.05 in the original log-flux units. The result is capped at 8. The same
+normalization applies during training and offline inference.
+
+Run this view with `--clean-only --feature-view full_audio_centered_flux
+--audio-dropout 0` to compare the centered baseline directly with the raw
+`full_audio` view under the same training recipe.

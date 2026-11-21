@@ -9,7 +9,7 @@ from typing import Final
 import torch
 from torch import Tensor
 
-from .rally_audio import RALLY_AUDIO_FEATURE_NAMES
+from .rally_audio import RALLY_AUDIO_FEATURE_NAMES, RallyAudioNormalization
 
 RALLY_FEATURE_SCHEMA: Final = "baddievision.rally.feature_views"
 RALLY_FEATURE_VERSION: Final = 2
@@ -47,7 +47,7 @@ class RallyFeatureView:
     names: tuple[str, ...]
     full_indices: tuple[int, ...]
     uses_audio: bool = False
-    audio_rolling_zscore: bool = False
+    audio_normalization: RallyAudioNormalization = "raw"
 
     @property
     def dimension(self) -> int:
@@ -81,7 +81,7 @@ def _view(
     names: Sequence[str],
     *,
     uses_audio: bool = False,
-    audio_rolling_zscore: bool = False,
+    audio_normalization: RallyAudioNormalization = "raw",
 ) -> RallyFeatureView:
     requested = tuple(names)
     if len(requested) != len(set(requested)):
@@ -93,7 +93,7 @@ def _view(
         raise AssertionError(f"unknown feature in rally view {name}: {missing}")
     return RallyFeatureView(
         name, requested, tuple(positions[item] for item in requested),
-        uses_audio=uses_audio, audio_rolling_zscore=audio_rolling_zscore,
+        uses_audio=uses_audio, audio_normalization=audio_normalization,
     )
 
 
@@ -104,7 +104,11 @@ RALLY_FEATURE_VIEWS: Final[Mapping[str, RallyFeatureView]] = {
     ),
     "full_audio_zscore": _view(
         "full_audio_zscore", FULL_RALLY_FEATURE_NAMES + RALLY_AUDIO_FEATURE_NAMES,
-        uses_audio=True, audio_rolling_zscore=True,
+        uses_audio=True, audio_normalization="trailing_zscore",
+    ),
+    "full_audio_centered_flux": _view(
+        "full_audio_centered_flux", FULL_RALLY_FEATURE_NAMES + RALLY_AUDIO_FEATURE_NAMES,
+        uses_audio=True, audio_normalization="centered_flux",
     ),
     "calibrated_canonical": _view(
         "calibrated_canonical",
@@ -180,6 +184,7 @@ assert {name: view.dimension for name, view in RALLY_FEATURE_VIEWS.items()} == {
     "full": 154,
     "full_audio": 161,
     "full_audio_zscore": 161,
+    "full_audio_centered_flux": 161,
     "calibrated_canonical": 142,
     "no_position": 138,
     "image_position": 150,

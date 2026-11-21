@@ -13,7 +13,7 @@ import pytest
 import torch
 
 from src.temporal_selector.rally import RallySegmenter, RallySegmenterConfig
-from src.temporal_selector.rally_audio import _rolling_zscore
+from src.temporal_selector.rally_audio import _centered_flux_excess, _rolling_zscore
 from src.temporal_selector.rally_dataset import (
     RallyDataConfig,
     RallySourceConfig,
@@ -290,6 +290,14 @@ def test_audio_view_keeps_visual_features_and_aligns_delayed_track(source, tmp_p
             first_observed = standardized.frame_indices.index(3)
             assert not standardized.frame_values[first_observed, visual_dim:].any()
 
+    centered_flux = RallyWindowDataset(
+        RallyDataConfig((source,), None, None, feature_view="full_audio_centered_flux")
+    )
+    assert centered_flux.manifest["audio_coverage"] == with_audio.manifest["audio_coverage"]
+    for raw, centered in zip(with_audio, centered_flux, strict=True):
+        torch.testing.assert_close(centered.frame_validity, raw.frame_validity)
+        torch.testing.assert_close(centered.frame_values[:, :-1], raw.frame_values[:, :-1], rtol=0, atol=0)
+
     rows = predict_source(
         source, _model("full_audio_zscore"), preprocessing={"feature_view": "full_audio_zscore"},
         decoder={"threshold": 0.49, "max_gap_seconds": 0, "minimum_duration_seconds": 0},
@@ -321,3 +329,16 @@ def test_audio_zscore_uses_trailing_observed_values_for_all_seven_features():
     np.testing.assert_allclose(_rolling_zscore(values * 2 + 30, valid, times), actual, atol=1e-6)
     normalized_prefix = _rolling_zscore(values[:4], valid[:4], times[:4])
     np.testing.assert_array_equal(normalized_prefix, actual[:4])
+
+
+def test_centered_flux_uses_future_background_and_excludes_missing_samples():
+    times = np.array([0.0, 0.2, 0.4, 0.6, 0.7, 1.34, 1.36, 1.5, 2.4, 4, 4.1, 4.2])
+    flux = np.array([0, 0.2, 0.4, 0.9, 9, 0.6, 0.7, 0.8, 9, 0.1, 10, 0.1], dtype=np.float32)
+    valid = np.array([True, True, True, True, False, True, True, True, True, True, True, True])
+    result = _centered_flux_excess(flux, valid, times)
+    # At 0.6s the valid neighborhood has median 0.4 and MAD 0.2.
+    assert result[3] == pytest.approx((0.9 - 0.4) / (1.4826 * 0.2))
+    assert result[4] == 0
+    assert result[8] == 0  # An isolated observation defines its own baseline.
+    assert result[10] == 8  # A transient above flat background is bounded.
+    assert (result >= 0).all()

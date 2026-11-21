@@ -7,6 +7,7 @@ import shutil
 import subprocess
 from itertools import pairwise
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 
@@ -24,6 +25,9 @@ _SAMPLE_RATE = 16_000
 _WINDOW_SAMPLES = 768  # 48 ms
 _FLUX_LAG_SAMPLES = 256  # 16 ms
 _BAND_EDGES = (100, 500, 1500, 3500, 7500)
+_FLUX_BASELINE_RADIUS_SECONDS = 0.75
+_FLUX_BASELINE_SCALE_FLOOR = 0.05
+RallyAudioNormalization = Literal["raw", "trailing_zscore", "centered_flux"]
 
 
 def _run_media_tool(tool: str, *args: str) -> bytes:
@@ -69,8 +73,32 @@ def _rolling_zscore(
     return result
 
 
+def _centered_flux_excess(
+    flux: np.ndarray, valid: np.ndarray, timestamps: np.ndarray
+) -> np.ndarray:
+    """Measure positive excess above the local flux median on valid audio."""
+    observed = flux[valid]
+    times = timestamps[valid]
+    left = np.searchsorted(times, times - _FLUX_BASELINE_RADIUS_SECONDS)
+    right = np.searchsorted(times, times + _FLUX_BASELINE_RADIUS_SECONDS, side="right")
+    normalized = np.empty_like(observed)
+    for index, (start, end) in enumerate(zip(left, right, strict=True)):
+        window = observed[start:end]
+        median = np.median(window)
+        mad = np.median(np.abs(window - median))
+        scale = max(1.4826 * mad, _FLUX_BASELINE_SCALE_FLOOR)
+        normalized[index] = min(max((observed[index] - median) / scale, 0), 8)
+    result = np.zeros_like(flux)
+    result[valid] = normalized
+    return result
+
+
 def read_rally_audio(
-    video: Path, *, frame_count: int, fps: float, rolling_zscore: bool = False
+    video: Path,
+    *,
+    frame_count: int,
+    fps: float,
+    normalization: RallyAudioNormalization = "raw",
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return finite audio values and a per-feature coverage mask for every frame."""
     values = np.zeros((frame_count, len(RALLY_AUDIO_FEATURE_NAMES)), dtype=np.float32)
@@ -201,6 +229,8 @@ def read_rally_audio(
         rise = np.maximum(spectrum[has_history] - previous, 0)
         values[indices[has_history], -1] = np.log1p(10 * rise.sum(axis=1))
         valid[indices[has_history], -1] = True
-    if rolling_zscore:
+    if normalization == "trailing_zscore":
         values = _rolling_zscore(values, valid, timestamps)
+    elif normalization == "centered_flux":
+        values[:, -1] = _centered_flux_excess(values[:, -1], valid[:, -1], timestamps)
     return values, valid

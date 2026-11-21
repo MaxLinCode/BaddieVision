@@ -70,7 +70,10 @@ def exported(tmp_path, request):
     return model, manifest, json.loads(manifest.read_text())
 
 
-@pytest.mark.parametrize("exported", ("full", "full_audio", "full_audio_zscore"), indirect=True)
+@pytest.mark.parametrize(
+    "exported", ("full", "full_audio", "full_audio_zscore", "full_audio_centered_flux"),
+    indirect=True,
+)
 def test_export_retains_predictions_without_private_metadata(exported):
     original, manifest_path, manifest = exported
     checkpoint = manifest_path.parent / "rally-segmenter.pt"
