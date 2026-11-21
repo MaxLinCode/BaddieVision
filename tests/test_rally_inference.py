@@ -2,6 +2,8 @@
 
 import csv
 import json
+import shutil
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 
@@ -16,6 +18,7 @@ from src.temporal_selector.rally_dataset import (
     RallySourceConfig,
     RallyWindowDataset,
 )
+from src.temporal_selector.rally_features import rally_feature_view
 from src.temporal_selector.rally_inference import (
     predict_source,
     predict_windows,
@@ -78,8 +81,9 @@ def source(tmp_path, request):
     return RallySourceConfig(identity.source_id, video, assignments, poses, calibration)
 
 
-def _model():
+def _model(feature_view="full"):
     model = RallySegmenter(RallySegmenterConfig(
+        frame_feature_dim=rally_feature_view(feature_view).dimension,
         token_size=8, num_layers=1, num_attention_heads=2, feed_forward_size=16, dropout=0,
     ))
     with torch.no_grad():
@@ -223,3 +227,60 @@ def test_missing_all_players_and_poses_still_covers_every_frame(source):
     pose_metadata = source.pose_cache_path.read_text().splitlines()[0]
     source.pose_cache_path.write_text(pose_metadata + "\n")
     assert len(_predict(source)) == 11
+
+
+@pytest.mark.skipif(
+    not shutil.which("ffprobe") or not shutil.which("ffmpeg"), reason="requires FFmpeg"
+)
+def test_audio_view_keeps_visual_features_and_aligns_delayed_track(source, tmp_path):
+    visual = RallyWindowDataset(RallyDataConfig((source,), None, None))
+    silent = RallyWindowDataset(RallyDataConfig((source,), None, None, feature_view="full_audio"))
+    visual_dim = visual.feature_view.dimension
+    for baseline, window in zip(visual, silent, strict=True):
+        torch.testing.assert_close(window.frame_values[:, :visual_dim], baseline.frame_values)
+        torch.testing.assert_close(window.frame_validity[:, :visual_dim], baseline.frame_validity)
+        assert not window.frame_validity[:, visual_dim:].any()
+        assert not window.frame_values[:, visual_dim:].any()
+
+    video = tmp_path / "delayed-audio.mp4"
+    subprocess.run([
+        "ffmpeg", "-nostdin", "-v", "error", "-i", str(source.video_path),
+        "-itsoffset", "0.6", "-f", "lavfi", "-i", "sine=frequency=1000:duration=0.6",
+        "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "alac", str(video),
+    ], check=True, capture_output=True)
+    source = replace(source, video_path=video)
+    identity_path = tmp_path / "source.json"
+    identity = replace(SourceIdentity.read(identity_path), video_sha256=sha256_file(video))
+    identity.write(identity_path)
+    calibration = json.loads(source.calibration_path.read_text())
+    calibration["artifact_metadata"]["source_identity_sha256"] = identity.fingerprint
+    source.calibration_path.write_text(json.dumps(calibration))
+    metadata, *observations = map(json.loads, source.assignments_path.read_text().splitlines())
+    metadata.update(
+        source_identity_sha256=identity.fingerprint,
+        calibration_sha256=sha256_file(source.calibration_path),
+    )
+    _jsonl(source.assignments_path, metadata, observations)
+
+    with_audio = RallyWindowDataset(
+        RallyDataConfig((source,), None, None, feature_view="full_audio")
+    )
+    assert with_audio.manifest["audio_coverage"][source.source_id] == {
+        "frames": 11, "energy_frames": 3, "flux_frames": 3,
+    }
+    for window in with_audio:
+        for index, frame in enumerate(window.frame_indices):
+            valid = window.frame_validity[index, visual_dim:]
+            if frame in (3, 4, 5):
+                assert valid.all()
+                bands = window.frame_values[index, visual_dim + 2:visual_dim + 6]
+                assert bands.argmax().item() == 1
+            else:
+                assert not valid.any()
+                assert not window.frame_values[index, visual_dim:].any()
+    rows = predict_source(
+        source, _model("full_audio"), preprocessing={"feature_view": "full_audio"},
+        decoder={"threshold": 0.49, "max_gap_seconds": 0, "minimum_duration_seconds": 0},
+        batch_size=2,
+    )
+    assert [row["frame"] for row in rows] == list(range(11))

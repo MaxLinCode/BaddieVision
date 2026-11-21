@@ -42,3 +42,34 @@ Epoch recovery applies to the maintained clean-only fold and production
 trainers. The comparative historical study arms accept recipe overrides but
 do not support `--resume`. Recovery does not claim identical results across
 different accelerator/runtime versions or nondeterministic device kernels.
+
+## Compare vision and audio
+
+The opt-in `full_audio` view appends seven features to the default `full`
+visual view. It reads the first audio stream with FFmpeg and FFprobe and uses
+video presentation timestamps to align the audio, including when frame spacing
+varies. The features capture RMS, peak level, power in four frequency bands,
+and positive spectral flux. A 48 ms window centered on each video frame's
+display interval captures short transients such as shuttle hits and shoe
+squeaks. Clips with no audio and windows outside audio coverage use the model's
+existing feature-validity mask. The run records audio coverage per source.
+
+Run both views with the same source config, device, seed, and training settings.
+Supply a local config that points to source recordings with their original
+audio and to the matching annotations and player observations.
+
+```bash
+for view in full full_audio; do
+  python -m src.temporal_selector.rally_experiment \
+    --config config/rally-experiment.local.json --clean-only \
+    --feature-view "$view" --output-dir "outputs/rally-${view}"
+done
+```
+
+Compare `macro.interval_f1`, `macro.boundary_mae`, false splits, and false merges
+in each run's `metrics.json`. Check `by_camera` for performance on each held-out
+camera and `dataset_manifest.audio_coverage` for the number of observed frames
+per source. The checkpoint and release manifest identify the feature view
+automatically. Export the trained checkpoint with
+[the existing inference exporter](rally-inference.md#export-the-existing-production-checkpoint)
+and use its manifest for prediction.

@@ -1,13 +1,15 @@
-"""Versioned rally feature views over one canonical full-frame vector."""
+"""Versioned rally feature views and their ordered inputs."""
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Final, Mapping, Sequence
+from typing import Final
 
 import torch
 from torch import Tensor
 
+from .rally_audio import RALLY_AUDIO_FEATURE_NAMES
 
 RALLY_FEATURE_SCHEMA: Final = "baddievision.rally.feature_views"
 RALLY_FEATURE_VERSION: Final = 2
@@ -39,11 +41,12 @@ FULL_RALLY_FEATURE_NAMES: Final = tuple(
 
 @dataclass(frozen=True)
 class RallyFeatureView:
-    """A stable ordered projection of the full rally feature vector."""
+    """A stable ordered projection of visual features and optional audio features."""
 
     name: str
     names: tuple[str, ...]
     full_indices: tuple[int, ...]
+    uses_audio: bool = False
 
     @property
     def dimension(self) -> int:
@@ -52,8 +55,11 @@ class RallyFeatureView:
     def select(self, values: Tensor, validity: Tensor) -> tuple[Tensor, Tensor]:
         if values.shape != validity.shape:
             raise ValueError("rally values and validity must have identical shapes")
-        if values.shape[-1] != len(FULL_RALLY_FEATURE_NAMES):
-            raise ValueError("feature-view projection requires the full rally vector")
+        input_dimension = len(FULL_RALLY_FEATURE_NAMES)
+        if self.uses_audio:
+            input_dimension += len(RALLY_AUDIO_FEATURE_NAMES)
+        if values.shape[-1] != input_dimension:
+            raise ValueError("feature-view projection received an incompatible rally vector")
         indices = torch.tensor(self.full_indices, dtype=torch.long, device=values.device)
         return values.index_select(-1, indices), validity.index_select(-1, indices)
 
@@ -69,19 +75,23 @@ def _names_for_fields(fields: Sequence[str], *, include_pose: bool = True) -> tu
     return selected
 
 
-def _view(name: str, names: Sequence[str]) -> RallyFeatureView:
+def _view(name: str, names: Sequence[str], *, uses_audio: bool = False) -> RallyFeatureView:
     requested = tuple(names)
     if len(requested) != len(set(requested)):
         raise AssertionError(f"duplicate feature in rally view {name}")
-    positions = {feature: index for index, feature in enumerate(FULL_RALLY_FEATURE_NAMES)}
+    input_names = FULL_RALLY_FEATURE_NAMES + (RALLY_AUDIO_FEATURE_NAMES if uses_audio else ())
+    positions = {feature: index for index, feature in enumerate(input_names)}
     missing = [feature for feature in requested if feature not in positions]
     if missing:
         raise AssertionError(f"unknown feature in rally view {name}: {missing}")
-    return RallyFeatureView(name, requested, tuple(positions[item] for item in requested))
+    return RallyFeatureView(name, requested, tuple(positions[item] for item in requested), uses_audio)
 
 
 RALLY_FEATURE_VIEWS: Final[Mapping[str, RallyFeatureView]] = {
     "full": _view("full", FULL_RALLY_FEATURE_NAMES),
+    "full_audio": _view(
+        "full_audio", FULL_RALLY_FEATURE_NAMES + RALLY_AUDIO_FEATURE_NAMES, uses_audio=True
+    ),
     "calibrated_canonical": _view(
         "calibrated_canonical",
         _names_for_fields(
@@ -154,6 +164,7 @@ def rally_feature_indices(names: Sequence[str]) -> tuple[int, ...]:
 assert len(FULL_RALLY_FEATURE_NAMES) == 154
 assert {name: view.dimension for name, view in RALLY_FEATURE_VIEWS.items()} == {
     "full": 154,
+    "full_audio": 161,
     "calibrated_canonical": 142,
     "no_position": 138,
     "image_position": 150,

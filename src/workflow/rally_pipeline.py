@@ -64,7 +64,9 @@ def run_pipeline(
     _calibrate(source, calibration, force=force or "pose" in rebuild)
 
     from src.rally_release import resolve_release
+    from src.temporal_selector.rally_audio import rally_audio_runtime
     from src.temporal_selector.rally_dataset import RallySourceConfig
+    from src.temporal_selector.rally_features import rally_feature_view
     from src.temporal_selector.rally_inference import (
         predict_source,
         write_prediction_artifacts,
@@ -76,6 +78,11 @@ def run_pipeline(
     print(
         f"{source.source_id}: verified model assets; using {resolved_device}",
         flush=True,
+    )
+    audio_runtime = (
+        rally_audio_runtime()
+        if rally_feature_view(manifest["rally_feature_view"]).uses_audio
+        else None
     )
     preprocessing = {
         **manifest["preprocessing"],
@@ -117,6 +124,7 @@ def run_pipeline(
         "preprocessing": preprocessing,
         "implementation": implementation_identity("predict"),
         "checkpoint_sha256": sha256_file(assets["checkpoint"]),
+        **({"audio_runtime": audio_runtime} if audio_runtime is not None else {}),
         "device": resolved_device,
         "batch_size": batch_size,
     }

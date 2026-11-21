@@ -60,6 +60,7 @@ from .rally_evaluation import (
     rally_metrics,
     tune_rally_decoder,
 )
+from .rally_features import RALLY_FEATURE_VIEWS, rally_feature_view
 
 
 class _RallyBatchSampler(Sampler[list[int]]):
@@ -996,6 +997,8 @@ def run_clean_rally_experiment(
     test_rows: list[dict[str, Any]] = []
     selected_epochs: list[int] = []
     fold_artifacts = []
+    feature_view = rally_dataset.feature_view
+    model_config = RallySegmenterConfig(frame_feature_dim=feature_view.dimension)
     calibration_fingerprints = {
         source: str(value["calibration_sha256"])
         for source, value in rally_dataset.manifest["sources"].items()
@@ -1024,7 +1027,7 @@ def run_clean_rally_experiment(
             "decoder_selection": "validation_labels_only",
             "test_labels_used_for_selection": False, "test_evaluations": 1,
         }
-        model = RallySegmenter(RallySegmenterConfig()).to(device)
+        model = RallySegmenter(model_config).to(device)
         history, epoch = train_rally_segmenter(
             model,
             train,
@@ -1067,6 +1070,7 @@ def run_clean_rally_experiment(
             annotation_fingerprint=rally_dataset.annotation_fingerprint,
             split_manifest=split_manifest, training_recipe=recipe, chosen_epoch=epoch,
             decoder_configuration=asdict(decoder),
+            feature_view=feature_view.name,
             calibration_fingerprints=calibration_fingerprints,
             extra={"epoch_history": history, "experiment_role": "expanded_clean_only"},
         )
@@ -1080,7 +1084,7 @@ def run_clean_rally_experiment(
         _write_json(fold_dir / "metrics.json", fold_result)
         fold_artifacts.append(fold_result)
     production_epoch = round(statistics.median(selected_epochs))
-    production = RallySegmenter(RallySegmenterConfig()).to(device)
+    production = RallySegmenter(model_config).to(device)
     production_history = train_rally_segmenter_fixed_epochs(
         production,
         rally_dataset.windows,
@@ -1116,6 +1120,7 @@ def run_clean_rally_experiment(
         annotation_fingerprint=rally_dataset.annotation_fingerprint,
         split_manifest=production_split, training_recipe=recipe,
         chosen_epoch=production_epoch, decoder_configuration=asdict(oof_decoder),
+        feature_view=feature_view.name,
         calibration_fingerprints=calibration_fingerprints,
         extra={"epoch_history": production_history, "out_of_fold_decoder_search": oof_search,
                "experiment_role": "expanded_clean_only_production"},
@@ -1302,6 +1307,8 @@ def load_experiment_datasets(
     rally_config: RallyDataConfig = rally_data_config_from_selector_mapping(
         raw, base_dir=config_path.parent
     )
+    if rally_feature_view(rally_config.feature_view).uses_audio:
+        raise ValueError("audio feature views require --clean-only")
     rally_dataset = RallyWindowDataset(rally_config)
     legacy_config, _ = load_dataset_config(
         config_path,
@@ -1353,6 +1360,11 @@ def _parser() -> argparse.ArgumentParser:
         help="Resume the clean-only run from committed epochs",
     )
     parser.add_argument("--clean-only", action="store_true")
+    parser.add_argument(
+        "--feature-view",
+        choices=tuple(RALLY_FEATURE_VIEWS),
+        help="Override dataset.rally_feature_view for the clean-only experiment",
+    )
     parser.add_argument("--candidate-inclusive-only", action="store_true")
     return parser
 
@@ -1381,12 +1393,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     if args.clean_only and args.candidate_inclusive_only:
         raise ValueError("choose only one rally experiment arm")
+    if args.feature_view is not None and not args.clean_only:
+        raise ValueError("--feature-view requires --clean-only")
     if args.clean_only:
         config_path = args.config.expanduser().resolve()
         raw = json.loads(config_path.read_text(encoding="utf-8"))
-        rally_dataset = RallyWindowDataset(
-            rally_data_config_from_selector_mapping(raw, base_dir=config_path.parent)
-        )
+        data_config = rally_data_config_from_selector_mapping(raw, base_dir=config_path.parent)
+        if args.feature_view is not None:
+            data_config = replace(data_config, feature_view=args.feature_view)
+        rally_dataset = RallyWindowDataset(data_config)
         camera_sources = _load_camera_sources(raw.get("camera_sources"))
         configured = {source.source_id for source in rally_dataset.config.sources}
         grouped = [source for sources in camera_sources.values() for source in sources]

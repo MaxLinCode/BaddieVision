@@ -53,6 +53,7 @@ STAGE_CODE = {
         "src/temporal_selector/rally_dataset.py",
         "src/temporal_selector/observations.py",
         "src/temporal_selector/rally_features.py",
+        "src/temporal_selector/rally_audio.py",
         "src/temporal_selector/rally.py",
         "src/temporal_selector/batch.py",
         "src/court_projection.py",

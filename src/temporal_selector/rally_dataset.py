@@ -30,6 +30,7 @@ from .rally import (
     RALLY_FEATURE_VERSION,
     RallyBatch,
 )
+from .rally_audio import read_rally_audio
 from .rally_features import (
     FULL_RALLY_FEATURE_NAMES,
     rally_feature_view,
@@ -122,6 +123,7 @@ class RallyWindowDataset(Dataset[RallyWindow]):
             else None
         )
         self.feature_view = rally_feature_view(config.feature_view)
+        self._audio_coverage: dict[str, dict[str, int]] = {}
         self.windows = self._compile()
         annotation_identity = (
             {
@@ -176,6 +178,7 @@ class RallyWindowDataset(Dataset[RallyWindow]):
             **identity,
             "dataset_fingerprint": dataset_fingerprint,
             "annotation_fingerprint": self.annotation_fingerprint,
+            **({"audio_coverage": self._audio_coverage} if self.feature_view.uses_audio else {}),
             "window_count": len(self.windows),
             "source_window_counts": {
                 source.source_id: sum(
@@ -306,6 +309,17 @@ class RallyWindowDataset(Dataset[RallyWindow]):
             if identity.video_sha256 != source_manifest.video_sha256:
                 raise ValueError("source identity video fingerprint does not match rally annotations")
 
+        audio = (
+            read_rally_audio(source.video_path, frame_count=frame_count, fps=fps)
+            if self.feature_view.uses_audio
+            else None
+        )
+        if audio is not None:
+            self._audio_coverage[source.source_id] = {
+                "frames": frame_count,
+                "energy_frames": int(audio[1][:, 0].sum()),
+                "flux_frames": int(audio[1][:, -1].sum()),
+            }
         ownership = max(1, round(fps * self.config.ownership_seconds))
         radius = max(1, round(fps * self.config.context_seconds))
         windows: list[RallyWindow] = []
@@ -348,6 +362,10 @@ class RallyWindowDataset(Dataset[RallyWindow]):
                     offset = player_index * 11
                     frame_values[offset + 6] = float(projected[0]) / HALF_WIDTH
                     frame_values[offset + 7] = float(projected[1]) / HALF_LENGTH
+                if audio is not None:
+                    audio_values, audio_validity = audio
+                    frame_values.extend(audio_values[frame].tolist())
+                    frame_validity.extend(audio_validity[frame].tolist())
                 selected_values, selected_validity = self.feature_view.select(
                     torch.tensor(frame_values, dtype=torch.float32),
                     torch.tensor(frame_validity, dtype=torch.bool),
