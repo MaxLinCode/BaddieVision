@@ -280,3 +280,19 @@ def test_mps_loss_is_finite_when_host_exposes_mps() -> None:
     model = RallySegmenter(_config()).to(device)
     losses = model.losses(_batch().to(device))
     assert bool(torch.isfinite(losses.total))
+
+
+def test_mixed_fps_camera_split_keeps_guard_in_seconds() -> None:
+    windows = [
+        *(_window("slow", frame, fps=10) for frame in range(100)),
+        *(_window("fast", frame, fps=20) for frame in range(100)),
+    ]
+    train, validation, split = chronological_camera_train_validation_split(
+        windows, {"camera": ("slow", "fast")}, guard_seconds=1.0,
+    )
+
+    assert len(train) == 120
+    assert train[-1].window_id == "fast-19"
+    assert len(validation) == 40
+    assert validation[0].window_id == "fast-60"
+    assert split["cameras"]["camera"]["cut_seconds"] == 12

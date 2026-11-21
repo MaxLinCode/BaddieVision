@@ -85,3 +85,40 @@ concatenated out-of-fold predictions.
 The matched candidate-inclusive arm keeps shuttle-selection loss at zero. It
 does not improve interval F1 and reduces macro ROC/PR AUC, so raw shuttle
 candidate tokens are not part of the maintained rally segmenter.
+
+## Seven-source YOLO26L and BoT-SORT run
+
+The seven-source run refreshed tracks, player assignments, and MediaPipe pose
+for all four camera groups. Sources within a camera group can have different
+frame rates. For those groups the 80% cut and one-second guards use elapsed
+time, with whole-window containment and source-local frame indices.
+
+Regenerate the features into a fresh directory using a local experiment config,
+then train from the generated config:
+
+```bash
+python -m tools.retrack_rally_experiment \
+  --config config/rally-experiment.local.json --output-dir outputs/retracked \
+  --model models/yolo26l.engine --pose-model models/pose_landmarker_full.task \
+  --device cuda
+python -m src.temporal_selector.rally_experiment \
+  --config outputs/retracked/experiment.json --output-dir outputs/rally-training \
+  --device cuda --clean-only
+```
+
+For interrupted preprocessing, run the same command against the same inputs
+and output directory with `--resume`. Completed tracks are reused and pose
+inference resumes from matching saved crops. For interrupted training, pass
+`--resume` once the training directory has a `resolved-config.json`.
+
+| Camera-held-out macro metric | Prior seven-source run | YOLO26L and BoT-SORT |
+|---|---:|---:|
+| Frame F1 | 0.724 | 0.774 |
+| ROC AUC | 0.864 | 0.889 |
+| Rally interval F1 | 0.393 | 0.488 |
+| Boundary MAE (frames) | 30.09 | 27.49 |
+
+The runs used the same labels, camera groups, window counts, and training
+recipe. The production checkpoint was fit for six epochs with its decoder
+calibrated on held-out predictions. The comparison uses a small private
+dataset and does not establish generalization to new camera setups.
