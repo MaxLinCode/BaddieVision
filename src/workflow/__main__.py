@@ -61,7 +61,7 @@ def _parser() -> argparse.ArgumentParser:
     calibrate.add_argument("--preview", type=Path)
     people = stage_commands.add_parser("person-tracks")
     people.add_argument("--source", required=True)
-    people.add_argument("--model", default="yolov8n.pt")
+    people.add_argument("--model", help="person detector weights or TensorRT engine")
     people.add_argument("--force", action="store_true")
     people.add_argument(
         "--device", choices=("auto", "cpu", "mps", "cuda"), default="auto"
@@ -97,7 +97,7 @@ def _parser() -> argparse.ArgumentParser:
     extract.add_argument(
         "--profile", choices=("observations", "rally"), default="observations"
     )
-    extract.add_argument("--person-model", default="yolov8n.pt")
+    extract.add_argument("--person-model", help="person detector weights or TensorRT engine")
     extract.add_argument("--pose-model", type=Path)
     extract.add_argument("--model-root", type=Path)
     extract.add_argument(

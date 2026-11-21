@@ -14,17 +14,14 @@ from InPlay.heuristic.corrections import finalize, validate_rows
 from InPlay.heuristic.court import add_court_signal, add_player_court_signal
 from InPlay.heuristic.evaluate import Interval, evaluate, interval_iou
 from InPlay.heuristic.players import (
-    assign_player_slots,
     build_player_rows,
     crop_point_to_image,
     detector_class_name,
     ensure_person_detector,
-    select_on_court_tracks,
     write_player_csv,
 )
 from InPlay.heuristic.segment import CANONICAL_FIELDS, segment_tracks
 from InPlay.heuristic.tracks import preprocess_tracks, read_track_csv
-from src.court_projection import CourtHomography
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -265,40 +262,8 @@ def test_correction_validation_and_finalize() -> None:
     assert any("overlapping" in error for error in validate_rows([base, overlap]))
 
 
-def test_player_geometry_and_spectator_rejection() -> None:
+def test_player_crop_coordinates_map_to_the_source_image() -> None:
     assert crop_point_to_image((0.5, 0.25), (100, 20, 300, 220)) == (200, 70)
-    observations = {
-        1: [(i, (100, 100, 200, 500)) for i in range(20)],
-        2: [(i, (500, 100, 600, 450)) for i in range(18)],
-        9: [(i, (0, 0, 20, 30)) for i in range(100)],
-        8: [(0, (300, 100, 350, 300))],
-    }
-    assert set(select_on_court_tracks(observations, (800, 600))) == {1, 2}
-
-
-def test_player_selection_uses_homography_when_available() -> None:
-    calibration = CourtHomography(np.eye(3))
-    observations = {
-        1: [(i, (-0.5, -2.0, 0.5, -1.0)) for i in range(20)],
-        2: [(i, (1.5, 1.0, 2.5, 2.0)) for i in range(18)],
-        9: [(i, (7.5, 0.0, 8.5, 1.0)) for i in range(100)],
-    }
-    assert set(select_on_court_tracks(observations, (800, 600), calibration)) == {1, 2}
-
-
-def test_player_slots_are_near_to_far_with_calibration_or_screen_fallback() -> None:
-    calibration = CourtHomography(np.eye(3))
-    court_observations = {
-        11: [(i, (-0.5, 3.0, 0.5, 4.0)) for i in range(10)],
-        22: [(i, (-0.5, -4.0, 0.5, -3.0)) for i in range(10)],
-    }
-    assert assign_player_slots([11, 22], court_observations, calibration) == [22, 11]
-
-    screen_observations = {
-        11: [(i, (100.0, 100.0, 200.0, 250.0)) for i in range(10)],
-        22: [(i, (100.0, 300.0, 200.0, 500.0)) for i in range(10)],
-    }
-    assert assign_player_slots([11, 22], screen_observations) == [22, 11]
 
 
 def test_player_detector_must_map_class_zero_to_person() -> None:

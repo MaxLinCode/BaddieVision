@@ -230,7 +230,7 @@ def run_extraction(
     output_dir: Path | None = None,
     calibration: Path | None = None,
     profile: str = "observations",
-    person_model: str | Path = "yolov8n.pt",
+    person_model: str | Path | None = None,
     pose_model: Path | None = None,
     model_root: Path | None = None,
     device: str = "auto",

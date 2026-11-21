@@ -54,14 +54,6 @@ python3 -m src.workflow stage import-artifact --source SOURCE \
 python3 -m src.workflow stage players --source SOURCE
 ```
 
-Player assignment uses the replacement guard by default. A track that still
-qualifies for its court role, averages at least 0.60 detector confidence, and
-occupies at least half of its occupancy window can only be replaced by a
-challenger averaging at least 0.35 detector confidence. Use
-`--no-replacement-guard` with the standalone
-`python3 -m InPlay.heuristic.player_interpretation` command to replay the earlier
-policy. Same-ID reacquisition remains opt-in on that command.
-
 Canonical observations are grouped beneath `ARTIFACT_ROOT/shuttle/`,
 `ARTIFACT_ROOT/players/`, and `ARTIFACT_ROOT/court/`. Imports are atomic and do
 not modify their source files.
@@ -143,7 +135,7 @@ Use one callable or CLI on local, Colab, and Kaggle:
 
 ```bash
 python -m src.workflow extract --source SOURCE --profile observations \
-  --person-model models/yolov8n.pt --pose-model models/pose_landmarker_full.task \
+  --pose-model models/pose_landmarker_full.task \
   --model-root . --device auto
 python -m src.workflow extract --source SOURCE --profile observations \
   --model-root . --rebuild pose
@@ -211,8 +203,54 @@ probabilities. Rendering failure preserves the prediction receipt.
 
 Person tracking and TrackNet currently recover at **stage boundaries**. An
 interrupted tracking stage restarts from frame zero. Arbitrary frame seeking is
-not supported: ByteTrack state/track identities and TrackNet temporal overlap
+not supported: BoT-SORT state/track identities and TrackNet temporal overlap
 and background preprocessing must be restored or deterministically replayed
 before a future implementation can claim equivalent in-stage tracking resume.
 For epoch recovery and configurable rally experiments, see
 [training and recovery](rally-training.md).
+
+## YOLO26L person detector
+
+Person extraction defaults to YOLO26L with fixed-camera BoT-SORT. CUDA uses
+`models/yolo26l.engine` when that FP16 TensorRT engine is present. CPU, Apple
+MPS, and CUDA without the engine use `yolo26l.pt`. Build the engine on the target
+NVIDIA GPU and TensorRT installation because engines are hardware and version
+specific.
+
+```bash
+mkdir -p models
+python -c 'from ultralytics import YOLO; YOLO("yolo26l.pt").export(format="engine", half=True, device=0, imgsz=960)'
+mv yolo26l.engine models/yolo26l.engine
+python -m src.workflow extract --help
+```
+
+Tracking uses a 960 × 960 input to retain more detail for the far player.
+It costs more GPU time and memory than the previous 640 × 640 input.
+
+Install compatible CUDA, TensorRT, and an Ultralytics release supporting YOLO26
+before export. Use `--device cuda` for extraction. The engine stores its FP16
+precision. CUDA PyTorch inference also requests FP16. Use `--person-model`
+with `extract` or `--model` with `stage person-tracks` to select a detector
+explicitly. Rebuild existing generated observations with `--rebuild person`
+or `stage person-tracks --force` to apply the new tracker and assignment rules.
+
+### Player assignment diagnostics
+
+Person extraction passes detections to BoT-SORT at a confidence floor of 0.10.
+BoT-SORT uses a 0.10 low match threshold, 0.25 high and new-track thresholds, and
+a 30-frame lost-track buffer. Camera-motion compensation and ReID are disabled.
+
+After tracking, the player stage assigns one track per court half using the
+projected box bottom center and a 1 m margin beyond the calibrated court. A current
+incumbent keeps its slot and can return for up to 0.5 s after its last eligible
+observation. For an open slot, tracks with at least 0.25 s of eligible
+observations in the next 0.5 s are ranked by unpadded court occupancy, then
+detection confidence. Missing observations remain empty.
+
+Assignment JSONL includes the role decision and whether visible heels or toes
+agree with the box's court half and padded bounds. The preview highlights the
+projected pose foot in red on disagreements. These diagnostics use the original
+MediaPipe result before temporal interpolation.
+
+Use separate artifact roots for diagnostic runs. Existing tracking outputs can
+be read or imported with their original provenance.

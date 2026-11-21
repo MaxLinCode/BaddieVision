@@ -22,11 +22,12 @@ from .artifacts import (
 from .identity import SourceIdentity, sha256_file
 from .registry import SourceEntry
 from .publication import publish, recover, recovered_publication
-from .source import verify_source as verify_source
+from .source import select_device, verify_source as verify_source
 
 
 STAGE_CODE = {
     "person": (
+        "config/botsort-fixed-camera.yaml",
         "InPlay/heuristic/person_tracks.py",
         "InPlay/heuristic/players.py",
         "src/single_video/video.py",
@@ -365,7 +366,7 @@ def _player_stage_valid(
 def run_person_stage(
     source: SourceEntry,
     *,
-    model: str | Path = "yolov8n.pt",
+    model: str | Path | None = None,
     device: str = "auto",
     force: bool = False,
     extractor: Callable[..., Any] | None = None,
@@ -395,8 +396,19 @@ def run_person_stage(
                 source, "person", "completed", reused=True, origin="validated_import"
             )
             return False
+    from InPlay.heuristic.person_tracks import default_person_model
+
+    if device == "auto":
+        device = select_device(device)
+    if model is None:
+        model = default_person_model(device)
     # Resolve an Ultralytics alias before hashing; receipts always describe model bytes.
     model_path = Path(model).expanduser()
+    if not model_path.is_file() and model_path.suffix.lower() == ".engine":
+        raise FileNotFoundError(
+            f"person detector engine is missing: {model_path}; "
+            "export YOLO26L on the target NVIDIA GPU (see docs/workflow.md)"
+        )
     if not model_path.is_file():
         from ultralytics import YOLO
 

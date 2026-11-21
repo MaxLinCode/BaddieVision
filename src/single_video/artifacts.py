@@ -289,7 +289,18 @@ def render_player_preview(
                     cv2.rectangle(image, (px1, py1), (px2, py2), color, 1)
                 quality = float(pose.get("pose_quality", 0.0))
                 pose_status = pose.get("temporal_status") or pose.get("status", "missing")
-                status_lines.append(f"{slot_name}: {assignment['track_id']} pose {quality:.2f} {pose_status}")
+                diagnostic = slot.get("foot_diagnostic", {})
+                image_foot = diagnostic.get("image_foot")
+                if image_foot is not None:
+                    foot_color = (0, 0, 255) if diagnostic["status"] == "disagrees" else color
+                    center = tuple(int(round(value)) for value in image_foot)
+                    cv2.circle(image, center, 6, foot_color, 2, cv2.LINE_AA)
+                foot_status = f" feet {diagnostic['status']}" if diagnostic else ""
+                decision = f" {slot['decision']}" if "decision" in slot else ""
+                status_lines.append(
+                    f"{slot_name}: {assignment['track_id']}{decision} pose {quality:.2f} "
+                    f"{pose_status}{foot_status}"
+                )
             for index, line in enumerate(status_lines):
                 cv2.putText(image, line, (12, 22 + index * 19), cv2.FONT_HERSHEY_SIMPLEX, 0.48, colors.get(line[:2], (230, 230, 230)), 1, cv2.LINE_AA)
             writer.write(image)
