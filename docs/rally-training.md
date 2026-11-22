@@ -5,7 +5,7 @@ The maintained candidate-free experiment accepts ordinary training settings:
 ```bash
 python -m src.temporal_selector.rally_experiment \
   --config config/rally-experiment.example.json \
-  --output-dir outputs/rally-cpu-smoke --clean-only --feature-view full_audio_zscore \
+  --output-dir outputs/rally-cpu-smoke --clean-only \
   --device cpu --epochs 1 --batch-size 2 --learning-rate 0.001
 ```
 
@@ -43,10 +43,12 @@ trainers. The comparative historical study arms accept recipe overrides but
 do not support `--resume`. Recovery does not claim identical results across
 different accelerator/runtime versions or nondeterministic device kernels.
 
-## Compare vision and audio
+## Canonical motion, vision, and audio
 
-The `full_audio_zscore` view appends seven normalized audio features to the
-`full` visual view. It reads the first audio stream with FFmpeg and FFprobe and uses
+The canonical `full_audio_zscore_motion` view adds signed player and court
+velocity to the baseline `full_audio_zscore` view. The audio portion appends
+seven normalized audio features to the visual representation. It reads the
+first audio stream with FFmpeg and FFprobe and uses
 video presentation timestamps to align the audio, including when frame spacing
 varies. The features capture RMS, peak level, power in four frequency bands,
 and positive spectral flux. A 48 ms window centered on each video frame's
@@ -58,12 +60,13 @@ transformer masks missing audio tokens in attention while retaining the
 corresponding video tokens.
 The run records audio coverage per source.
 
-Run both views with the same source config, device, seed, and training settings.
+Run the canonical view and its ablations with the same source config, device,
+seed, and training settings.
 Supply a local config that points to source recordings with their original
 audio and to the matching annotations and player observations.
 
 ```bash
-for view in full full_audio_zscore; do
+for view in full full_audio_zscore full_audio_zscore_motion; do
   python -m src.temporal_selector.rally_experiment \
     --config config/rally-experiment.local.json --clean-only \
     --feature-view "$view" --output-dir "outputs/rally-${view}"
@@ -78,10 +81,11 @@ automatically. Export the trained checkpoint with
 [the existing inference exporter](rally-inference.md#export-the-existing-production-checkpoint)
 and use its manifest for prediction.
 
-The z-score view uses the trailing ten seconds of observed values for each
+The audio z-score uses the trailing ten seconds of observed values for each
 channel and emits zero when there is insufficient history or variance.
-Use `full_audio` to compare against raw features with the same attention
-architecture and camera splits.
+`full_audio_zscore` remains available as the audio-only baseline. Use
+`full_audio` to compare against raw audio with the same attention architecture
+and camera splits.
 
 ## Clean train and validation partitions
 
@@ -138,8 +142,9 @@ python -m src.temporal_selector.rally_experiment \
   --clean-only --preset rtmpose-audio --device cuda
 ```
 
-The preset selects the `full_audio_zscore` view, a four-second centered transformer
-window (two seconds on either side), and a smoothing weight of 0.1. At 30 fps, a
+The preset selects the canonical `full_audio_zscore_motion` view, a four-second
+centered transformer window (two seconds on either side), and a smoothing
+weight of 0.1. At 30 fps, a
 full window contains 121 frames including the center and owns 30 frames.
 To compare another context radius, set `dataset.rally_context_seconds`
 in the local experiment config. The loss penalizes probability changes between adjacent
@@ -153,11 +158,12 @@ threshold on its validation frames.
 The production checkpoint freezes both thresholds using out-of-fold
 predictions, along with the gap and minimum-duration settings.
 
-## Joint and court velocity experiment
+## Joint and court velocity representation
 
-Use `--clean-only --feature-view full_motion` to add signed x/y velocity for
-each pose landmark and each player's court position. Use
-`full_audio_zscore_motion` for the corresponding normalized-audio recipe.
+The canonical view adds signed x/y velocity for each pose landmark and each
+player's court position. Use `full_motion` for the visual-only experiment, or
+pass `--feature-view full_audio_zscore` explicitly to train the audio-only
+baseline.
 Both views use the existing court-centered coordinate convention, with the
 court center at zero and the outer lines at ±1 along each axis. Coordinates
 can extend beyond the lines. A centered three-frame median on each court

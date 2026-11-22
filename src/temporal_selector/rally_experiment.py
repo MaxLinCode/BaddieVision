@@ -61,7 +61,11 @@ from .rally_evaluation import (
     rally_metrics,
     tune_rally_decoder,
 )
-from .rally_features import RALLY_FEATURE_VIEWS, rally_feature_view
+from .rally_features import (
+    CANONICAL_RALLY_FEATURE_VIEW,
+    RALLY_FEATURE_VIEWS,
+    rally_feature_view,
+)
 from .rally_intervals import read_rally_intervals
 from .rally_partitions import plan_rally_camera_splits, prepare_rally_partition
 
@@ -1490,7 +1494,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if rtmpose_preset:
         if not args.clean_only:
             raise ValueError("the RTMPose audio preset requires --clean-only")
-        if args.feature_view not in (None, "full_audio_zscore", "full_audio_zscore_motion"):
+        if args.feature_view not in (None, "full_audio_zscore", CANONICAL_RALLY_FEATURE_VIEW):
             raise ValueError("the RTMPose audio preset requires a normalized-audio feature view")
         overrides.setdefault("temporal_smoothing_weight", 0.1)
     recipe = RallyTrainingRecipe.from_preset(
@@ -1519,7 +1523,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         feature_view = args.feature_view
         if rtmpose_preset and feature_view is None:
-            feature_view = "full_audio_zscore"
+            feature_view = CANONICAL_RALLY_FEATURE_VIEW
         if feature_view is not None:
             data_config = replace(data_config, feature_view=feature_view)
         camera_sources = _load_camera_sources(raw.get("camera_sources"))

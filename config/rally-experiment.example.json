@@ -19,7 +19,7 @@
   },
   "dataset": {
     "pose_visibility_threshold": 0.5,
-    "rally_feature_view": "full",
+    "rally_feature_view": "full_audio_zscore_motion",
     "rally_intervals_path": "../.annotation-final/rallies.csv",
     "rally_manifest_path": "../.annotation-final/rallies.manifest.json",
     "sources": [
