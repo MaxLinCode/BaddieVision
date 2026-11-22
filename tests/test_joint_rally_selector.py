@@ -640,3 +640,18 @@ def test_joint_runner_writes_conditional_outputs(tmp_path: Path) -> None:
         "no_shuttle",
         "not_required",
     }
+
+
+def test_decoder_hysteresis_requires_a_new_entry_after_the_rally_ends() -> None:
+    config = InPlayDecoderConfig(
+        threshold=0.6,
+        continuation_threshold=0.4,
+        max_gap_seconds=0,
+        minimum_duration_seconds=0,
+    )
+    probabilities = [0.5, 0.6, 0.5, 0.4, 0.39, 0.5, 0.6]
+    assert decode_inplay_probabilities(probabilities, fps=30, config=config) == (
+        False, True, True, True, False, False, True,
+    )
+    with pytest.raises(ValueError, match="continuation threshold"):
+        InPlayDecoderConfig(threshold=0.4, continuation_threshold=0.6)

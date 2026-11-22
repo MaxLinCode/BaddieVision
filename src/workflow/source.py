@@ -12,7 +12,8 @@ from .artifacts import (
     import_calibration,
     register_native_calibration,
 )
-from .identity import SourceIdentity, inspect_source, sha256_file
+from .identity import ParentVideoProvenance, SourceIdentity, inspect_source, sha256_file
+from .publication import recovered_publication
 from .registry import SourceCatalog, SourceEntry
 
 
@@ -33,6 +34,7 @@ def resolve_source(
     source_id: str | None = None,
     video: Path | None = None,
     output_dir: Path | None = None,
+    parent_video: ParentVideoProvenance | None = None,
 ) -> SourceEntry:
     if video is None:
         if source_id is None:
@@ -54,12 +56,57 @@ def resolve_source(
             raise ValueError(
                 "output directory belongs to a different source; choose a new --output-dir"
             )
-        source = catalog.add(video, source_id=source_id, output_dir=output_dir)
+        source = catalog.add(
+            video, source_id=source_id, output_dir=output_dir, parent_video=parent_video
+        )
         if source.artifact_root != output_dir:
             raise ValueError(
                 "video is already registered with a different output directory"
             )
     verify_source(source)
+    return source
+
+
+def resolve_rally_30fps_source(
+    catalog: SourceCatalog,
+    *,
+    source_id: str | None,
+    video: Path | None,
+    output_dir: Path | None,
+) -> SourceEntry:
+    """Register converted footage as a distinct source before deriving artifacts."""
+    from src.single_video.video import has_constant_frame_rate, prepare_working_video, read_video_info
+    from src.temporal_selector.rally_dataset import RALLY_INPUT_FPS, validate_rally_source_fps
+
+    if video is not None:
+        video = video.expanduser().resolve()
+        fps = float(read_video_info(video)["fps"])
+        if abs(fps - RALLY_INPUT_FPS) > 1e-6 or not has_constant_frame_rate(video, RALLY_INPUT_FPS):
+            source_id = source_id or f"{video.stem}-30fps"
+            if output_dir is None:
+                raise ValueError("--output-dir is required to prepare a 30 fps source")
+            root = output_dir.expanduser().resolve()
+            digest = sha256_file(video)
+            converted = root / "input" / f"{digest}-30fps.mp4"
+            previous = root / "source.json"
+            with recovered_publication(previous):
+                if previous.is_file():
+                    identity = SourceIdentity.read(previous)
+                    if not converted.is_file() or identity.video_sha256 != sha256_file(converted):
+                        raise ValueError(
+                            "output directory belongs to a different source; choose a new --output-dir"
+                        )
+                else:
+                    prepare_working_video(video, converted, None, None, RALLY_INPUT_FPS, exact_fps=True)
+                return resolve_source(
+                    catalog, source_id=source_id, video=converted, output_dir=root,
+                    parent_video=ParentVideoProvenance(video_sha256=digest, handling="fps-transcode"),
+                )
+    source = resolve_source(catalog, source_id=source_id, video=video, output_dir=output_dir)
+    identity = SourceIdentity.read(source.identity_path)
+    validate_rally_source_fps(source.source_id, identity.fps_numerator / identity.fps_denominator)
+    if video is None and not has_constant_frame_rate(source.video_path, RALLY_INPUT_FPS):
+        raise ValueError(f"{source.source_id}: register a new constant 30 fps source")
     return source
 
 

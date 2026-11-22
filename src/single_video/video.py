@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+from fractions import Fraction
 from pathlib import Path
 
 import cv2
@@ -56,6 +57,35 @@ def read_video_info(path: Path) -> dict[str, object]:
         }
     finally:
         cap.release()
+
+
+def has_constant_frame_rate(path: Path, fps: int | float) -> bool:
+    """Check presentation timestamps in demuxed video packets."""
+    executable = shutil.which("ffprobe")
+    if not executable:
+        raise RuntimeError("ffprobe is required to verify constant frame rate")
+    result = subprocess.run(
+        [executable, "-v", "error", "-select_streams", "v:0",
+         "-show_packets", "-show_streams", "-show_entries", "packet=pts:stream=time_base",
+         "-of", "json", str(path)],
+        capture_output=True, text=True, check=False,
+    )
+    if result.returncode:
+        raise RuntimeError(f"ffprobe failed for {path}: {result.stderr.strip()}")
+    value = json.loads(result.stdout)
+    packets = value.get("packets", [])
+    streams = value.get("streams", [])
+    if not packets or not streams or any("pts" not in packet for packet in packets):
+        return False
+    timestamps = sorted(int(packet["pts"]) for packet in packets)
+    ticks_per_frame = 1 / (Fraction(streams[0]["time_base"]) * Fraction(fps))
+    if ticks_per_frame < 1:
+        return False
+    start = timestamps[0]
+    return all(
+        0 < right - left and abs((right - start) - index * ticks_per_frame) < 1
+        for index, (left, right) in enumerate(zip(timestamps, timestamps[1:]), start=1)
+    )
 
 
 def segment_suffix(start_time_sec: int | float | None, end_time_sec: int | float | None) -> str:
@@ -166,15 +196,21 @@ def prepare_working_video(
     start_time_sec: int | float | None,
     end_time_sec: int | float | None,
     target_fps: int | float | None = None,
+    *,
+    exact_fps: bool = False,
 ) -> Path:
-    """Copy/trim an MP4, transcoding only when its FPS must be reduced."""
+    """Copy or trim an MP4, optionally converting in either direction to an exact rate."""
     video_path, output_path = Path(video_path), Path(output_path)
     if video_path.suffix.lower() != ".mp4":
         raise ValueError(f"Source video must be an MP4 file: {video_path}")
     info = read_video_info(video_path)
     _validate_segment(info, start_time_sec, end_time_sec, target_fps)
     source_fps = float(info["fps"])
-    convert_fps = target_fps is not None and source_fps > float(target_fps) + _FPS_TOLERANCE
+    convert_fps = target_fps is not None and (
+        (not math.isclose(source_fps, target_fps, rel_tol=0.0, abs_tol=1e-6)
+         or not has_constant_frame_rate(video_path, target_fps))
+        if exact_fps else source_fps > float(target_fps) + _FPS_TOLERANCE
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = _temporary_sibling(output_path)
     try:
@@ -226,12 +262,17 @@ def prepare_working_video(
                 result = subprocess.run(command, capture_output=True, text=True, check=False)
                 if result.returncode:
                     raise RuntimeError(f"FFmpeg stream-copy trim failed: {result.stderr.strip()}")
-        validate_prepared_video(
+        prepared_info = validate_prepared_video(
             temporary_path,
             width=int(info["width"]),
             height=int(info["height"]),
             fps=float(target_fps) if convert_fps else source_fps,
         )
+        if exact_fps and target_fps is not None and (
+            not math.isclose(float(prepared_info["fps"]), target_fps, rel_tol=0.0, abs_tol=1e-6)
+            or (convert_fps and not has_constant_frame_rate(temporary_path, target_fps))
+        ):
+            raise RuntimeError(f"prepared video did not reach the required {target_fps:g} fps")
         temporary_path.replace(output_path)
     finally:
         temporary_path.unlink(missing_ok=True)

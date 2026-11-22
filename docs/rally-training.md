@@ -107,3 +107,43 @@ normalization applies during training and offline inference.
 Run this view with `--clean-only --feature-view full_audio_centered_flux
 --audio-dropout 0` to compare the centered baseline directly with the raw
 `full_audio` view under the same training recipe.
+
+## RTMPose and raw audio recipe
+
+Start with a constant 30 fps source. Preparing a source at a different rate
+creates a converted MP4 and a distinct source identity before any tracks,
+pose caches, or frame-indexed annotations are produced. Use an unused source
+ID and artifact root when migrating an existing recording. Calibrate and
+review labels on the resulting source-local frame sequence.
+
+```bash
+python -m src.workflow source add --video match.mp4 --rally-30-fps \
+  --source-id match-30fps --artifact-root outputs/match-30fps
+python -m src.workflow stage players --source match-30fps \
+  --pose-backend rtmpose --pose-model models/rtmpose-l-halpe26-384x288-fp16.onnx \
+  --pose-device cpu
+```
+
+Run court calibration and the person-tracks stage before the player stage.
+RTMPose uses Halpe26 FP16 ONNX, 15% crop padding, and no retry. Every training
+source must use the same pose model and crop recipe. The dataset and checkpoints
+record the SHA-256 of the pose asset and the preprocessing settings.
+
+```bash
+python -m src.temporal_selector.rally_experiment \
+  --config config/rally-experiment.local.json --output-dir outputs/rally-rtmpose-audio \
+  --clean-only --preset rtmpose-audio --device cuda
+```
+
+The preset selects the raw `full_audio` view and defaults to a smoothing
+weight of 0.1. The loss penalizes probability changes between adjacent
+supervised frames with the same label. It excludes rally boundaries and
+masked frames. A four-camera replay of earlier experiments favored 0.1 over
+0.3 for macro interval F1 (0.501 versus 0.463). The combined recipe requires
+its own camera-held-out evaluation.
+
+For RTMPose, the chronological split uses a three-second guard for the
+centered player-assignment context. Each fold tunes a higher rally entry
+threshold and a lower continuation threshold on its validation frames.
+The production checkpoint freezes both thresholds using out-of-fold
+predictions, along with the gap and minimum-duration settings.

@@ -18,13 +18,15 @@ from typing import Any, Callable, Iterable
 
 import cv2
 import numpy as np
-from tqdm.auto import tqdm
 
 from InPlay.heuristic.person_tracks import load_person_tracks, raw_artifact_fingerprint
 from src.court_projection import HALF_LENGTH, HALF_WIDTH, CourtHomography
-from src.pose_estimator import create_pose_estimator, ensure_pose_model_asset, pose_backend_info
+from src.pose_backends import resolve_crop_pose_backend
+from src.rtmpose import RTMPOSE_BACKEND_TYPE
+from InPlay.heuristic.pose_crops import expand_pose_bbox as expand_pose_bbox
+from InPlay.heuristic.pose_crops import iter_player_crop_poses
 from src.single_video.video import read_video_info
-from src.workflow.identity import SourceIdentity
+from src.workflow.identity import SourceIdentity, sha256_file
 
 COURT_MARGIN_METERS = 0.3
 REASSIGN_INTERVAL_SECONDS = 0.5
@@ -441,16 +443,6 @@ def _bbox_key(bbox: Iterable[float]) -> tuple[float, ...]:
     return tuple(round(float(value), 6) for value in bbox)
 
 
-def expand_pose_bbox(
-    bbox: Iterable[float], frame_size: tuple[int, int], padding: float
-) -> list[float]:
-    """Expand every detector-box edge by a fraction of its original dimension."""
-    x1, y1, x2, y2 = map(float, bbox)
-    width, height = frame_size
-    dx, dy = (x2 - x1) * padding, (y2 - y1) * padding
-    return [max(0.0, x1 - dx), max(0.0, y1 - dy), min(float(width), x2 + dx), min(float(height), y2 + dy)]
-
-
 def pose_quality(landmarks: list[dict[str, Any]] | None) -> float:
     """Score visible torso and limb coverage without affecting classifier features."""
     if not landmarks or len(landmarks) <= max(QUALITY_LANDMARKS):
@@ -461,42 +453,13 @@ def pose_quality(landmarks: list[dict[str, Any]] | None) -> float:
     return float(0.6 * np.mean(torso) + 0.4 * np.mean(limbs))
 
 
-def _estimate_pose_record(
-    image: np.ndarray, bbox: Iterable[float], estimator: Any, padding: float,
-) -> dict[str, Any]:
-    """Infer one independent image crop, including quality-based padding retry."""
-    attempts = []
-    paddings = [padding] if padding == POSE_RETRY_PADDING else [padding, POSE_RETRY_PADDING]
-    for crop_padding in paddings:
-        expanded = expand_pose_bbox(bbox, (image.shape[1], image.shape[0]), crop_padding)
-        x1, y1, x2, y2 = [int(round(value)) for value in expanded]
-        pose_bbox = [float(x1), float(y1), float(x2), float(y2)]
-        crop = image[y1:y2, x1:x2]
-        landmarks = None
-        status = "invalid_crop"
-        if crop.size:
-            result = estimator.estimate_pose(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
-            landmarks = result.to_raw_landmarks() if result.detected else None
-            status = "detected" if landmarks else "no_pose"
-        attempts.append((pose_quality(landmarks), landmarks, pose_bbox, status))
-        if attempts[-1][0] >= POSE_QUALITY_THRESHOLD:
-            break
-    quality, landmarks, pose_bbox, status = max(attempts, key=lambda item: item[0])
-    if landmarks and quality < POSE_QUALITY_THRESHOLD:
-        status = "low_quality"
-    return {
-        "pose_bbox": pose_bbox, "status": status, "temporal_status": "original",
-        "pose_quality": quality, "pose_attempts": len(attempts), "pose_landmarks": landmarks,
-    }
-
-
-def _pose_preprocessing(padding: float) -> dict[str, Any]:
+def _pose_preprocessing(padding: float, retry_padding: float | None = POSE_RETRY_PADDING) -> dict[str, Any]:
     implementation = "\n".join(
         ast.dump(ast.parse(textwrap.dedent(inspect.getsource(component))), include_attributes=False)
-        for component in (_bbox_key, expand_pose_bbox, pose_quality, _estimate_pose_record)
+        for component in (_bbox_key, expand_pose_bbox, pose_quality, iter_player_crop_poses)
     )
     return {
-        "pose_crop_padding": padding, "retry_padding": POSE_RETRY_PADDING,
+        "pose_crop_padding": padding, "retry_padding": retry_padding,
         "quality_threshold": POSE_QUALITY_THRESHOLD,
         "quality_landmarks": QUALITY_LANDMARKS,
         "implementation_fingerprint": "sha256:" + hashlib.sha256(implementation.encode()).hexdigest(),
@@ -504,8 +467,8 @@ def _pose_preprocessing(padding: float) -> dict[str, Any]:
     }
 
 
-def pose_preprocessing_fingerprint(padding: float) -> str:
-    payload = json.dumps(_pose_preprocessing(padding), sort_keys=True, separators=(",", ":"))
+def pose_preprocessing_fingerprint(padding: float, retry_padding: float | None = POSE_RETRY_PADDING) -> str:
+    payload = json.dumps(_pose_preprocessing(padding, retry_padding), sort_keys=True, separators=(",", ":"))
     return "sha256:" + hashlib.sha256(payload.encode()).hexdigest()
 
 
@@ -619,8 +582,10 @@ def enrich_pose_cache(
     pose_cache_path: str | Path,
     *,
     pose_model_asset: str | Path | None = None,
-    pose_crop_padding: float = POSE_CROP_PADDING,
-    estimator_factory: Callable[..., Any] = create_pose_estimator,
+    pose_crop_padding: float | None = None,
+    pose_backend: str = "mediapipe",
+    pose_device: str | None = None,
+    estimator_factory: Callable[..., Any] | None = None,
     pose_work_dir: str | Path | None = None,
     pose_backend_identity: dict[str, Any] | None = None,
 ) -> tuple[dict[tuple[int, int, tuple[float, ...]], dict[str, Any]], int]:
@@ -632,19 +597,16 @@ def enrich_pose_cache(
     reuse it without publishing incomplete assignments or player features.
     """
     raw_fingerprint = raw_artifact_fingerprint(person_tracks_path)
-    # Resolve/download the production asset before hashing it. Previously the
-    # first run fingerprinted a missing path and the second run fingerprinted
-    # the downloaded bytes, forcing an unnecessary full recomputation.
-    resolved_model_asset = (
-        ensure_pose_model_asset(pose_model_asset)
-        if estimator_factory is create_pose_estimator
-        else pose_model_asset
+    crop_backend = resolve_crop_pose_backend(
+        pose_backend, pose_model_asset, device=pose_device,
+        crop_padding=pose_crop_padding, mediapipe_padding=POSE_CROP_PADDING,
+        mediapipe_retry_padding=POSE_RETRY_PADDING, estimator_factory=estimator_factory,
     )
-    backend = pose_backend_info(resolved_model_asset)
+    backend = crop_backend.info
     if pose_backend_identity is not None:
         backend["adapter_identity"] = pose_backend_identity
     model_fingerprint = pose_model_fingerprint(backend)
-    preprocessing_fingerprint = pose_preprocessing_fingerprint(pose_crop_padding)
+    preprocessing_fingerprint = pose_preprocessing_fingerprint(crop_backend.padding, crop_backend.retry_padding)
     metadata, records = load_pose_cache(pose_cache_path)
     if metadata is not None and metadata.get("raw_artifact_fingerprint") != raw_fingerprint:
         # Person tracks are an immutable source layer, while poses are derived
@@ -739,56 +701,38 @@ def enrich_pose_cache(
                 required[key] = assignment
     missing = [key for key in required if (*key, model_fingerprint, preprocessing_fingerprint) not in existing]
     new_records: list[dict[str, Any]] = []
-    if missing:
-        missing_by_frame: dict[int, list[tuple[int, int, tuple[float, ...]]]] = defaultdict(list)
-        for key in missing:
-            missing_by_frame[key[0]].append(key)
-        cap = cv2.VideoCapture(str(video_path))
-        if not cap.isOpened():
-            raise RuntimeError(f"failed to open pose source: {video_path}")
-        estimator = None
-        try:
-            estimator = estimator_factory(
-                model_asset_path=resolved_model_asset, running_mode="image"
-            )
-            last_frame = max(missing_by_frame)
-            progress = tqdm(
-                range(last_frame + 1),
-                desc=f"MediaPipe pose enrichment ({len(missing)} crops)",
-                unit="frame",
-            )
-            computed = 0
-            for frame_index in progress:
-                ok, image = cap.read()
-                if not ok:
-                    raise RuntimeError(f"video ended before required pose frame {frame_index}")
-                for key in missing_by_frame.get(frame_index, []):
-                    assignment = required[key]
-                    record = {
-                        "type": "pose", "frame": key[0], "track_id": key[1],
-                        "bbox": list(key[2]), "raw_artifact_fingerprint": raw_fingerprint,
-                        "pose_model_fingerprint": model_fingerprint,
-                        "preprocessing_fingerprint": preprocessing_fingerprint,
-                        **_estimate_pose_record(image, assignment["bbox"], estimator, pose_crop_padding),
-                    }
-                    _validate_pose_unit(record)
-                    _atomic_json_lines(unit_directory / _pose_unit_name(record), [record])
-                    new_records.append(record)
-                    existing[(*key, model_fingerprint, preprocessing_fingerprint)] = record
-                    computed += 1
-                    progress.set_postfix(computed=f"{computed}/{len(missing)}", refresh=False)
-        finally:
-            if estimator is not None:
-                estimator.close()
-            cap.release()
+    missing_by_frame = defaultdict(list)
+    for key in missing:
+        missing_by_frame[key[0]].append((key, required[key]["bbox"]))
+    for key, attempt, attempts in iter_player_crop_poses(
+        video_path, missing_by_frame, crop_backend, pose_quality, POSE_QUALITY_THRESHOLD,
+    ):
+        status = attempt.status
+        if attempt.landmarks and attempt.quality < POSE_QUALITY_THRESHOLD:
+            status = "low_quality"
+        record = {
+            "type": "pose", "frame": key[0], "track_id": key[1],
+            "bbox": list(key[2]), "raw_artifact_fingerprint": raw_fingerprint,
+            "pose_model_fingerprint": model_fingerprint,
+            "preprocessing_fingerprint": preprocessing_fingerprint,
+            "pose_bbox": attempt.bbox, "status": status, "temporal_status": "original",
+            "pose_quality": attempt.quality, "pose_attempts": attempts,
+            "pose_landmarks": attempt.landmarks,
+        }
+        _validate_pose_unit(record)
+        _atomic_json_lines(unit_directory / _pose_unit_name(record), [record])
+        new_records.append(record)
+        existing[(*key, model_fingerprint, preprocessing_fingerprint)] = record
     cache_metadata = {
         "type": "metadata", "schema": "pose_cache", "schema_version": POSE_CACHE_SCHEMA_VERSION,
         "raw_artifact_fingerprint": raw_fingerprint,
         "pose_model_fingerprint": model_fingerprint, "pose_backend": backend,
-        "preprocessing": _pose_preprocessing(pose_crop_padding),
+        "preprocessing": _pose_preprocessing(crop_backend.padding, crop_backend.retry_padding),
         "preprocessing_fingerprint": preprocessing_fingerprint,
     }
-    if new_records or recovered or metadata is None or cache_needs_upgrade:
+    if backend["backend_type"] == RTMPOSE_BACKEND_TYPE:
+        cache_metadata["pose_model_sha256"] = sha256_file(backend["model_asset_path"])
+    if new_records or recovered or metadata != cache_metadata or cache_needs_upgrade:
         _atomic_json_lines(pose_cache_path, [cache_metadata, *records, *new_records])
     active = {
         (frame, track_id, bbox): item
@@ -802,6 +746,8 @@ def apply_temporal_pose_validation(
     assignments: list[dict[str, Any]],
     pose_cache: dict[tuple[int, int, tuple[float, ...]], dict[str, Any]],
     frame_size: tuple[int, int],
+    *,
+    mask_missing_landmarks: bool = False,
 ) -> None:
     """Reject isolated torso outliers and fill only bracketed one-frame pose gaps."""
     diagonal = float(np.hypot(*frame_size))
@@ -825,12 +771,19 @@ def apply_temporal_pose_validation(
             next_points = _landmarks_to_image(nxt["pose_landmarks"], nxt.get("pose_bbox", nxt["bbox"]))
             if len(prev_points) <= max(TORSO_LANDMARKS) or len(next_points) != len(prev_points):
                 continue
+            if mask_missing_landmarks and any(
+                record["pose_landmarks"][joint]["visibility"] <= 0
+                for record in (prev, nxt) for joint in TORSO_LANDMARKS
+            ):
+                continue
             prev_torso = prev_points[list(TORSO_LANDMARKS)].mean(axis=0)
             next_torso = next_points[list(TORSO_LANDMARKS)].mean(axis=0)
             if np.linalg.norm(next_torso - prev_torso) / diagonal > TEMPORAL_MAX_BRACKET_MOTION:
                 continue
             interpolated = (prev_points + next_points) / 2.0
             usable = current.get("pose_landmarks") and current.get("pose_quality", 0.0) >= POSE_QUALITY_THRESHOLD
+            if mask_missing_landmarks and usable:
+                usable = all(current["pose_landmarks"][joint]["visibility"] > 0 for joint in TORSO_LANDMARKS)
             if usable:
                 current_points = _landmarks_to_image(current["pose_landmarks"], current.get("pose_bbox", current["bbox"]))
                 torso = current_points[list(TORSO_LANDMARKS)].mean(axis=0)
@@ -841,9 +794,13 @@ def apply_temporal_pose_validation(
             else:
                 current["temporal_status"] = "interpolated_single_gap"
             template = prev["pose_landmarks"]
-            current["pose_landmarks"] = _image_to_landmarks(
-                interpolated, template, current.get("pose_bbox", current["bbox"])
-            )
+            landmarks = _image_to_landmarks(interpolated, template, current.get("pose_bbox", current["bbox"]))
+            if mask_missing_landmarks:
+                for point, next_point in zip(landmarks, nxt["pose_landmarks"], strict=True):
+                    point["visibility"] = min(point["visibility"], next_point["visibility"])
+                    if point["visibility"] <= 0:
+                        point.update(x=0.0, y=0.0, z=0.0)
+            current["pose_landmarks"] = landmarks
             current["pose_quality"] = min(float(prev.get("pose_quality", 0)), float(nxt.get("pose_quality", 0)))
             current["status"] = "detected"
 
@@ -853,10 +810,13 @@ def derive_activity_and_rows(
     pose_cache: dict[tuple[int, int, tuple[float, ...]], dict[str, Any]],
     frame_size: tuple[int, int],
     homography: CourtHomography,
+    *,
+    mask_missing_landmarks: bool = False,
 ) -> list[dict[str, Any]]:
     width, height = frame_size
     diagonal = float(np.hypot(width, height))
     previous_pose: dict[int, np.ndarray] = {}
+    previous_mask: dict[int, np.ndarray] = {}
     previous_foot: dict[int, np.ndarray] = {}
     activity_window: deque[float] = deque(maxlen=ACTIVITY_WINDOW)
     rows = []
@@ -873,6 +833,7 @@ def derive_activity_and_rows(
             foot = np.asarray([(bbox[0] + bbox[2]) / 2.0, bbox[3]], dtype=float)
             cache = pose_cache.get((int(frame["frame"]), track_id, _bbox_key(bbox)))
             pose_array = None
+            mask = None
             if cache and cache.get("pose_landmarks"):
                 landmarks = cache["pose_landmarks"]
                 pose_bbox = cache.get("pose_bbox", bbox)
@@ -880,6 +841,8 @@ def derive_activity_and_rows(
                     [pose_bbox[0] + point["x"] * (pose_bbox[2] - pose_bbox[0]), pose_bbox[1] + point["y"] * (pose_bbox[3] - pose_bbox[1])]
                     for point in landmarks
                 ]) / np.asarray([width, height])
+                if mask_missing_landmarks:
+                    mask = np.asarray([point["visibility"] > 0 for point in landmarks])
                 visible_feet = [
                     [pose_bbox[0] + landmarks[index]["x"] * (pose_bbox[2] - pose_bbox[0]), pose_bbox[1] + landmarks[index]["y"] * (pose_bbox[3] - pose_bbox[1])]
                     for index in (29, 30, 31, 32)
@@ -888,12 +851,18 @@ def derive_activity_and_rows(
                 if visible_feet:
                     foot = np.mean(visible_feet, axis=0)
             activity = 0.0
-            if pose_array is not None and slot_number in previous_pose:
-                activity = float(np.linalg.norm(pose_array - previous_pose[slot_number], axis=1).mean())
-            elif slot_number in previous_foot:
+            if slot_number in previous_foot:
                 activity = float(np.linalg.norm(foot - previous_foot[slot_number]) / diagonal)
+            if pose_array is not None and slot_number in previous_pose:
+                movement = np.linalg.norm(pose_array - previous_pose[slot_number], axis=1)
+                if mask is not None:
+                    movement = movement[mask & previous_mask[slot_number]]
+                if movement.size:
+                    activity = float(movement.mean())
             if pose_array is not None:
                 previous_pose[slot_number] = pose_array
+                if mask is not None:
+                    previous_mask[slot_number] = mask
             previous_foot[slot_number] = foot
             assignment["activity"] = activity
             assignment["foot"] = [float(foot[0]), float(foot[1])]
@@ -946,8 +915,10 @@ def interpret_players(
     players_csv_path: str | Path,
     *,
     pose_model_asset: str | Path | None = None,
-    pose_crop_padding: float = POSE_CROP_PADDING,
-    estimator_factory: Callable[..., Any] = create_pose_estimator,
+    pose_crop_padding: float | None = None,
+    pose_backend: str = "mediapipe",
+    pose_device: str | None = None,
+    estimator_factory: Callable[..., Any] | None = None,
     pose_work_dir: str | Path | None = None,
     pose_backend_identity: dict[str, Any] | None = None,
     assignment_policy: AssignmentPolicy = AssignmentPolicy(),
@@ -988,10 +959,11 @@ def interpret_players(
     cache, computed = enrich_pose_cache(
         video_path, assignments, person_tracks_path, pose_cache_path,
         pose_model_asset=pose_model_asset, pose_crop_padding=pose_crop_padding,
-        estimator_factory=estimator_factory,
+        estimator_factory=estimator_factory, pose_backend=pose_backend, pose_device=pose_device,
         pose_work_dir=pose_work_dir, pose_backend_identity=pose_backend_identity,
     )
-    apply_temporal_pose_validation(assignments, cache, frame_size)
+    mask_missing = pose_backend == "rtmpose"
+    apply_temporal_pose_validation(assignments, cache, frame_size, mask_missing_landmarks=mask_missing)
     cache_metadata, cache_records = load_pose_cache(pose_cache_path)
     if cache_metadata is not None:
         validated_records = []
@@ -1003,7 +975,9 @@ def interpret_players(
                 item = active_item
             validated_records.append(item)
         _atomic_json_lines(pose_cache_path, [cache_metadata, *validated_records])
-    rows = derive_activity_and_rows(assignments, cache, frame_size, homography)
+    rows = derive_activity_and_rows(
+        assignments, cache, frame_size, homography, mask_missing_landmarks=mask_missing
+    )
     assignment_metadata = {
         "type": "metadata", "schema": "player_assignments", "schema_version": 3,
         "source_id": identity.source_id,

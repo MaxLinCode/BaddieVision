@@ -147,3 +147,30 @@ Before publishing:
 The model card must identify the small private evaluation dataset only through
 aggregate counts/results and describe the known fragmentation and camera-transfer
 limitations. This release changes packaging and inference, not model accuracy.
+
+## Run a trained RTMPose release
+
+Export the research checkpoint with the same FP16 Halpe26 ONNX pose asset
+used to generate its training observations.
+
+```bash
+python -m tools.export_rally_release \
+  --checkpoint outputs/rally-rtmpose-audio/production-rally-segmenter.pt \
+  --output-dir outputs/rally-release \
+  --person-detector models/person-detector.pt \
+  --pose-model models/rtmpose-l-halpe26-384x288-fp16.onnx \
+  --model-id rally-rtmpose-audio --code-revision COMMIT_SHA \
+  --base-url https://example.org/rally-rtmpose-audio
+
+python -m src.workflow rally predict --video match.mp4 --output-dir outputs/match \
+  --checkpoint outputs/rally-release/rally-segmenter.pt \
+  --model-manifest outputs/rally-release/manifest.json --device cpu
+```
+
+RTMPose inference requires constant 30 fps. Passing a new MP4 as `--video`
+converts other frame rates and variable-rate input before registration and
+keeps the audio streams. For an existing nonconforming `--source`, prepare
+a new source and regenerate its frame-indexed artifacts. See the
+[training workflow](rally-training.md#rtmpose-and-raw-audio-recipe).
+For CUDA pose inference, install `onnxruntime-gpu` in place of `onnxruntime`
+and use `--device cuda`.

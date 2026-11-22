@@ -491,50 +491,58 @@ def tune_rally_decoder(
     validation_rows: Sequence[Mapping[str, Any]],
     *,
     fps_by_source: Mapping[str, float],
+    hysteresis: bool = False,
 ) -> tuple[InPlayDecoderConfig, list[dict[str, Any]]]:
-    """Tune threshold/gap/minimum duration using validation labels only."""
+    """Tune entry/continuation thresholds, gap and minimum duration using validation labels only."""
     if not validation_rows:
         raise ValueError("decoder tuning requires validation predictions")
     candidates: list[
         tuple[tuple[float, ...], InPlayDecoderConfig, dict[str, Any]]
     ] = []
+    drops = (0.05, 0.10) if hysteresis else (0.0,)
     for threshold in DECODER_THRESHOLDS:
-        for gap in DECODER_GAPS_SECONDS:
-            for minimum in DECODER_MINIMUM_SECONDS:
-                config = InPlayDecoderConfig(
-                    threshold=threshold,
-                    max_gap_seconds=gap,
-                    minimum_duration_seconds=minimum,
-                    preserve_edge_runs=True,
-                )
-                decoded = decode_prediction_rows(
-                    validation_rows,
-                    fps_by_source=fps_by_source,
-                    config=config,
-                )
-                metrics = rally_metrics(decoded)
-                intervals = metrics["intervals"]
-                boundary = intervals["mean_absolute_boundary_error"]
-                score = (
-                    float(intervals["f1"]),
-                    -float(boundary if boundary is not None else math.inf),
-                    float(metrics["f1"]),
-                    -gap,
-                    -minimum,
-                    -abs(threshold - 0.5),
-                )
-                candidates.append(
-                    (
-                        score,
-                        config,
-                        {
-                            "configuration": asdict(config),
-                            "validation_interval_f1": intervals["f1"],
-                            "validation_boundary_mae": boundary,
-                            "validation_frame_f1": metrics["f1"],
-                        },
+        for drop in drops:
+            if drop >= threshold:
+                continue
+            continuation = round(threshold - drop, 2) if drop else None
+            for gap in DECODER_GAPS_SECONDS:
+                for minimum in DECODER_MINIMUM_SECONDS:
+                    config = InPlayDecoderConfig(
+                        threshold=threshold,
+                        max_gap_seconds=gap,
+                        minimum_duration_seconds=minimum,
+                        preserve_edge_runs=True,
+                        continuation_threshold=continuation,
                     )
-                )
+                    decoded = decode_prediction_rows(
+                        validation_rows,
+                        fps_by_source=fps_by_source,
+                        config=config,
+                    )
+                    metrics = rally_metrics(decoded)
+                    intervals = metrics["intervals"]
+                    boundary = intervals["mean_absolute_boundary_error"]
+                    score = (
+                        float(intervals["f1"]),
+                        -float(boundary if boundary is not None else math.inf),
+                        float(metrics["f1"]),
+                        -gap,
+                        -minimum,
+                        -abs(threshold - 0.5),
+                        -drop,
+                    )
+                    candidates.append(
+                        (
+                            score,
+                            config,
+                            {
+                                "configuration": asdict(config),
+                                "validation_interval_f1": intervals["f1"],
+                                "validation_boundary_mae": boundary,
+                                "validation_frame_f1": metrics["f1"],
+                            },
+                        )
+                    )
     candidates.sort(key=lambda item: item[0], reverse=True)
     return candidates[0][1], [candidate[2] for candidate in candidates]
 

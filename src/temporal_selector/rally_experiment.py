@@ -328,6 +328,7 @@ def train_rally_segmenter(
     batch_size: int,
     seed: int,
     boundary_aux_weight: float = 0.25,
+    temporal_smoothing_weight: float = 0.0,
     learning_rate: float = 3e-4,
     gradient_clip_norm: float = 1.0,
     sampling: str = "boundary_balanced",
@@ -347,6 +348,7 @@ def train_rally_segmenter(
         epochs=epochs,
         batch_size=batch_size,
         boundary_aux_weight=boundary_aux_weight,
+        temporal_smoothing_weight=temporal_smoothing_weight,
         learning_rate=learning_rate,
         gradient_clip_norm=gradient_clip_norm,
         sampling=sampling,
@@ -370,7 +372,7 @@ def train_rally_segmenter(
                 f"recovery checkpoint already exists; use resume: {recovery_path}"
             )
     identity = {
-        "recipe": asdict(recipe),
+        "recipe": recipe.recovery_settings(),
         "model_config": asdict(model.config),
         "train_windows": _window_identity(train_windows),
         "validation_windows": _window_identity(validation_windows)
@@ -443,6 +445,7 @@ def train_rally_segmenter(
                 boundary_start_pos_weight=weights["rally_start_targets"],
                 boundary_end_pos_weight=weights["rally_end_targets"],
                 boundary_aux_weight=boundary_aux_weight,
+                temporal_smoothing_weight=temporal_smoothing_weight,
                 return_counts=False,
             )
             if not bool(torch.isfinite(losses.total)):
@@ -670,6 +673,7 @@ def _prepare_rally_run(
             )
         if isinstance(previous.get("training_recipe"), dict):
             previous["training_recipe"].setdefault("audio_dropout", 0.0)
+            previous["training_recipe"].setdefault("temporal_smoothing_weight", 0.0)
         if previous != configuration:
             raise ValueError("resume configuration or dataset identity has changed")
     else:
@@ -863,6 +867,7 @@ def run_independent_rally_experiment(
             training_recipe=recipe,
             chosen_epoch=clean_epoch,
             decoder_configuration=asdict(clean_decoder),
+            pose_training_metadata=rally_dataset.manifest.get("pose_training_metadata"),
             extra={"epoch_history": clean_history},
         )
         torch.save(clean_checkpoint, fold_dir / "rally-segmenter.pt")
@@ -988,6 +993,7 @@ def run_independent_rally_experiment(
             training_recipe=recipe,
             chosen_epoch=production_epoch,
             decoder_configuration=asdict(oof_decoder),
+            pose_training_metadata=rally_dataset.manifest.get("pose_training_metadata"),
             extra={
                 "out_of_fold_decoder_search": oof_search,
                 "acceptance": acceptance,
@@ -1019,6 +1025,7 @@ def run_clean_rally_experiment(
     device = device or torch.device(recipe.device)
     recipe = replace(recipe, device=device.type)
     feature_view = rally_dataset.feature_view
+    uses_rtmpose = "pose_training_metadata" in rally_dataset.manifest
     if recipe.audio_dropout and not feature_view.uses_audio:
         raise ValueError("audio dropout requires an audio feature view")
     output_dir, camera_sources = _prepare_rally_run(
@@ -1040,7 +1047,8 @@ def run_clean_rally_experiment(
         eligible = [window for window in rally_dataset.windows
                     if window.source_id in fold.training_source_ids]
         train, validation, split = chronological_camera_train_validation_split(
-            eligible, _training_camera_groups(fold, camera_sources), guard_seconds=1.0
+            eligible, _training_camera_groups(fold, camera_sources),
+            guard_seconds=3.0 if uses_rtmpose else 1.0,
         )
         test = [window for window in rally_dataset.windows
                 if window.source_id in fold.test_source_ids]
@@ -1068,6 +1076,7 @@ def run_clean_rally_experiment(
             batch_size=recipe.batch_size,
             seed=recipe.seed,
             boundary_aux_weight=recipe.boundary_aux_weight,
+            temporal_smoothing_weight=recipe.temporal_smoothing_weight,
             learning_rate=recipe.learning_rate,
             gradient_clip_norm=recipe.gradient_clip_norm,
             sampling=recipe.sampling,
@@ -1088,7 +1097,7 @@ def run_clean_rally_experiment(
         fps_by_source = {window.source_id: float(window.metadata["fps"])
                          for window in (*validation, *test)}
         decoder, decoder_search = tune_rally_decoder(
-            validation_rows, fps_by_source=fps_by_source
+            validation_rows, fps_by_source=fps_by_source, hysteresis=uses_rtmpose
         )
         raw_test = predict_rally_windows(
             model, test, device=device, batch_size=recipe.batch_size, partition="test"
@@ -1102,6 +1111,7 @@ def run_clean_rally_experiment(
             annotation_fingerprint=rally_dataset.annotation_fingerprint,
             split_manifest=split_manifest, training_recipe=recipe, chosen_epoch=epoch,
             decoder_configuration=asdict(decoder),
+            pose_training_metadata=rally_dataset.manifest.get("pose_training_metadata"),
             feature_view=feature_view.name,
             calibration_fingerprints=calibration_fingerprints,
             extra={"epoch_history": history, "experiment_role": "expanded_clean_only"},
@@ -1125,6 +1135,7 @@ def run_clean_rally_experiment(
         batch_size=recipe.batch_size,
         seed=recipe.seed,
         boundary_aux_weight=recipe.boundary_aux_weight,
+        temporal_smoothing_weight=recipe.temporal_smoothing_weight,
         learning_rate=recipe.learning_rate,
         gradient_clip_norm=recipe.gradient_clip_norm,
         sampling=recipe.sampling,
@@ -1141,6 +1152,7 @@ def run_clean_rally_experiment(
     oof_decoder, oof_search = tune_rally_decoder(
         test_rows, fps_by_source={window.source_id: float(window.metadata["fps"])
                                   for window in rally_dataset.windows},
+        hysteresis=uses_rtmpose,
     )
     production_split = {
         "strategy": "all-sources", "source_ids": [source.source_id for source in rally_dataset.config.sources],
@@ -1153,6 +1165,7 @@ def run_clean_rally_experiment(
         annotation_fingerprint=rally_dataset.annotation_fingerprint,
         split_manifest=production_split, training_recipe=recipe,
         chosen_epoch=production_epoch, decoder_configuration=asdict(oof_decoder),
+        pose_training_metadata=rally_dataset.manifest.get("pose_training_metadata"),
         feature_view=feature_view.name,
         calibration_fingerprints=calibration_fingerprints,
         extra={"epoch_history": production_history, "out_of_fold_decoder_search": oof_search,
@@ -1290,6 +1303,7 @@ def train_rally_segmenter_fixed_epochs(
     batch_size: int,
     seed: int,
     boundary_aux_weight: float,
+    temporal_smoothing_weight: float = 0.0,
     learning_rate: float = 3e-4,
     gradient_clip_norm: float = 1.0,
     sampling: str = "boundary_balanced",
@@ -1308,6 +1322,7 @@ def train_rally_segmenter_fixed_epochs(
         batch_size=batch_size,
         seed=seed,
         boundary_aux_weight=boundary_aux_weight,
+        temporal_smoothing_weight=temporal_smoothing_weight,
         learning_rate=learning_rate,
         gradient_clip_norm=gradient_clip_norm,
         sampling=sampling,
@@ -1380,13 +1395,16 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--preset", default="default", choices=("default", "benchmark"))
+    parser.add_argument(
+        "--preset", default="default", choices=("default", "benchmark", "rtmpose-audio")
+    )
     parser.add_argument("--device", choices=("mps", "cpu", "cuda"))
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--learning-rate", type=float)
     parser.add_argument("--gradient-clip-norm", type=float)
     parser.add_argument("--boundary-aux-weight", type=float)
+    parser.add_argument("--temporal-smoothing-weight", type=float)
     parser.add_argument("--seed", type=int)
     parser.add_argument(
         "--audio-dropout", type=float,
@@ -1425,7 +1443,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             if hasattr(args, key) and getattr(args, key) is not None
         },
     }
-    recipe = RallyTrainingRecipe.from_preset(args.preset, **overrides)
+    rtmpose_preset = args.preset == "rtmpose-audio"
+    if rtmpose_preset:
+        if not args.clean_only:
+            raise ValueError("the RTMPose audio preset requires --clean-only")
+        if args.feature_view not in (None, "full_audio"):
+            raise ValueError("the RTMPose audio preset requires the full_audio feature view")
+        overrides.setdefault("temporal_smoothing_weight", 0.1)
+    recipe = RallyTrainingRecipe.from_preset(
+        "default" if rtmpose_preset else args.preset, **overrides
+    )
+    if recipe.temporal_smoothing_weight and not args.clean_only:
+        raise ValueError("temporal smoothing requires --clean-only")
     if args.resume and not args.clean_only:
         raise ValueError(
             "epoch recovery currently requires --clean-only; comparative study arms use their historical trainer"
@@ -1440,9 +1469,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         config_path = args.config.expanduser().resolve()
         raw = json.loads(config_path.read_text(encoding="utf-8"))
         data_config = rally_data_config_from_selector_mapping(raw, base_dir=config_path.parent)
-        if args.feature_view is not None:
-            data_config = replace(data_config, feature_view=args.feature_view)
+        feature_view = "full_audio" if rtmpose_preset else args.feature_view
+        if feature_view is not None:
+            data_config = replace(data_config, feature_view=feature_view)
         rally_dataset = RallyWindowDataset(data_config)
+        if rtmpose_preset and "pose_training_metadata" not in rally_dataset.manifest:
+            raise ValueError("the RTMPose audio preset requires RTMPose observations for every source")
         camera_sources = _load_camera_sources(raw.get("camera_sources"))
         configured = {source.source_id for source in rally_dataset.config.sources}
         grouped = [source for sources in camera_sources.values() for source in sources]

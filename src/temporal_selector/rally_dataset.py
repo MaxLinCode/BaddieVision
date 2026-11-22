@@ -14,6 +14,9 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from src.rtmpose import RTMPOSE_BACKEND_TYPE
+from src.single_video.video import has_constant_frame_rate
+
 from .batch import MASKED_TARGET
 from .observations import (
     POSE_REPRESENTATION_VERSION,
@@ -39,6 +42,15 @@ from .rally_intervals import read_rally_intervals
 
 
 RALLY_FEATURE_NAMES = FULL_RALLY_FEATURE_NAMES
+RALLY_INPUT_FPS = 30.0
+
+
+def validate_rally_source_fps(source_id: str, fps: float) -> None:
+    if not math.isclose(fps, RALLY_INPUT_FPS, rel_tol=0.0, abs_tol=1e-6):
+        raise ValueError(
+            f"{source_id}: rally model requires {RALLY_INPUT_FPS:g} fps, got {fps:g} fps. "
+            "Create a 30 fps source with its own frame-indexed artifacts."
+        )
 
 
 @dataclass(frozen=True)
@@ -124,6 +136,7 @@ class RallyWindowDataset(Dataset[RallyWindow]):
         )
         self.feature_view = rally_feature_view(config.feature_view)
         self._audio_coverage: dict[str, dict[str, int]] = {}
+        self._pose_sources: dict[str, dict[str, Any]] = {}
         self.windows = self._compile()
         annotation_identity = (
             {
@@ -163,6 +176,21 @@ class RallyWindowDataset(Dataset[RallyWindow]):
                 for source in config.sources
             },
         }
+        pose_sources = list(self._pose_sources.values())
+        if any(item.get("pose_backend") == RTMPOSE_BACKEND_TYPE for item in pose_sources):
+            pose = pose_sources[0]
+            if any(item != pose for item in pose_sources):
+                raise ValueError("RTMPose data requires one pose model and preprocessing recipe across all sources")
+            identity["pose_training_metadata"] = {
+                "pose_model_sha256": pose["pose_model_sha256"],
+                "preprocessing": {
+                    **{key: value for key, value in pose.items() if key != "pose_model_sha256"},
+                    "pose_coordinate_mode": config.pose_coordinate_mode,
+                    "pose_visibility_threshold": config.pose_visibility_threshold,
+                    "context_seconds": config.context_seconds,
+                    "ownership_seconds": config.ownership_seconds,
+                },
+            }
         dataset_fingerprint = hashlib.sha256(
             json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
@@ -221,6 +249,27 @@ class RallyWindowDataset(Dataset[RallyWindow]):
         pose_meta, pose_records = read_jsonl_artifact(source.pose_cache_path)
         frame_count = int(assignment_meta["frame_count"])
         fps = float(assignment_meta["fps"])
+        pose_backend = (pose_meta.get("pose_backend") or {}).get("backend_type")
+        pose = {"pose_backend": pose_backend}
+        if pose_backend == RTMPOSE_BACKEND_TYPE:
+            validate_rally_source_fps(source.source_id, fps)
+            if not has_constant_frame_rate(source.video_path, RALLY_INPUT_FPS):
+                raise ValueError(f"{source.source_id}: register a new constant 30 fps source")
+            recipe = pose_meta.get("preprocessing") or {}
+            digest = pose_meta.get("pose_model_sha256", "")
+            if (
+                not isinstance(digest, str) or len(digest) != 64
+                or any(char not in "0123456789abcdef" for char in digest)
+                or not {"pose_crop_padding", "retry_padding", "quality_threshold"} <= recipe.keys()
+            ):
+                raise ValueError(f"{source.source_id}: regenerate the RTMPose cache to record pose model provenance")
+            pose.update(
+                pose_model_sha256=digest,
+                pose_crop_padding=recipe["pose_crop_padding"],
+                pose_retry_padding=recipe["retry_padding"],
+                pose_quality_threshold=recipe["quality_threshold"],
+            )
+        self._pose_sources[source.source_id] = pose
         image_size = tuple(map(int, assignment_meta["frame_size"]))
         if frame_count <= 0 or fps <= 0:
             raise ValueError("rally source frame count and FPS must be positive")
@@ -243,6 +292,10 @@ class RallyWindowDataset(Dataset[RallyWindow]):
         poses = {
             (int(record["frame"]), int(record["track_id"])): record
             for record in pose_records
+            if pose_backend != RTMPOSE_BACKEND_TYPE or all(
+                record.get(key) == pose_meta[key]
+                for key in ("pose_model_fingerprint", "preprocessing_fingerprint")
+            )
         }
         calibration_sha256 = file_sha256(source.calibration_path)
         identity_path = source.calibration_path.parent.parent / "source.json"

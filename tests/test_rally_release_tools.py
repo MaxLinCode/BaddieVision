@@ -162,7 +162,7 @@ def test_release_zip_is_allowlisted_reproducible_and_checksummed(bundle, tmp_pat
     second = package_release(bundle, tmp_path / "two.zip")
     assert first.read_bytes() == second.read_bytes()
     with zipfile.ZipFile(first) as archive:
-        assert set(archive.namelist()) == REQUIRED_FILES | {"SHA256SUMS"}
+        assert set(archive.namelist()) == REQUIRED_FILES | {"pose-landmarker.task", "SHA256SUMS"}
         checksums = archive.read("SHA256SUMS").decode()
         assert f"{sha256_file(bundle / 'sample.mp4')}  sample.mp4" in checksums
         assert "private-recording" not in checksums
