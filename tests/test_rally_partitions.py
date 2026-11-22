@@ -16,7 +16,7 @@ from src.temporal_selector.rally_intervals import (
     RallyIntervalIndex,
     RallySourceManifest,
 )
-from src.workflow.identity import inspect_source
+from src.workflow.identity import inspect_source, sha256_file
 from src.workflow.registry import SourceCatalog
 from src.workflow.source import resolve_rally_30fps_source
 
@@ -91,7 +91,7 @@ def test_partition_stages_receive_disjoint_clips_and_keep_original_frame_keys(tm
         identity = inspect_source(entry.source_id, entry.video_path)
         pose_inputs.append(entry.video_path)
         lineage = "sha256:" + "a" * 64
-        from src.workflow.identity import SourceIdentity, sha256_file
+        from src.workflow.identity import SourceIdentity
 
         stored = SourceIdentity.read(entry.identity_path)
         assignments = [{
@@ -113,6 +113,9 @@ def test_partition_stages_receive_disjoint_clips_and_keep_original_frame_keys(tm
     config = RallyDataConfig((source,), None, None, feature_view="full_audio_zscore")
     detector = tmp_path / "fixture.pt"
     detector.write_bytes(b"test detector")
+    source.assignments_path.with_name("person-tracks.manifest.json").write_text(
+        json.dumps({"inputs": {"detector_sha256": sha256_file(detector)}}, indent=2)
+    )
     train, validation = [
         partitions.prepare_rally_partition(
             config, source, partitions.RallySourceRange("parent", start, stop), index,

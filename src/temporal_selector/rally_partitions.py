@@ -164,7 +164,8 @@ def prepare_rally_partition(
     detector_digest = sha256_file(detector)
     receipt_path = tracks_path.with_name("person-tracks.manifest.json")
     if receipt_path.is_file():
-        original = _metadata(receipt_path)["inputs"].get("detector_sha256")
+        with receipt_path.open(encoding="utf-8") as handle:
+            original = json.load(handle)["inputs"].get("detector_sha256")
         if original is not None and original != detector_digest:
             raise ValueError(f"{block.source_id}: --person-model must match the full-source detector")
     padding = (cache.get("preprocessing") or {}).get("pose_crop_padding")
