@@ -14,6 +14,11 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from InPlay.heuristic.player_interpretation import (
+    EVIDENCE_WINDOW_SECONDS,
+    OCCUPANCY_WINDOW_SECONDS,
+    REASSIGN_INTERVAL_SECONDS,
+)
 from src.rtmpose import RTMPOSE_BACKEND_TYPE
 from src.single_video.video import has_constant_frame_rate
 
@@ -52,6 +57,20 @@ def validate_rally_source_fps(source_id: str, fps: float) -> None:
             f"{source_id}: rally model requires {RALLY_INPUT_FPS:g} fps, got {fps:g} fps. "
             "Create a 30 fps source with its own frame-indexed artifacts."
         )
+
+
+def player_assignment_guard_seconds(parameters: Mapping[str, Any], fps: float) -> float:
+    """Bound the centered assignment inputs of a frame and its one-frame pose repair."""
+    evidence = float(parameters.get("evidence_window_seconds", EVIDENCE_WINDOW_SECONDS))
+    occupancy = float(parameters.get("occupancy_window_seconds", OCCUPANCY_WINDOW_SECONDS))
+    interval = float(parameters.get("reassign_interval_seconds", REASSIGN_INTERVAL_SECONDS))
+    if any(not math.isfinite(value) or value <= 0 for value in (evidence, occupancy, interval)):
+        raise ValueError("player assignment window durations must be finite and positive")
+    evidence_frames = max(1, round(max(evidence, occupancy) * fps))
+    # A frame can use the previous reassignment decision for interval - 1 frames.
+    # Pose repair can use one additional neighboring frame.
+    hold_frames = max(1, round(interval * fps))
+    return (evidence_frames // 2 + hold_frames) / fps
 
 
 @dataclass(frozen=True)
@@ -380,6 +399,9 @@ class RallyWindowDataset(Dataset[RallyWindow]):
                 "energy_frames": int(audio[1][:, 0].sum()),
                 "flux_frames": int(audio[1][:, -1].sum()),
             }
+        assignment_guard_seconds = player_assignment_guard_seconds(
+            assignment_meta.get("parameters") or {}, fps,
+        )
         ownership = max(1, round(fps * self.config.ownership_seconds))
         radius = max(1, round(fps * self.config.context_seconds))
         if radius < ownership // 2:
@@ -474,6 +496,7 @@ class RallyWindowDataset(Dataset[RallyWindow]):
                     metadata={
                         "fps": fps,
                         "frame_count": frame_count,
+                        "player_assignment_guard_seconds": assignment_guard_seconds,
                         "image_size": list(image_size),
                         "feature_view": self.feature_view.name,
                         "calibration_sha256": calibration_sha256,

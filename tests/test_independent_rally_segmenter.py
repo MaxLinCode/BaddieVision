@@ -20,6 +20,7 @@ from src.temporal_selector import (
     collate_rally_windows,
     rally_checkpoint,
 )
+from src.temporal_selector.rally_dataset import player_assignment_guard_seconds
 from src.temporal_selector.rally_evaluation import (
     camera_held_out_folds,
     chronological_camera_train_validation_split,
@@ -242,8 +243,15 @@ def test_camera_splits_are_contained_guarded_and_deterministic() -> None:
     )
 
 
-@pytest.mark.parametrize(("context_seconds", "anchor_guard_frames"), [(1.0, 120), (2.0, 150), (3.0, 180)])
-def test_rally_split_guard_expands_with_the_context(context_seconds, anchor_guard_frames):
+@pytest.mark.parametrize(("context_seconds", "assignment_parameters", "anchor_guard_frames"), [
+    (1.0, {}, 120),
+    (2.0, {}, 150),
+    (3.0, {}, 180),
+    (2.0, {"evidence_window_seconds": 7.0, "reassign_interval_seconds": 1.0}, 195),
+])
+def test_rally_split_guard_expands_with_both_windows(
+    context_seconds, assignment_parameters, anchor_guard_frames,
+):
     fps = 30
     frame_count = 1500
     radius = round(context_seconds * fps)
@@ -254,16 +262,18 @@ def test_rally_split_guard_expands_with_the_context(context_seconds, anchor_guar
         )
         for frame in range(frame_count)
     ]
+    guard_seconds = player_assignment_guard_seconds(assignment_parameters, fps)
+    guard_frames = round(guard_seconds * fps)
     train, validation, split = chronological_camera_train_validation_split(
-        windows, {"camera-a": ("a",)}, guard_seconds=3.0, context_radius_seconds=context_seconds,
+        windows, {"camera-a": ("a",)}, guard_seconds=guard_seconds, context_radius_seconds=context_seconds,
     )
     cut = split["cameras"]["camera-a"]["cut_frame"]
-    assert split["anchor_guard_seconds"] == 3.0 + context_seconds
+    assert split["anchor_guard_seconds"] == guard_seconds + context_seconds
     assert split["cameras"]["camera-a"]["anchor_guard_frames"] == anchor_guard_frames
     assert train[-1].anchor_frame == cut - anchor_guard_frames - 1
     assert validation[0].anchor_frame == cut + anchor_guard_frames
-    assert max(train[-1].frame_indices) + 90 < cut
-    assert min(validation[0].frame_indices) - 90 == cut
+    assert max(train[-1].frame_indices) + guard_frames < cut
+    assert min(validation[0].frame_indices) - guard_frames == cut
 
 
 def _rows(clean: bool) -> list[dict]:

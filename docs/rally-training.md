@@ -145,10 +145,12 @@ masked frames. A four-camera replay of earlier experiments favored 0.1 over
 0.3 for macro interval F1 (0.501 versus 0.463). The combined recipe requires
 its own camera-held-out evaluation.
 
-The split for this recipe keeps every transformer input frame at least three seconds from the
-train/validation cut for centered player-assignment evidence. It adds the
-configured context radius to that guard for window centers, giving the
-standard recipe a five-second guard on each side of the cut. Each fold tunes
+Each fold reads the player-assignment evidence window and reassignment interval
+from its source artifacts. It uses the largest resulting guard across its training
+cameras, then adds the configured transformer context radius for window centers.
+With the usual five-second assignment evidence window and half-second reassignment
+interval, the guard is three seconds per transformer input frame and five
+seconds per window center on each side of the train/validation cut. Each fold tunes
 a higher rally entry threshold and a lower continuation threshold on its
 validation frames.
 The production checkpoint freezes both thresholds using out-of-fold

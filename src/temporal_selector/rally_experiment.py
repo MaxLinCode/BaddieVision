@@ -1047,10 +1047,13 @@ def run_clean_rally_experiment(
         fold_dir.mkdir(exist_ok=resume)
         eligible = [window for window in rally_dataset.windows
                     if window.source_id in fold.training_source_ids]
+        guard_seconds = (
+            max(float(window.metadata["player_assignment_guard_seconds"]) for window in eligible)
+            if uses_rtmpose else 1.0
+        )
         train, validation, split = chronological_camera_train_validation_split(
             eligible, _training_camera_groups(fold, camera_sources),
-            # Player assignment uses five seconds of evidence and a half-second hold.
-            guard_seconds=3.0 if uses_rtmpose else 1.0,
+            guard_seconds=guard_seconds,
             context_radius_seconds=rally_dataset.config.context_seconds if uses_rtmpose else None,
         )
         test = [window for window in rally_dataset.windows
