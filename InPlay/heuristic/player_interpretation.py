@@ -19,7 +19,13 @@ import cv2
 import numpy as np
 from tqdm.auto import tqdm
 
-from InPlay.heuristic.person_tracks import load_person_tracks, raw_artifact_fingerprint
+from InPlay.heuristic.person_tracks import (
+    BOTSORT_CONTINUOUS,
+    BYTETRACK_PERIODIC,
+    PLAYER_TRACKING_PROFILES,
+    load_person_tracks,
+    raw_artifact_fingerprint,
+)
 from src.court_projection import HALF_LENGTH, HALF_WIDTH, CourtHomography
 from src.pose_estimator import create_pose_estimator, ensure_pose_model_asset, pose_backend_info
 from src.single_video.video import read_video_info
@@ -761,7 +767,10 @@ def interpret_players(
     estimator_factory: Callable[..., Any] = create_pose_estimator,
     pose_work_dir: str | Path | None = None,
     pose_backend_identity: dict[str, Any] | None = None,
+    tracking_profile: str = BOTSORT_CONTINUOUS,
 ) -> tuple[list[dict[str, Any]], int]:
+    if tracking_profile not in PLAYER_TRACKING_PROFILES:
+        raise ValueError(f"unsupported player tracking profile: {tracking_profile}")
     raw_metadata, observations = load_person_tracks(person_tracks_path)
     frame_size = tuple(map(int, raw_metadata["frame_size"]))
     info = read_video_info(Path(video_path))
@@ -792,14 +801,22 @@ def interpret_players(
     ):
         raise ValueError("source identity does not match player-processing video")
     fps = float(info["fps"])
-    assignments = assign_singles_slots(observations, homography, frame_count, fps)
+    if tracking_profile == BYTETRACK_PERIODIC:
+        from .legacy_player_assignment import assign_singles_slots as assign_periodic_slots
+
+        assignments = assign_periodic_slots(
+            observations, homography, frame_count, fps, frame_size=frame_size,
+        )
+    else:
+        assignments = assign_singles_slots(observations, homography, frame_count, fps)
     cache, computed = enrich_pose_cache(
         video_path, assignments, person_tracks_path, pose_cache_path,
         pose_model_asset=pose_model_asset, pose_crop_padding=pose_crop_padding,
         estimator_factory=estimator_factory,
         pose_work_dir=pose_work_dir, pose_backend_identity=pose_backend_identity,
     )
-    _record_foot_diagnostics(assignments, cache, homography)
+    if tracking_profile == BOTSORT_CONTINUOUS:
+        _record_foot_diagnostics(assignments, cache, homography)
     apply_temporal_pose_validation(assignments, cache, frame_size)
     cache_metadata, cache_records = load_pose_cache(pose_cache_path)
     if cache_metadata is not None:
@@ -831,7 +848,7 @@ def interpret_players(
             "lookahead_seconds": ROLE_LOOKAHEAD_SECONDS,
             "minimum_observation_seconds": ROLE_CONFIRMATION_SECONDS,
             "foot_visibility_threshold": POSE_VISIBILITY_THRESHOLD,
-        },
+        } if tracking_profile == BOTSORT_CONTINUOUS else {"policy": tracking_profile},
     }
     write_player_assignments(assignments_path, assignment_metadata, assignments)
     write_players_csv(players_csv_path, rows)

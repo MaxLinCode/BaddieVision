@@ -13,6 +13,8 @@ import tempfile
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
+from InPlay.heuristic.person_tracks import BOTSORT_CONTINUOUS, BYTETRACK_PERIODIC
+
 from .artifacts import (
     atomic_write_json,
     calibration_fingerprint,
@@ -33,6 +35,7 @@ STAGE_CODE = {
         "src/single_video/video.py",
     ),
     "pose": (
+        "InPlay/heuristic/legacy_player_assignment.py",
         "InPlay/heuristic/player_interpretation.py",
         "src/pose_estimator.py",
         "src/court_projection.py",
@@ -371,6 +374,7 @@ def run_person_stage(
     force: bool = False,
     extractor: Callable[..., Any] | None = None,
     extractor_identity: str | None = None,
+    tracking_profile: str = BOTSORT_CONTINUOUS,
 ) -> bool:
     identity = verify_source(source)
     imported_receipt = source.person_tracks_path.with_name(
@@ -401,7 +405,10 @@ def run_person_stage(
     if device == "auto":
         device = select_device(device)
     if model is None:
-        model = default_person_model(device)
+        model = (
+            "yolov8n.pt" if tracking_profile == BYTETRACK_PERIODIC
+            else default_person_model(device)
+        )
     # Resolve an Ultralytics alias before hashing; receipts always describe model bytes.
     model_path = Path(model).expanduser()
     if not model_path.is_file() and model_path.suffix.lower() == ".engine":
@@ -421,6 +428,7 @@ def run_person_stage(
         "implementation": implementation_identity("person"),
         "backend": backend_identity(extractor, extractor_identity),
         "device": device,
+        "tracking_profile": tracking_profile,
     }
 
     def execute(paths):
@@ -428,7 +436,11 @@ def run_person_stage(
             from InPlay.heuristic.person_tracks import extract_person_tracks
 
             extract_person_tracks(
-                source.video_path, paths[0], str(model_path), device=device
+                source.video_path,
+                paths[0],
+                str(model_path),
+                device=device,
+                tracking_profile=tracking_profile,
             )
         else:
             extractor(source.video_path, paths[0], str(model_path))
@@ -453,6 +465,7 @@ def run_player_stage(
     force: bool = False,
     interpreter: Callable[..., Any] | None = None,
     interpreter_identity: str | None = None,
+    tracking_profile: str | None = None,
 ) -> bool:
     identity = verify_source(source)
     tracks = source.person_tracks_path
@@ -478,6 +491,11 @@ def run_player_stage(
                 f"person tracks differ from the committed receipt at {receipt}; "
                 "rebuild or reimport the tracks"
             )
+        person_profile = committed["inputs"].get("tracking_profile")
+        if tracking_profile is None:
+            tracking_profile = person_profile or BOTSORT_CONTINUOUS
+        elif person_profile is not None and person_profile != tracking_profile:
+            raise ValueError("player assignment profile differs from person tracks")
         validate_person_tracks(tracks, identity)
         from src.pose_estimator import ensure_pose_model_asset
 
@@ -488,6 +506,7 @@ def run_player_stage(
             "calibration_sha256": calibration_fingerprint(source),
             "pose_sha256": sha256_file(pose_model),
             "pose_crop_padding": pose_crop_padding,
+            "tracking_profile": tracking_profile,
             "implementation": implementation_identity("pose"),
             "backend": backend_identity(interpreter, interpreter_identity),
         }
@@ -509,6 +528,8 @@ def run_player_stage(
                 "pose_model_asset": pose_model,
                 "pose_crop_padding": pose_crop_padding,
             }
+            if "tracking_profile" in inspect.signature(callback).parameters:
+                kwargs["tracking_profile"] = tracking_profile
             if "pose_work_dir" in inspect.signature(callback).parameters:
                 kwargs["pose_work_dir"] = source.artifact_root / "players" / ".pose-work"
             if (

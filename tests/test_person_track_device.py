@@ -5,7 +5,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from InPlay.heuristic.person_tracks import default_person_model, extract_person_tracks
+from InPlay.heuristic.person_tracks import (
+    BYTETRACK_PERIODIC,
+    default_person_model,
+    extract_person_tracks,
+)
 
 
 def test_explicit_device_reaches_person_detector(monkeypatch, tmp_path):
@@ -69,6 +73,40 @@ def test_cuda_person_detector_uses_fp16(monkeypatch, tmp_path):
     )
     assert calls["half"] is True
     assert calls["imgsz"] == 960
+
+
+def test_bytetrack_release_uses_original_detector_options(monkeypatch, tmp_path):
+    calls = {}
+
+    class Detector:
+        names = {0: "person"}
+
+        def __init__(self, model):
+            pass
+
+        def track(self, **kwargs):
+            calls.update(kwargs)
+            return [SimpleNamespace(boxes=SimpleNamespace(id=None))]
+
+    monkeypatch.setitem(sys.modules, "ultralytics", SimpleNamespace(YOLO=Detector))
+    monkeypatch.setattr(
+        "InPlay.heuristic.person_tracks.read_video_info",
+        lambda p: {"width": 64, "height": 48, "fps": 30, "frame_count": 1},
+    )
+    video = tmp_path / "input.mp4"
+    extract_person_tracks(
+        video, tmp_path / "people.jsonl", "model.pt", device="cuda",
+        tracking_profile=BYTETRACK_PERIODIC,
+    )
+    assert calls == {
+        "source": str(video),
+        "classes": [0],
+        "tracker": "bytetrack.yaml",
+        "stream": True,
+        "persist": True,
+        "verbose": False,
+        "device": "cuda",
+    }
 
 
 @pytest.mark.parametrize(
