@@ -39,6 +39,11 @@ FULL_RALLY_FEATURE_NAMES: Final = tuple(
 )
 
 
+MEDIAN_TORSO_FEATURE_NAMES: Final = tuple(
+    name.replace("_pose_", "_median_torso_pose_") for name in FULL_RALLY_FEATURE_NAMES
+)
+_POSE_START: Final = len(PLAYER_CONTEXT_FIELDS) * 2
+
 MOTION_POSITION_INDICES: Final = tuple(
     index for index, name in enumerate(FULL_RALLY_FEATURE_NAMES)
     if "_pose_" in name or name.endswith(("_court_x", "_court_y"))
@@ -54,24 +59,55 @@ MOTION_FEATURE_NAMES: Final = tuple(
 _MOTION_PLAYER_INDICES: Final = (0, 0, 1, 1) + (0,) * 66 + (1,) * 66
 
 
+def normalize_rally_motion_pose(
+    values: Tensor, validity: Tensor, track_ids: Tensor, image_size: tuple[int, int],
+) -> None:
+    """Normalize image pose in place using one median torso length per player track."""
+    poses = values[:, _POSE_START:].reshape(-1, 2, 33, 2)
+    valid = validity[:, _POSE_START:].reshape_as(poses)
+    poses.mul_(poses.new_tensor(image_size))
+    visible = valid.all(dim=-1)
+    hips = poses[:, :, [23, 24]].mean(dim=-2, keepdim=True)
+    shoulders = poses[:, :, [11, 12]].mean(dim=-2, keepdim=True)
+    torso = (shoulders - hips).norm(dim=-1).squeeze(-1)
+    has_hips = visible[:, :, 23] & visible[:, :, 24]
+    has_torso = has_hips & visible[:, :, 11] & visible[:, :, 12] & (torso > 1.0)
+    for player in range(2):
+        scale = torch.zeros_like(torso[:, player])
+        player_tracks = track_ids[:, player]
+        for track in player_tracks[has_torso[:, player] & (player_tracks >= 0)].unique():
+            frames = player_tracks == track
+            scale[frames] = torso[:, player][frames & has_torso[:, player]].quantile(0.5)
+        usable = has_hips[:, player] & (scale > 0)
+        valid[:, player] &= usable[:, None, None]
+        relative = (poses[:, player] - hips[:, player]) / scale.clamp_min(1)[:, None, None]
+        poses[:, player] = torch.where(valid[:, player], relative, 0.0)
+
+
 def rally_motion_features(
     values: Tensor, validity: Tensor, track_ids: Tensor, fps: float,
 ) -> tuple[Tensor, Tensor]:
-    """Fit a trailing four-frame slope over each continuously observed coordinate."""
+    """Fit trailing slopes over continuously observed coordinates on the same track."""
     positions = values[:, MOTION_POSITION_INDICES]
     observed = validity[:, MOTION_POSITION_INDICES]
     velocity = torch.zeros_like(positions)
     valid = torch.zeros_like(observed)
-    if len(positions) < 4:
-        return velocity, valid
 
-    # Least-squares slope for four uniformly spaced samples, per second.
-    track_history = track_ids.unfold(0, 4, 1)
-    same_track = (track_history == track_history[..., :1]).all(dim=-1)
-    same_track &= track_history[..., 0] >= 0
-    valid[3:] = observed.unfold(0, 4, 1).all(dim=-1) & same_track[:, _MOTION_PLAYER_INDICES]
-    slope = (3 * (positions[3:] - positions[:-3]) + positions[2:-1] - positions[1:-2])
-    velocity[3:] = torch.where(valid[3:], slope * (fps / 10), 0.0)
+    # Court motion uses four samples. Joints use three to retain faster motion.
+    for columns, count in ((slice(0, 4), 4), (slice(4, None), 3)):
+        if len(positions) < count:
+            continue
+        tracks = track_ids.unfold(0, count, 1)
+        same_track = (tracks == tracks[..., :1]).all(dim=-1) & (tracks[..., 0] >= 0)
+        valid[count - 1:, columns] = (
+            observed[:, columns].unfold(0, count, 1).all(dim=-1)
+            & same_track[:, _MOTION_PLAYER_INDICES[columns]]
+        )
+        samples = positions[:, columns].unfold(0, count, 1)
+        slope = (samples[..., -1] - samples[..., 0]) / 2
+        if count == 4:
+            slope = (3 * (samples[..., -1] - samples[..., 0]) + samples[..., 2] - samples[..., 1]) / 10
+        velocity[count - 1:, columns] = torch.where(valid[count - 1:, columns], slope * fps, 0.0)
     return velocity, valid
 
 
@@ -123,8 +159,7 @@ def _view(
     if len(requested) != len(set(requested)):
         raise AssertionError(f"duplicate feature in rally view {name}")
     input_names = (
-        FULL_RALLY_FEATURE_NAMES
-        + (MOTION_FEATURE_NAMES if uses_motion else ())
+        (MEDIAN_TORSO_FEATURE_NAMES + MOTION_FEATURE_NAMES if uses_motion else FULL_RALLY_FEATURE_NAMES)
         + (RALLY_AUDIO_FEATURE_NAMES if uses_audio else ())
     )
     positions = {feature: index for index, feature in enumerate(input_names)}
@@ -139,11 +174,11 @@ def _view(
 RALLY_FEATURE_VIEWS: Final[Mapping[str, RallyFeatureView]] = {
     "full": _view("full", FULL_RALLY_FEATURE_NAMES),
     "full_motion": _view(
-        "full_motion", FULL_RALLY_FEATURE_NAMES + MOTION_FEATURE_NAMES, uses_motion=True
+        "full_motion", MEDIAN_TORSO_FEATURE_NAMES + MOTION_FEATURE_NAMES, uses_motion=True
     ),
     "full_audio_zscore_motion": _view(
         "full_audio_zscore_motion",
-        FULL_RALLY_FEATURE_NAMES + MOTION_FEATURE_NAMES + RALLY_AUDIO_FEATURE_NAMES,
+        MEDIAN_TORSO_FEATURE_NAMES + MOTION_FEATURE_NAMES + RALLY_AUDIO_FEATURE_NAMES,
         uses_audio=True, audio_zscore=True, uses_motion=True,
     ),
     "full_audio": _view(

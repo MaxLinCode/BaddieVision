@@ -393,9 +393,9 @@ def test_rally_motion_uses_elapsed_time_and_masks_gaps_and_track_changes(fps) ->
     joint_y = MOTION_FEATURE_NAMES.index("p2_pose_0_velocity_y")
     expected_valid = [False, False, False, True, False, False, False, True, True]
     assert valid[:, court_x].tolist() == expected_valid
-    assert valid[:, joint_y].tolist() == [*expected_valid[:7], False, True]
+    assert valid[:, joint_y].tolist() == [False, False, True, True, False, False, False, True, True]
     assert torch.allclose(velocity[valid[:, court_x], court_x], torch.full((3,), -2.0))
-    assert torch.allclose(velocity[valid[:, joint_y], joint_y], torch.full((2,), 3.0))
+    assert torch.allclose(velocity[valid[:, joint_y], joint_y], torch.full((4,), 3.0))
     assert torch.count_nonzero(velocity[~valid]) == 0
 
     view = rally_feature_view("full_motion")
@@ -405,3 +405,41 @@ def test_rally_motion_uses_elapsed_time_and_masks_gaps_and_track_changes(fps) ->
     )
     assert values.shape == mask.shape == (9, 290)
     assert torch.equal(values[:, :positions.shape[1]], positions)
+
+
+def test_rally_motion_pose_uses_crop_geometry_and_track_median_torso() -> None:
+    from src.temporal_selector.observations import frame_context
+    from src.temporal_selector.rally_features import (
+        FULL_RALLY_FEATURE_NAMES,
+        normalize_rally_motion_pose,
+    )
+
+    image_size = (640, 480)
+    crop = [85, 70, 215, 330]
+    assignment = {"slots": {"P1": {"confidence": 1, "assignment": {
+        "track_id": 1, "bbox": [100, 100, 200, 300], "foot": [150, 300],
+        "court_x": 0, "court_y": 0, "detection_confidence": 1, "activity": 0,
+    }}}}
+    observations = []
+    for frame, torso in enumerate((20, 20, 100, 40, 40)):
+        pixels = [(160, 200)] * 33
+        for left, right, y in ((11, 12, 200 - torso), (23, 24, 200)):
+            pixels[left], pixels[right] = (140, y), (160, y)
+        landmarks = [
+            {"x": (x - crop[0]) / (crop[2] - crop[0]),
+             "y": (y - crop[1]) / (crop[3] - crop[1]),
+             "visibility": 0 if (frame, index) == (4, 24) else 1}
+            for index, (x, y) in enumerate(pixels)
+        ]
+        track = 1 if frame < 3 else 2
+        assignment["slots"]["P1"]["assignment"]["track_id"] = track
+        poses = {(frame, track): {
+            "status": "detected", "pose_bbox": crop, "pose_landmarks": landmarks,
+        }}
+        observations.append(frame_context(assignment, poses, frame, image_size, "full_context", 0.5, "image"))
+    values, valid = map(torch.tensor, zip(*observations))
+    track_ids = torch.tensor([[1, -1], [1, -1], [1, -1], [2, -1], [2, -1]])
+    normalize_rally_motion_pose(values, valid, track_ids, image_size)
+    wrist_x = FULL_RALLY_FEATURE_NAMES.index("p1_pose_15_x")
+    assert values[:, wrist_x].tolist() == pytest.approx([0.5, 0.5, 0.5, 0.25, 0.0])
+    assert valid[:, wrist_x].tolist() == [True, True, True, True, False]

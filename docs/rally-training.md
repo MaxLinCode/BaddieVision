@@ -160,16 +160,20 @@ each pose landmark and each player's court position. Use
 `full_audio_zscore_motion` for the corresponding normalized-audio recipe.
 Both views retain the original normalized court x/y positions.
 
-The features fit a trailing four-frame linear slope to the player-relative
-pose coordinates and the normalized coordinates of the projected court foot
-position. Slopes are expressed per second, in pose-scale units for joints
-and court half-width or half-length units for court position. A velocity
-requires four valid consecutive samples of the same track. The first three
-frames, missing observations, and track changes invalidate the affected
-velocity channels. The computation runs once per source or split clip before
-creating overlapping model windows.
+The motion views map crop landmarks back to image pixels using the exact
+stored crop box. They center pose on the midpoint of the hips and normalize
+by the median visible shoulder-midpoint to hip-midpoint distance for that
+player track within the source or split clip. Frames with either hip missing
+or no usable track torso scale have masked pose features.
 
-Compare each motion view with its corresponding position-only view on the
-same camera folds and source artifacts. Hold the training recipe fixed and
-compare interval F1 and signed start/end errors by camera. The four-frame
-window is an experimental default and has a shorter time span at higher FPS.
+Joint velocity uses a trailing three-frame slope and court velocity uses
+four frames. Slopes are per second, in torso-length units for joints and
+court half-width or half-length units for court position. A velocity requires
+all samples in its window to be valid and on the same track. Motion is computed
+before slicing overlapping model windows.
+
+Compare motion views on the same camera folds and source artifacts, with the
+training recipe fixed. Report interval F1 and signed start/end errors by
+camera. The motion views change both pose normalization and velocity
+channels, so comparisons against the original views measure their combined
+effect. The filter windows span less time at higher FPS.

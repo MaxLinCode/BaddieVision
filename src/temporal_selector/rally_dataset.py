@@ -36,8 +36,9 @@ from .rally import (
 from .rally_audio import read_rally_audio
 from .rally_features import (
     FULL_RALLY_FEATURE_NAMES,
-    rally_motion_features,
+    normalize_rally_motion_pose,
     rally_feature_view,
+    rally_motion_features,
 )
 from .rally_intervals import read_rally_intervals
 
@@ -164,9 +165,10 @@ class RallyWindowDataset(Dataset[RallyWindow]):
             "feature_view": self.feature_view.name,
             "feature_names": self.feature_view.names,
             "pose_coordinate_mode": config.pose_coordinate_mode,
-            "pose_representation_version": POSE_REPRESENTATION_VERSION[
-                config.pose_coordinate_mode
-            ],
+            "pose_representation_version": (
+                "pelvis-root-track-median-torso-v1" if self.feature_view.uses_motion
+                else POSE_REPRESENTATION_VERSION[config.pose_coordinate_mode]
+            ),
             "pose_visibility_threshold": config.pose_visibility_threshold,
             "context_seconds": config.context_seconds,
             "ownership_seconds": config.ownership_seconds,
@@ -395,7 +397,7 @@ class RallyWindowDataset(Dataset[RallyWindow]):
                 image_size,
                 "full_context",
                 self.config.pose_visibility_threshold,
-                self.config.pose_coordinate_mode,
+                "image" if self.feature_view.uses_motion else self.config.pose_coordinate_mode,
             )
             for player_index, role in enumerate(("P1", "P2")):
                 item = assignments[frame].get("slots", {}).get(role, {}).get("assignment")
@@ -426,8 +428,10 @@ class RallyWindowDataset(Dataset[RallyWindow]):
         value_tensor = torch.tensor(source_values, dtype=torch.float32)
         validity_tensor = torch.tensor(source_validity, dtype=torch.bool)
         if self.feature_view.uses_motion:
+            track_tensor = torch.tensor(track_ids)
+            normalize_rally_motion_pose(value_tensor, validity_tensor, track_tensor, image_size)
             velocity, velocity_valid = rally_motion_features(
-                value_tensor, validity_tensor, torch.tensor(track_ids), fps
+                value_tensor, validity_tensor, track_tensor, fps
             )
             value_tensor = torch.cat((value_tensor, velocity), dim=-1)
             validity_tensor = torch.cat((validity_tensor, velocity_valid), dim=-1)
