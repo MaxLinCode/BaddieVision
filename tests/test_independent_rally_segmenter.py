@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import fields
+from dataclasses import fields, replace
 
 import pytest
 import torch
@@ -28,6 +28,7 @@ from src.temporal_selector.rally_evaluation import (
     rally_metrics,
     stable_track_fusion_acceptance,
 )
+from src.temporal_selector.rally_audio import RALLY_AUDIO_FEATURE_NAMES
 
 
 def _config() -> RallySegmenterConfig:
@@ -101,6 +102,58 @@ def test_padding_missing_features_and_boundary_masks_produce_finite_cpu_loss() -
     assert torch.isfinite(losses.total)
     losses.total.backward()
     assert model.frame_projection.network[0].weight.grad is not None
+
+
+def test_temporal_smoothing_uses_only_adjacent_owned_same_state_frames() -> None:
+    batch = _batch()
+    model = RallySegmenter(_config())
+    output = model(batch)
+    # Only the middle pair of the first row has matching supervised labels.
+    output.inplay_logits = torch.tensor(
+        [[-2.0, -1.0, 1.0, -2.0], [0.0, 2.0, -torch.inf, -torch.inf]],
+        requires_grad=True,
+    )
+    baseline = model.losses(batch, output)
+    smoothed = model.losses(batch, output, temporal_smoothing_weight=0.5)
+    probabilities = output.inplay_logits.detach().sigmoid()
+    expected = 0.5 * (probabilities[0, 2] - probabilities[0, 1])
+    penalty = smoothed.total - baseline.total
+    torch.testing.assert_close(penalty, expected)
+    penalty.backward()
+    gradient = output.inplay_logits.grad
+    assert gradient is not None
+    assert gradient[0, 1] < 0 < gradient[0, 2]
+    assert gradient.count_nonzero() == 2
+
+
+def test_attention_masks_missing_audio_without_masking_its_video_frames() -> None:
+    audio_dim = len(RALLY_AUDIO_FEATURE_NAMES)
+    model = RallySegmenter(replace(
+        _config(), frame_feature_dim=RALLY_FEATURE_DIM + audio_dim, audio_attention=True,
+    )).eval()
+    batch = _batch()
+    batch.frame_values = torch.zeros(2, 4, model.config.frame_feature_dim)
+    batch.frame_validity = torch.ones_like(batch.frame_values, dtype=torch.bool)
+    audio_validity = batch.frame_validity[..., -audio_dim:]
+    audio_validity[0, 0] = False
+    audio_validity[0, 2, 1:] = False
+    audio_validity[1, :2] = False
+    masks = []
+    handle = model.transformer.register_forward_pre_hook(
+        lambda module, args, kwargs: masks.append(kwargs["src_key_padding_mask"]),
+        with_kwargs=True,
+    )
+    with torch.no_grad():
+        expected = model(batch).inplay_logits
+        batch.frame_values[..., -audio_dim:].masked_fill_(~audio_validity, 1000)
+        actual = model(batch).inplay_logits
+    handle.remove()
+    assert masks[0].tolist() == [
+        [False, False, False, False, True, False, False, False],
+        [False, False, True, True, True, True, True, True],
+    ]
+    torch.testing.assert_close(actual, expected)
+    assert torch.isfinite(actual[batch.frame_mask]).all()
 
 
 def test_padding_targets_and_centered_time_are_validated() -> None:

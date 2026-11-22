@@ -14,6 +14,7 @@ from typing import Any
 import cv2
 import torch
 
+from src.rtmpose import RTMPOSE_BACKEND_TYPE
 from src.workflow.identity import SourceIdentity, sha256_file
 
 from .joint_inference import (
@@ -139,6 +140,18 @@ def predict_source(
     dataset = RallyWindowDataset(RallyDataConfig(
         sources=(source,), rally_intervals_path=None, rally_manifest_path=None, **settings,
     ))
+    pose = dataset.manifest.get("pose_training_metadata")
+    if preprocessing.get("pose_backend") == RTMPOSE_BACKEND_TYPE:
+        if pose is None or any(
+            value != preprocessing.get(key)
+            for key, value in pose["preprocessing"].items()
+        ) or (
+            "pose_model_sha256" in preprocessing
+            and pose["pose_model_sha256"] != preprocessing["pose_model_sha256"]
+        ):
+            raise ValueError("RTMPose cache does not match the inference preprocessing and model")
+    elif pose is not None and "pose_backend" in preprocessing:
+        raise ValueError("RTMPose observations require RTMPose-trained model preprocessing")
     if model.config.frame_feature_dim != dataset.feature_view.dimension:
         raise ValueError("rally model dimension differs from preprocessing feature view")
     rows = predict_windows(model, dataset.windows, device=device, batch_size=batch_size)

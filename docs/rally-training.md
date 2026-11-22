@@ -5,7 +5,7 @@ The maintained candidate-free experiment accepts ordinary training settings:
 ```bash
 python -m src.temporal_selector.rally_experiment \
   --config config/rally-experiment.example.json \
-  --output-dir outputs/rally-cpu-smoke --clean-only \
+  --output-dir outputs/rally-cpu-smoke --clean-only --feature-view full_audio_zscore \
   --device cpu --epochs 1 --batch-size 2 --learning-rate 0.001
 ```
 
@@ -42,3 +42,113 @@ Epoch recovery applies to the maintained clean-only fold and production
 trainers. The comparative historical study arms accept recipe overrides but
 do not support `--resume`. Recovery does not claim identical results across
 different accelerator/runtime versions or nondeterministic device kernels.
+
+## Compare vision and audio
+
+The `full_audio_zscore` view appends seven normalized audio features to the
+`full` visual view. It reads the first audio stream with FFmpeg and FFprobe and uses
+video presentation timestamps to align the audio, including when frame spacing
+varies. The features capture RMS, peak level, power in four frequency bands,
+and positive spectral flux. A 48 ms window centered on each video frame's
+display interval captures short transients such as shuttle hits and shoe
+squeaks. The model's feature-validity mask marks windows as invalid when they
+overlap gaps or fall outside the recorded audio. Recorded silence remains
+valid. Spectral flux requires coverage in both analysis windows. The
+transformer masks missing audio tokens in attention while retaining the
+corresponding video tokens.
+The run records audio coverage per source.
+
+Run both views with the same source config, device, seed, and training settings.
+Supply a local config that points to source recordings with their original
+audio and to the matching annotations and player observations.
+
+```bash
+for view in full full_audio_zscore; do
+  python -m src.temporal_selector.rally_experiment \
+    --config config/rally-experiment.local.json --clean-only \
+    --feature-view "$view" --output-dir "outputs/rally-${view}"
+done
+```
+
+Compare `macro.interval_f1`, `macro.boundary_mae`, false splits, and false merges
+in each run's `metrics.json`. Check `by_camera` for performance on each held-out
+camera and `dataset_manifest.audio_coverage` for the number of observed frames
+per source. The checkpoint and release manifest identify the feature view
+automatically. Export the trained checkpoint with
+[the existing inference exporter](rally-inference.md#export-the-existing-production-checkpoint)
+and use its manifest for prediction.
+
+The z-score view uses the trailing ten seconds of observed values for each
+channel and emits zero when there is insufficient history or variance.
+Use `full_audio` to compare against raw features with the same attention
+architecture and camera splits.
+
+## Clean train and validation partitions
+
+Each fold holds out one complete camera. For each remaining camera, the clean
+trainer plans the split from source frame counts and annotations before building
+feature windows. It prefers a whole-recording boundary that leaves 70–90% of the
+frames in training. Otherwise it splits near 80%, moving the cut up to two
+seconds to reach a nearby reviewed break when available.
+
+For a recording cut in two, the trainer extracts each frame range as its own
+clip and reruns person tracking and player pose processing on both clips.
+Assignment, activity, pose repair, and transformer windows stay inside their
+clip. Each clip stores PCM audio in Matroska to preserve the timing of audio
+gaps. Audio features and their trailing z-score history start fresh for each
+clip. Edge windows retain their supervised frames. Prediction
+rows use the original source and frame IDs, and the resolved run configuration
+records the partition artifact fingerprints for resume.
+
+The trainer looks up the original detector and pose assets from the source
+artifacts. Use `--person-model` or `--pose-model` to provide relocated assets.
+The derived clips and observations are cached in `.rally-partitions` next to
+the run directory. Whole recordings use their existing features.
+
+A rally spanning a cut keeps its in-play labels and any actual start or end on
+each side. Complete-interval metrics exclude the cut rally. Decoder calibration
+uses continuous validation predictions, including frames without labels, and
+scores only reviewed frames. The matched comparative experiment still uses
+its historical split.
+
+## RTMPose and normalized audio recipe
+
+Start with a constant 30 fps source. Inputs below 30 fps are rejected.
+Downsampling a higher-rate input creates a converted MP4 and a distinct source identity before any tracks,
+pose caches, or frame-indexed annotations are produced. Use an unused source
+ID and artifact root when migrating an existing recording. Calibrate and
+review labels on the resulting source-local frame sequence.
+
+```bash
+python -m src.workflow source add --video match.mp4 --rally-30-fps \
+  --source-id match-30fps --artifact-root outputs/match-30fps
+python -m src.workflow stage players --source match-30fps \
+  --pose-backend rtmpose --pose-model models/rtmpose-l-halpe26-384x288-fp16.onnx \
+  --pose-device cpu
+```
+
+Run court calibration and the person-tracks stage before the player stage.
+RTMPose uses Halpe26 FP16 ONNX, 15% crop padding, and no retry. Every training
+source must use the same pose model and crop recipe. The dataset and checkpoints
+record the SHA-256 of the pose asset and the preprocessing settings.
+
+```bash
+python -m src.temporal_selector.rally_experiment \
+  --config config/rally-experiment.local.json --output-dir outputs/rally-rtmpose-audio \
+  --clean-only --preset rtmpose-audio --device cuda
+```
+
+The preset selects the `full_audio_zscore` view, a four-second centered transformer
+window (two seconds on either side), and a smoothing weight of 0.1. At 30 fps, a
+full window contains 121 frames including the center and owns 30 frames.
+To compare another context radius, set `dataset.rally_context_seconds`
+in the local experiment config. The loss penalizes probability changes between adjacent
+supervised frames with the same label. It excludes rally boundaries and
+masked frames. A four-camera replay of earlier experiments favored 0.1 over
+0.3 for macro interval F1 (0.501 versus 0.463). The combined recipe requires
+its own camera-held-out evaluation.
+
+Each fold tunes a higher rally entry threshold and a lower continuation
+threshold on its validation frames.
+The production checkpoint freezes both thresholds using out-of-fold
+predictions, along with the gap and minimum-duration settings.

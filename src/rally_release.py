@@ -27,6 +27,10 @@ from InPlay.heuristic.person_tracks import (
     BYTETRACK_PERIODIC,
     PLAYER_TRACKING_PROFILES,
 )
+from src.rtmpose import (
+    DEFAULT_RTMPOSE_MODEL_NAME, RTMPOSE_BACKEND_TYPE, RTMPOSE_CROP_PADDING,
+    open_session, validate_fp16_halpe26_model,
+)
 from src.temporal_selector.joint_inference import InPlayDecoderConfig
 from src.temporal_selector.rally import (
     RALLY_CONTEXT_DIRECTION,
@@ -34,6 +38,7 @@ from src.temporal_selector.rally import (
     RallySegmenter,
     RallySegmenterConfig,
 )
+from src.temporal_selector.rally_dataset import RALLY_TRANSFORMER_CONTEXT_RADIUS_SECONDS
 from src.temporal_selector.rally_features import (
     RALLY_FEATURE_SCHEMA,
     RALLY_FEATURE_VERSION,
@@ -41,10 +46,12 @@ from src.temporal_selector.rally_features import (
 )
 
 RELEASE_SCHEMA = "baddievision.rally.inference_release"
-RELEASE_VERSION = 1
+LEGACY_RELEASE_VERSION = 1
+RELEASE_VERSION = 2
 RELEASE_BASE_URL = "https://github.com/MaxLinCode/BaddieVision/releases/download"
-ASSET_NAMES = ("checkpoint", "person_detector", "pose_landmarker")
-DEFAULT_PREPROCESSING = {
+LEGACY_ASSET_NAMES = ("checkpoint", "person_detector", "pose_landmarker")
+ASSET_NAMES = ("checkpoint", "person_detector", "pose_model")
+LEGACY_PREPROCESSING = {
     "pose_coordinate_mode": "player_relative",
     "pose_visibility_threshold": 0.5,
     "context_seconds": 1.0,
@@ -53,6 +60,13 @@ DEFAULT_PREPROCESSING = {
     "pose_retry_padding": 0.25,
     "pose_quality_threshold": 0.55,
     "pose_backend": "mediapipe.tasks.pose_landmarker",
+}
+DEFAULT_PREPROCESSING = {
+    **LEGACY_PREPROCESSING,
+    "context_seconds": RALLY_TRANSFORMER_CONTEXT_RADIUS_SECONDS,
+    "pose_crop_padding": RTMPOSE_CROP_PADDING,
+    "pose_retry_padding": None,
+    "pose_backend": RTMPOSE_BACKEND_TYPE,
 }
 CONTRACT_FIELDS = (
     "schema",
@@ -122,8 +136,11 @@ def validate_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError(f"release manifest is missing fields: {sorted(missing)}")
     if set(value) != {*CONTRACT_FIELDS, "assets"}:
         raise ValueError("release manifest contains unsupported or private metadata")
-    if value["schema"] != RELEASE_SCHEMA or value["schema_version"] != RELEASE_VERSION:
+    if value["schema"] != RELEASE_SCHEMA or value["schema_version"] not in (LEGACY_RELEASE_VERSION, RELEASE_VERSION):
         raise ValueError("unsupported inference release schema/version")
+    legacy = value["schema_version"] == LEGACY_RELEASE_VERSION
+    defaults = LEGACY_PREPROCESSING if legacy else DEFAULT_PREPROCESSING
+    expected_assets = LEGACY_ASSET_NAMES if legacy else ASSET_NAMES
     _model_id(value["model_id"])
     if value["model_type"] != RALLY_MODEL_TYPE:
         raise ValueError("release is not a RallySegmenter")
@@ -154,7 +171,7 @@ def validate_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
             "python",
             "torch",
             "ultralytics",
-            "mediapipe",
+            "mediapipe" if legacy else "onnxruntime",
             "numpy",
             "opencv-python",
             "lap",
@@ -167,7 +184,10 @@ def validate_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
             "runtime_versions must record the inference dependency versions"
         )
     preprocessing = value["preprocessing"]
-    if set(preprocessing) - {"tracking_profile"} != set(DEFAULT_PREPROCESSING):
+    expected_preprocessing = set(defaults)
+    if not legacy:
+        expected_preprocessing.add("pose_model_sha256")
+    if set(preprocessing) - {"tracking_profile"} != expected_preprocessing:
         raise ValueError("release preprocessing fields are incompatible")
     if release_tracking_profile(value) not in PLAYER_TRACKING_PROFILES:
         raise ValueError("unsupported release tracking profile")
@@ -177,7 +197,7 @@ def validate_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
         "pose_retry_padding",
         "pose_quality_threshold",
     ):
-        if preprocessing[name] != DEFAULT_PREPROCESSING[name]:
+        if preprocessing[name] != defaults[name]:
             raise ValueError(f"unsupported preprocessing setting: {name}")
     for name in ("context_seconds", "ownership_seconds"):
         if not math.isfinite(preprocessing[name]) or preprocessing[name] <= 0:
@@ -185,8 +205,14 @@ def validate_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
     for name in ("pose_visibility_threshold", "pose_crop_padding"):
         if not math.isfinite(preprocessing[name]) or not 0 <= preprocessing[name] <= 1:
             raise ValueError(f"preprocessing {name} must be in [0, 1]")
+    if not legacy and preprocessing["pose_crop_padding"] != RTMPOSE_CROP_PADDING:
+        raise ValueError("the RTMPose release requires 15% crop padding")
     decoder = value["decoder_configuration"]
     parsed = InPlayDecoderConfig(**decoder)
+    if not legacy and (
+        parsed.continuation_threshold is None or parsed.continuation_threshold >= parsed.threshold
+    ):
+        raise ValueError("RTMPose releases require separate decoder entry and continuation thresholds")
     if (
         not all(
             math.isfinite(getattr(parsed, name))
@@ -196,10 +222,10 @@ def validate_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
     ):
         raise ValueError("release decoder settings must be finite and valid")
     assets = value.get("assets", {})
-    if set(assets) != set(ASSET_NAMES):
-        raise ValueError(
-            "release requires checkpoint, person_detector and pose_landmarker assets"
-        )
+    if set(assets) != set(expected_assets):
+        raise ValueError(f"release requires these assets: {', '.join(expected_assets)}")
+    if not legacy and assets["pose_model"].get("filename") != DEFAULT_RTMPOSE_MODEL_NAME:
+        raise ValueError("invalid RTMPose asset filename")
     for name, asset in assets.items():
         filename = asset.get("filename", "")
         if not filename or Path(filename).name != filename or filename in {".", ".."}:
@@ -216,6 +242,8 @@ def validate_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
             "localhost",
         }:
             raise ValueError("HTTP assets are allowed only for local tests")
+    if not legacy and assets["pose_model"]["sha256"] != preprocessing["pose_model_sha256"]:
+        raise ValueError("RTMPose asset SHA-256 differs from release preprocessing")
     return value
 
 
@@ -285,7 +313,7 @@ def load_release(
 
 
 def resolve_release(
-    model_id: str = "rally-six-source-v1",
+    model_id: str | None = "rally-six-source-v1",
     *,
     checkpoint: Path | None = None,
     manifest: Path | None = None,
@@ -304,6 +332,8 @@ def resolve_release(
     if manifest is not None:
         manifest_value = validate_manifest(json.loads(Path(manifest).read_text()))
     else:
+        if model_id is None:
+            raise ValueError("provide a published --model or an RTMPose-trained --checkpoint and --model-manifest")
         model_id = _model_id(model_id)
         manifest_path = cache / model_id / "manifest.json"
         if not manifest_path.exists():
@@ -352,10 +382,11 @@ def export_release(
     output_dir: Path,
     *,
     person_detector: Path,
-    pose_landmarker: Path,
+    pose_landmarker: Path | None = None,
+    pose_model: Path | None = None,
     code_revision: str,
     base_url: str,
-    model_id: str = "rally-six-source-v1",
+    model_id: str | None = None,
     preprocessing: Mapping[str, Any] | None = None,
 ) -> Path:
     """Export allowlisted metadata; never copy private research checkpoint extras.
@@ -365,16 +396,43 @@ def export_release(
     """
     import shutil
 
-    model_id = _model_id(model_id)
+    if (pose_landmarker is None) == (pose_model is None):
+        raise ValueError("provide exactly one pose model asset")
+    legacy = pose_model is None
+    model_id = _model_id(model_id or ("rally-six-source-v1" if legacy else "rally-rtmpose-v1"))
     research = torch.load(research_checkpoint, map_location="cpu", weights_only=False)
     model = RallySegmenter.from_checkpoint(research).eval()
+    trained_pose = research.get("pose_training_metadata")
+    if legacy:
+        if trained_pose is not None:
+            raise ValueError("cannot export an RTMPose-trained checkpoint as legacy MediaPipe")
+        recipe = dict(preprocessing or LEGACY_PREPROCESSING)
+        pose_asset = ("pose_landmarker", pose_landmarker, "pose-landmarker.task")
+        pose_runtime = {"mediapipe": _package_version("mediapipe")}
+    else:
+        if not isinstance(trained_pose, Mapping) or trained_pose.get("pose_model_sha256") != sha256_file(pose_model):
+            raise ValueError("export requires an RTMPose-trained checkpoint with the exact training pose model SHA-256")
+        recipe = dict(trained_pose["preprocessing"])
+        if preprocessing is not None and dict(preprocessing) != recipe:
+            raise ValueError("export preprocessing differs from RTMPose training")
+        if recipe.get("pose_backend") != RTMPOSE_BACKEND_TYPE:
+            raise ValueError("checkpoint does not declare RTMPose preprocessing")
+        recipe["pose_model_sha256"] = trained_pose["pose_model_sha256"]
+        if pose_model.suffix.lower() != ".onnx":
+            raise ValueError("RTMPose release requires an FP16 ONNX pose asset")
+        session, _ = open_session(pose_model, "cpu")
+        validate_fp16_halpe26_model(session)
+        del session
+        pose_asset = ("pose_model", pose_model, DEFAULT_RTMPOSE_MODEL_NAME)
+        runtime = _package_version("onnxruntime-gpu")
+        pose_runtime = {"onnxruntime": _package_version("onnxruntime") if runtime == "uninstalled" else runtime}
     output = Path(output_dir)
     if output.exists() and any(output.iterdir()):
         raise FileExistsError("release output directory must be empty")
     output.mkdir(parents=True, exist_ok=True)
     contract = {
         "schema": RELEASE_SCHEMA,
-        "schema_version": RELEASE_VERSION,
+        "schema_version": LEGACY_RELEASE_VERSION if legacy else RELEASE_VERSION,
         "model_id": model_id,
         "model_type": RALLY_MODEL_TYPE,
         "code_revision": code_revision,
@@ -390,15 +448,15 @@ def export_release(
                 "decoder_configuration",
             )
         },
-        "preprocessing": dict(preprocessing or DEFAULT_PREPROCESSING),
+        "preprocessing": recipe,
         "runtime_versions": {
             "python": platform.python_version(),
+            **pose_runtime,
             **{
                 name: _package_version(name)
                 for name in (
                     "torch",
                     "ultralytics",
-                    "mediapipe",
                     "numpy",
                     "opencv-python",
                     "lap",
@@ -420,7 +478,7 @@ def export_release(
     assets = {"checkpoint": checkpoint_path}
     for name, source, filename in (
         ("person_detector", person_detector, "person-detector.pt"),
-        ("pose_landmarker", pose_landmarker, "pose-landmarker.task"),
+        pose_asset,
     ):
         path = output / filename
         shutil.copyfile(source, path)

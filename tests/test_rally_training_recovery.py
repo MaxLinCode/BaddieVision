@@ -216,15 +216,10 @@ def test_cli_resolves_config_and_command_line_overrides(tmp_path, monkeypatch):
             }
         )
     )
-    dataset = SimpleNamespace(
-        config=SimpleNamespace(
-            sources=[SimpleNamespace(source_id=i) for i in ("a", "b")]
-        )
-    )
+    config_stub = SimpleNamespace(sources=[SimpleNamespace(source_id=i) for i in ("a", "b")])
     monkeypatch.setattr(
-        training, "rally_data_config_from_selector_mapping", lambda *a, **k: None
+        training, "rally_data_config_from_selector_mapping", lambda *a, **k: config_stub
     )
-    monkeypatch.setattr(training, "RallyWindowDataset", lambda _: dataset)
     called = {}
     monkeypatch.setattr(
         training, "run_clean_rally_experiment", lambda *a, **k: called.update(k)
@@ -251,6 +246,41 @@ def test_cli_resolves_config_and_command_line_overrides(tmp_path, monkeypatch):
     assert called["recipe"].learning_rate == 0.001
     assert called["device"] == torch.device("cpu")
     assert called["resume"]
+
+
+@pytest.mark.parametrize(("dataset_overrides", "expected_seconds"), [({}, 2.0), ({"rally_context_seconds": 3.0}, 3.0)])
+def test_rtmpose_preset_uses_zscore_audio_and_defaults_to_four_second_context(
+    tmp_path, monkeypatch, dataset_overrides, expected_seconds,
+):
+    import json
+
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({
+        "dataset": {
+            "sources": [{
+                "source_id": "a", "video_path": "video.mp4", "assignments_path": "assignments.jsonl",
+                "pose_cache_path": "poses.jsonl", "calibration_path": "calibration.json",
+            }],
+            "rally_intervals_path": "rallies.csv", "rally_manifest_path": "rallies.json",
+            **dataset_overrides,
+        },
+        "camera_sources": {"A": ["a"]},
+    }))
+    called = {}
+    monkeypatch.setattr(training, "run_clean_rally_experiment", lambda config, *a, **k: called.update(
+        context=config.context_seconds,
+        feature_view=config.feature_view,
+        smoothing_weight=k["recipe"].temporal_smoothing_weight,
+        require_rtmpose=k["require_rtmpose"],
+    ))
+    assert training.main([
+        "--config", str(config), "--output-dir", str(tmp_path / "output"),
+        "--clean-only", "--preset", "rtmpose-audio", "--device", "cpu",
+    ]) == 0
+    assert called == {
+        "context": expected_seconds, "feature_view": "full_audio_zscore", "smoothing_weight": 0.1,
+        "require_rtmpose": True,
+    }
 
 
 def test_run_records_config_and_rejects_changed_resume_identity(tmp_path):

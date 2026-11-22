@@ -2,6 +2,8 @@
 
 import csv
 import json
+import shutil
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 
@@ -10,12 +12,15 @@ import numpy as np
 import pytest
 import torch
 
+from src.pose_estimator import POSE_BACKEND_TYPE
 from src.temporal_selector.rally import RallySegmenter, RallySegmenterConfig
+from src.temporal_selector.rally_audio import RallyAudio, read_rally_audio
 from src.temporal_selector.rally_dataset import (
     RallyDataConfig,
     RallySourceConfig,
     RallyWindowDataset,
 )
+from src.temporal_selector.rally_features import rally_feature_view
 from src.temporal_selector.rally_inference import (
     predict_source,
     predict_windows,
@@ -78,8 +83,10 @@ def source(tmp_path, request):
     return RallySourceConfig(identity.source_id, video, assignments, poses, calibration)
 
 
-def _model():
+def _model(feature_view="full"):
     model = RallySegmenter(RallySegmenterConfig(
+        frame_feature_dim=rally_feature_view(feature_view).dimension,
+        audio_attention=rally_feature_view(feature_view).uses_audio,
         token_size=8, num_layers=1, num_attention_heads=2, feed_forward_size=16, dropout=0,
     ))
     with torch.no_grad():
@@ -143,6 +150,38 @@ def test_targets_remain_masked_and_duplicate_ownership_is_rejected(source):
         predict_windows(_model(), [dataset.windows[0], dataset.windows[0]])
     with pytest.raises(ValueError, match="one source"):
         predict_windows(_model(), [dataset.windows[0], replace(dataset.windows[0], source_id="other")])
+
+
+@pytest.mark.parametrize("inactive_fingerprint", ["pose_model_fingerprint", "preprocessing_fingerprint"])
+def test_mediapipe_uses_only_active_pose_cache_records(source, inactive_fingerprint):
+    cache_path = source.pose_cache_path
+    metadata = json.loads(cache_path.read_text().splitlines()[0])
+    metadata["pose_backend"] = {"backend_type": POSE_BACKEND_TYPE}
+    active = {
+        "type": "pose", "frame": 0, "track_id": 1, "status": "detected",
+        "bbox": [20, 10, 40, 40], "pose_bbox": [20, 10, 40, 40],
+        "pose_model_fingerprint": metadata["pose_model_fingerprint"],
+        "preprocessing_fingerprint": metadata["preprocessing_fingerprint"],
+        "pose_landmarks": [
+            {"x": .8 if joint == 0 else .5, "y": .5, "visibility": 1.}
+            for joint in range(33)
+        ],
+    }
+    inactive = {
+        **active, inactive_fingerprint: "sha256:" + "b" * 64,
+        "pose_landmarks": [
+            {**active["pose_landmarks"][0], "x": .2},
+            *active["pose_landmarks"][1:],
+        ],
+    }
+    _jsonl(cache_path, metadata, [active, inactive, {**inactive, "frame": 1}])
+
+    dataset = RallyWindowDataset(RallyDataConfig((source,), None, None))
+    window = dataset.windows[0]
+    pose_x = dataset.feature_view.names.index("p1_pose_0_x")
+    assert window.frame_validity[window.frame_indices.index(0), pose_x].item()
+    assert window.frame_values[window.frame_indices.index(0), pose_x].item() == pytest.approx(.2)
+    assert not window.frame_validity[window.frame_indices.index(1), pose_x].item()
 
 
 @pytest.mark.parametrize("decoder", [
@@ -223,3 +262,104 @@ def test_missing_all_players_and_poses_still_covers_every_frame(source):
     pose_metadata = source.pose_cache_path.read_text().splitlines()[0]
     source.pose_cache_path.write_text(pose_metadata + "\n")
     assert len(_predict(source)) == 11
+
+
+@pytest.mark.skipif(
+    not shutil.which("ffprobe") or not shutil.which("ffmpeg"), reason="requires FFmpeg"
+)
+def test_audio_view_keeps_visual_features_and_aligns_delayed_track(source, tmp_path):
+    visual = RallyWindowDataset(RallyDataConfig((source,), None, None))
+    silent = RallyWindowDataset(RallyDataConfig((source,), None, None, feature_view="full_audio"))
+    visual_dim = visual.feature_view.dimension
+    for baseline, window in zip(visual, silent, strict=True):
+        torch.testing.assert_close(window.frame_values[:, :visual_dim], baseline.frame_values)
+        torch.testing.assert_close(window.frame_validity[:, :visual_dim], baseline.frame_validity)
+        assert not window.frame_validity[:, visual_dim:].any()
+        assert not window.frame_values[:, visual_dim:].any()
+
+    video = tmp_path / "delayed-audio.mp4"
+    subprocess.run([
+        "ffmpeg", "-nostdin", "-v", "error", "-i", str(source.video_path),
+        "-itsoffset", "0.6", "-f", "lavfi", "-i", "sine=frequency=1000:duration=0.6",
+        "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "alac", str(video),
+    ], check=True, capture_output=True)
+    source = replace(source, video_path=video)
+    identity_path = tmp_path / "source.json"
+    identity = replace(SourceIdentity.read(identity_path), video_sha256=sha256_file(video))
+    identity.write(identity_path)
+    calibration = json.loads(source.calibration_path.read_text())
+    calibration["artifact_metadata"]["source_identity_sha256"] = identity.fingerprint
+    source.calibration_path.write_text(json.dumps(calibration))
+    metadata, *observations = map(json.loads, source.assignments_path.read_text().splitlines())
+    metadata.update(
+        source_identity_sha256=identity.fingerprint,
+        calibration_sha256=sha256_file(source.calibration_path),
+    )
+    _jsonl(source.assignments_path, metadata, observations)
+
+    with_audio = RallyWindowDataset(
+        RallyDataConfig((source,), None, None, feature_view="full_audio")
+    )
+    assert with_audio.manifest["audio_coverage"][source.source_id] == {
+        "frames": 11, "energy_frames": 3, "flux_frames": 3,
+    }
+    for window in with_audio:
+        for index, frame in enumerate(window.frame_indices):
+            valid = window.frame_validity[index, visual_dim:]
+            if frame in (3, 4, 5):
+                assert valid.all()
+                bands = window.frame_values[index, visual_dim + 2:visual_dim + 6]
+                assert bands.argmax().item() == 1
+            else:
+                assert not valid.any()
+                assert not window.frame_values[index, visual_dim:].any()
+    rows = predict_source(
+        source, _model("full_audio"), preprocessing={"feature_view": "full_audio"},
+        decoder={"threshold": 0.49, "max_gap_seconds": 0, "minimum_duration_seconds": 0},
+        batch_size=2,
+    )
+    assert [row["frame"] for row in rows] == list(range(11))
+
+
+@pytest.mark.skipif(
+    not shutil.which("ffprobe") or not shutil.which("ffmpeg"), reason="requires FFmpeg"
+)
+def test_audio_gaps_are_masked_but_recorded_silence_is_valid(tmp_path):
+    video = tmp_path / "audio-gaps.mkv"
+    subprocess.run([
+        "ffmpeg", "-nostdin", "-v", "error",
+        "-f", "lavfi", "-i", "color=size=64x64:rate=50:duration=3",
+        "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=48000:duration=3",
+        "-af", "asetnsamples=n=480:p=0,volume=0:enable='between(t,0.4,0.8)',"
+        "aselect='not(between(t,1,1.05)+between(t,1.5,2))'",
+        "-c:v", "mpeg4", "-c:a", "pcm_s16le", str(video),
+    ], check=True, capture_output=True)
+    audio = read_rally_audio(video, frame_count=150, fps=50)
+    values, valid = audio.values, audio.validity
+
+    assert valid[30].all()
+    assert not values[30].any()
+    for frames in (slice(50, 54), slice(80, 95)):
+        assert not valid[frames].any()
+        assert not values[frames].any()
+    # At 1.09s only the earlier window used by spectral flux overlaps the gap.
+    assert valid[54, :-1].all()
+    assert values[54, 0] > 0
+    assert not valid[54, -1]
+    assert values[54, -1] == 0
+    assert valid[55].all()
+    assert valid[110].all()
+
+
+def test_audio_zscore_uses_observed_trailing_history_with_a_partition_reset():
+    times = np.array([0.0, 1.0, 2.0, 11.0, 11.5, 22.0])
+    values = np.array([[0, 3], [10, 3], [2, 3], [4, 3], [8, 3], [16, 3]], dtype=np.float32)
+    valid = np.ones_like(values, dtype=bool)
+    valid[2, 0] = False
+    audio = RallyAudio(values, valid, times)
+
+    # At 11s the observation exactly ten seconds back and the missing value are excluded.
+    np.testing.assert_array_equal(audio.zscore()[:, 0], [0, 1, 0, 0, 1, 0])
+    np.testing.assert_array_equal(audio.zscore()[:, 1], 0)
+    # Starting validation at 11.5s prevents it from looking back at the training audio.
+    np.testing.assert_array_equal(audio.zscore(start_frame=4), np.zeros((2, 2)))
