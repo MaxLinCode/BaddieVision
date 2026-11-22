@@ -14,11 +14,6 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from InPlay.heuristic.player_interpretation import (
-    EVIDENCE_WINDOW_SECONDS,
-    OCCUPANCY_WINDOW_SECONDS,
-    REASSIGN_INTERVAL_SECONDS,
-)
 from src.rtmpose import RTMPOSE_BACKEND_TYPE
 from src.single_video.video import has_constant_frame_rate
 
@@ -57,20 +52,6 @@ def validate_rally_source_fps(source_id: str, fps: float) -> None:
             f"{source_id}: rally model requires {RALLY_INPUT_FPS:g} fps, got {fps:g} fps. "
             "Create a 30 fps source with its own frame-indexed artifacts."
         )
-
-
-def player_assignment_guard_seconds(parameters: Mapping[str, Any], fps: float) -> float:
-    """Bound the centered assignment inputs of a frame and its one-frame pose repair."""
-    evidence = float(parameters.get("evidence_window_seconds", EVIDENCE_WINDOW_SECONDS))
-    occupancy = float(parameters.get("occupancy_window_seconds", OCCUPANCY_WINDOW_SECONDS))
-    interval = float(parameters.get("reassign_interval_seconds", REASSIGN_INTERVAL_SECONDS))
-    if any(not math.isfinite(value) or value <= 0 for value in (evidence, occupancy, interval)):
-        raise ValueError("player assignment window durations must be finite and positive")
-    evidence_frames = max(1, round(max(evidence, occupancy) * fps))
-    # A frame can use the previous reassignment decision for interval - 1 frames.
-    # Pose repair can use one additional neighboring frame.
-    hold_frames = max(1, round(interval * fps))
-    return (evidence_frames // 2 + hold_frames) / fps
 
 
 @dataclass(frozen=True)
@@ -309,15 +290,16 @@ class RallyWindowDataset(Dataset[RallyWindow]):
             raise ValueError(
                 "pose-cache lineage does not match player assignments"
             )
-        for key in ("pose_model_fingerprint", "preprocessing_fingerprint"):
+        pose_fingerprint_keys = ("pose_model_fingerprint", "preprocessing_fingerprint")
+        for key in pose_fingerprint_keys:
             if not str(pose_meta.get(key, "")).startswith("sha256:"):
                 raise ValueError(f"pose cache has invalid {key}")
         poses = {
             (int(record["frame"]), int(record["track_id"])): record
             for record in pose_records
-            if pose_backend != RTMPOSE_BACKEND_TYPE or all(
+            if all(
                 record.get(key) == pose_meta[key]
-                for key in ("pose_model_fingerprint", "preprocessing_fingerprint")
+                for key in pose_fingerprint_keys
             )
         }
         calibration_sha256 = file_sha256(source.calibration_path)
@@ -386,22 +368,17 @@ class RallyWindowDataset(Dataset[RallyWindow]):
                 raise ValueError("source identity video fingerprint does not match rally annotations")
 
         audio = (
-            read_rally_audio(
-                source.video_path, frame_count=frame_count, fps=fps,
-                normalization=self.feature_view.audio_normalization,
-            )
+            read_rally_audio(source.video_path, frame_count=frame_count, fps=fps)
             if self.feature_view.uses_audio
             else None
         )
         if audio is not None:
+            audio_values = audio.zscore() if self.feature_view.audio_zscore else audio.values
             self._audio_coverage[source.source_id] = {
                 "frames": frame_count,
-                "energy_frames": int(audio[1][:, 0].sum()),
-                "flux_frames": int(audio[1][:, -1].sum()),
+                "energy_frames": int(audio.validity[:, 0].sum()),
+                "flux_frames": int(audio.validity[:, -1].sum()),
             }
-        assignment_guard_seconds = player_assignment_guard_seconds(
-            assignment_meta.get("parameters") or {}, fps,
-        )
         ownership = max(1, round(fps * self.config.ownership_seconds))
         radius = max(1, round(fps * self.config.context_seconds))
         if radius < ownership // 2:
@@ -447,9 +424,8 @@ class RallyWindowDataset(Dataset[RallyWindow]):
                     frame_values[offset + 6] = float(projected[0]) / HALF_WIDTH
                     frame_values[offset + 7] = float(projected[1]) / HALF_LENGTH
                 if audio is not None:
-                    audio_values, audio_validity = audio
                     frame_values.extend(audio_values[frame].tolist())
-                    frame_validity.extend(audio_validity[frame].tolist())
+                    frame_validity.extend(audio.validity[frame].tolist())
                 selected_values, selected_validity = self.feature_view.select(
                     torch.tensor(frame_values, dtype=torch.float32),
                     torch.tensor(frame_validity, dtype=torch.bool),
@@ -496,7 +472,6 @@ class RallyWindowDataset(Dataset[RallyWindow]):
                     metadata={
                         "fps": fps,
                         "frame_count": frame_count,
-                        "player_assignment_guard_seconds": assignment_guard_seconds,
                         "image_size": list(image_size),
                         "feature_view": self.feature_view.name,
                         "calibration_sha256": calibration_sha256,

@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 import torch
 
-from src.rally_release import DEFAULT_PREPROCESSING, export_release
+from src.rally_release import DEFAULT_PREPROCESSING, export_release, resolve_release
 from src.temporal_selector.joint_inference import InPlayDecoderConfig
 from src.temporal_selector.rally import (
     RallySegmenter,
@@ -192,20 +192,21 @@ def test_rtmpose_release_converts_fps_before_extraction_and_reuses_source(
     subprocess.run(
         ["ffmpeg", "-v", "error", "-i", str(raw_video),
          "-f", "lavfi", "-i", "sine=frequency=660", "-shortest",
-         "-c:v", "copy", "-c:a", "aac", str(audio_video)],
+         "-vf", "fps=60", "-c:v", "libx264", "-c:a", "aac", str(audio_video)],
         check=True,
     )
     pose = tmp_path / "rtmpose.onnx"
     pose.write_bytes(b"test pose model")
     research = tmp_path / "rtm-research.pt"
     model = RallySegmenter(RallySegmenterConfig(
-        frame_feature_dim=RALLY_FEATURE_VIEWS["full_audio"].dimension,
+        frame_feature_dim=RALLY_FEATURE_VIEWS["full_audio_zscore"].dimension,
+        audio_attention=True,
         token_size=8, num_layers=1, num_attention_heads=2, feed_forward_size=16,
     ))
     torch.save(rally_checkpoint(
         model, dataset_fingerprint="test", annotation_fingerprint="test",
         split_manifest={}, training_recipe=RallyTrainingRecipe(temporal_smoothing_weight=0.1),
-        chosen_epoch=1, feature_view="full_audio",
+        chosen_epoch=1, feature_view="full_audio_zscore",
         decoder_configuration=asdict(InPlayDecoderConfig(continuation_threshold=0.4)),
         pose_training_metadata={
             "pose_model_sha256": sha256_file(pose),
@@ -235,10 +236,27 @@ def test_rtmpose_release_converts_fps_before_extraction_and_reuses_source(
         assert len(handle.readlines()) == identity.frame_count + 1
     from src.temporal_selector.rally_audio import read_rally_audio
 
-    _, validity = read_rally_audio(source.video_path, frame_count=45, fps=30)
+    validity = read_rally_audio(source.video_path, frame_count=45, fps=30).validity
     assert validity[:, 0].any()
     assert run_pipeline(**kwargs) == outputs
     assert calls["person"] == 1
+
+    manifest_value = json.loads(manifest.read_text())
+    pose_entry = manifest_value["assets"]["pose_model"]
+    replacement = release / pose_entry["filename"]
+    replacement.write_bytes(b"different pose model")
+    pose_entry.update(sha256=sha256_file(replacement), size_bytes=replacement.stat().st_size)
+    manifest.write_text(json.dumps(manifest_value))
+    resolve_kwargs = {
+        "checkpoint": kwargs["checkpoint"], "manifest": manifest, "cache_dir": kwargs["cache_dir"],
+    }
+    with pytest.raises(ValueError, match="RTMPose asset SHA-256 differs from release preprocessing"):
+        resolve_release(**resolve_kwargs)
+
+    manifest_value["preprocessing"]["pose_model_sha256"] = pose_entry["sha256"]
+    manifest.write_text(json.dumps(manifest_value))
+    with pytest.raises(ValueError, match="checkpoint and manifest inference contracts differ"):
+        resolve_release(**resolve_kwargs)
 
 
 def test_complete_pipeline_and_verified_cached_rerun(pipeline, monkeypatch):
@@ -412,9 +430,7 @@ def test_explicit_device_failure_and_auto_fallback(pipeline, monkeypatch):
     assert calls == {"person": 0, "players": 0}
 
 
-@pytest.mark.parametrize("view", [
-    "no_position", "full_audio", "full_audio_zscore", "full_audio_centered_flux",
-])
+@pytest.mark.parametrize("view", ["no_position", "full_audio"])
 def test_pipeline_uses_manifest_feature_view(pipeline, view):
     kwargs, _ = pipeline
     config = RallySegmenterConfig(

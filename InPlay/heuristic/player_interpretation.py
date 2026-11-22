@@ -742,6 +742,18 @@ def enrich_pose_cache(
     return active, len(new_records)
 
 
+def _usable_original_pose(record: dict[str, Any], mask_missing_landmarks: bool) -> bool:
+    landmarks = record.get("pose_landmarks") or ()
+    return (
+        record.get("temporal_status") in (None, "original", "validated")
+        and record.get("pose_quality", 0.0) >= POSE_QUALITY_THRESHOLD
+        and len(landmarks) > max(TORSO_LANDMARKS)
+        and (not mask_missing_landmarks or all(
+            landmarks[joint]["visibility"] > 0 for joint in TORSO_LANDMARKS
+        ))
+    )
+
+
 def apply_temporal_pose_validation(
     assignments: list[dict[str, Any]],
     pose_cache: dict[tuple[int, int, tuple[float, ...]], dict[str, Any]],
@@ -749,60 +761,62 @@ def apply_temporal_pose_validation(
     *,
     mask_missing_landmarks: bool = False,
 ) -> None:
-    """Reject isolated torso outliers and fill only bracketed one-frame pose gaps."""
+    """Repair isolated torso outliers and one-frame gaps using usable original poses."""
     diagonal = float(np.hypot(*frame_size))
+    frame_numbers = [int(frame["frame"]) for frame in assignments]
+    updates: list[tuple[dict[str, Any], dict[str, Any]]] = []
     for slot_name in ("P1", "P2"):
-        series: list[tuple[dict[str, Any] | None, dict[str, Any] | None]] = []
-        for frame in assignments:
+        series: list[dict[str, Any] | None] = []
+        for frame_number, frame in zip(frame_numbers, assignments, strict=True):
             assignment = frame["slots"][slot_name]["assignment"]
             record = None if assignment is None else pose_cache.get(
-                (int(frame["frame"]), int(assignment["track_id"]), _bbox_key(assignment["bbox"]))
+                (frame_number, int(assignment["track_id"]), _bbox_key(assignment["bbox"]))
             )
-            series.append((assignment, record))
+            series.append(record)
         for index in range(1, len(series) - 1):
-            prev_assignment, prev = series[index - 1]
-            assignment, current = series[index]
-            next_assignment, nxt = series[index + 1]
-            if not all((prev_assignment, assignment, next_assignment, prev, current, nxt)):
+            prev, current, nxt = series[index - 1:index + 2]
+            if prev is None or current is None or nxt is None:
                 continue
-            if not (prev.get("pose_landmarks") and nxt.get("pose_landmarks")):
+            frame_number = frame_numbers[index]
+            if frame_numbers[index - 1] != frame_number - 1 or frame_numbers[index + 1] != frame_number + 1:
+                continue
+            if not (_usable_original_pose(prev, mask_missing_landmarks)
+                    and _usable_original_pose(nxt, mask_missing_landmarks)):
                 continue
             prev_points = _landmarks_to_image(prev["pose_landmarks"], prev.get("pose_bbox", prev["bbox"]))
             next_points = _landmarks_to_image(nxt["pose_landmarks"], nxt.get("pose_bbox", nxt["bbox"]))
-            if len(prev_points) <= max(TORSO_LANDMARKS) or len(next_points) != len(prev_points):
-                continue
-            if mask_missing_landmarks and any(
-                record["pose_landmarks"][joint]["visibility"] <= 0
-                for record in (prev, nxt) for joint in TORSO_LANDMARKS
-            ):
+            if len(next_points) != len(prev_points):
                 continue
             prev_torso = prev_points[list(TORSO_LANDMARKS)].mean(axis=0)
             next_torso = next_points[list(TORSO_LANDMARKS)].mean(axis=0)
             if np.linalg.norm(next_torso - prev_torso) / diagonal > TEMPORAL_MAX_BRACKET_MOTION:
                 continue
-            interpolated = (prev_points + next_points) / 2.0
-            usable = current.get("pose_landmarks") and current.get("pose_quality", 0.0) >= POSE_QUALITY_THRESHOLD
-            if mask_missing_landmarks and usable:
-                usable = all(current["pose_landmarks"][joint]["visibility"] > 0 for joint in TORSO_LANDMARKS)
-            if usable:
+            if _usable_original_pose(current, mask_missing_landmarks):
                 current_points = _landmarks_to_image(current["pose_landmarks"], current.get("pose_bbox", current["bbox"]))
                 torso = current_points[list(TORSO_LANDMARKS)].mean(axis=0)
                 if np.linalg.norm(torso - (prev_torso + next_torso) / 2.0) / diagonal <= TEMPORAL_JUMP_THRESHOLD:
-                    current["temporal_status"] = "validated"
+                    updates.append((current, {"temporal_status": "validated"}))
                     continue
-                current["temporal_status"] = "rejected_jump_interpolated"
+                temporal_status = "rejected_jump_interpolated"
             else:
-                current["temporal_status"] = "interpolated_single_gap"
+                temporal_status = "interpolated_single_gap"
             template = prev["pose_landmarks"]
+            interpolated = (prev_points + next_points) / 2.0
             landmarks = _image_to_landmarks(interpolated, template, current.get("pose_bbox", current["bbox"]))
             if mask_missing_landmarks:
                 for point, next_point in zip(landmarks, nxt["pose_landmarks"], strict=True):
                     point["visibility"] = min(point["visibility"], next_point["visibility"])
                     if point["visibility"] <= 0:
                         point.update(x=0.0, y=0.0, z=0.0)
-            current["pose_landmarks"] = landmarks
-            current["pose_quality"] = min(float(prev.get("pose_quality", 0)), float(nxt.get("pose_quality", 0)))
-            current["status"] = "detected"
+            updates.append((current, {
+                "temporal_status": temporal_status,
+                "pose_landmarks": landmarks,
+                "pose_quality": min(float(prev["pose_quality"]), float(nxt["pose_quality"])),
+                "status": "detected",
+            }))
+    # Commit after both slots have been checked so repairs cannot become brackets.
+    for record, update in updates:
+        record.update(update)
 
 
 def derive_activity_and_rows(

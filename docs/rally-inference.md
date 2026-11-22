@@ -48,10 +48,10 @@ Model and performance options:
 - `--no-overlay`: produce predictions and CSV without an MP4.
 - `--force`: regenerate stages whose inputs or outputs no longer match receipts.
 
-A local checkpoint trained with the `full_audio` feature view uses the first
-audio stream of the input video and requires both FFmpeg and FFprobe. The
-manifest selects audio extraction automatically. For audio-model evaluation,
-keep the recording's synchronized audio track.
+Local checkpoints trained with `full_audio_zscore` or `full_audio`
+use the first audio stream and require both FFmpeg and FFprobe. The manifest
+selects audio extraction automatically. For audio-model evaluation, keep the
+recording's synchronized audio track.
 
 The full video retains its source-local frame numbering. CSV endpoints are
 inclusive and start at zero. No rallies is a successful header-only CSV. Inference
@@ -151,7 +151,9 @@ limitations. This release changes packaging and inference, not model accuracy.
 ## Run a trained RTMPose release
 
 Export the research checkpoint with the same FP16 Halpe26 ONNX pose asset
-used to generate its training observations.
+used to generate its training observations. The exported checkpoint binds
+the pose asset's SHA-256 to the inference contract. Re-export older RTMPose
+packages that lack this digest using the original research checkpoint and pose asset.
 
 ```bash
 python -m tools.export_rally_release \
@@ -167,8 +169,9 @@ python -m src.workflow rally predict --video match.mp4 --output-dir outputs/matc
   --model-manifest outputs/rally-release/manifest.json --device cpu
 ```
 
-RTMPose inference requires constant 30 fps. Passing a new MP4 as `--video`
-converts other frame rates and variable-rate input before registration and
+RTMPose inference requires constant 30 fps. Inputs below 30 fps are rejected.
+Passing a new MP4 as `--video` converts higher-rate or variable-rate input
+at or above 30 fps before registration and
 keeps the audio streams. For an existing nonconforming `--source`, prepare
 a new source and regenerate its frame-indexed artifacts. See the
 [training workflow](rally-training.md#rtmpose-and-raw-audio-recipe).

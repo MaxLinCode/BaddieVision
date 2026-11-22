@@ -170,7 +170,10 @@ def validate_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
             "runtime_versions must record the inference dependency versions"
         )
     preprocessing = value["preprocessing"]
-    if set(preprocessing) != set(defaults):
+    expected_preprocessing = set(defaults)
+    if not legacy:
+        expected_preprocessing.add("pose_model_sha256")
+    if set(preprocessing) != expected_preprocessing:
         raise ValueError("release preprocessing fields are incompatible")
     for name in (
         "pose_coordinate_mode",
@@ -223,6 +226,8 @@ def validate_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
             "localhost",
         }:
             raise ValueError("HTTP assets are allowed only for local tests")
+    if not legacy and assets["pose_model"]["sha256"] != preprocessing["pose_model_sha256"]:
+        raise ValueError("RTMPose asset SHA-256 differs from release preprocessing")
     return value
 
 
@@ -396,6 +401,7 @@ def export_release(
             raise ValueError("export preprocessing differs from RTMPose training")
         if recipe.get("pose_backend") != RTMPOSE_BACKEND_TYPE:
             raise ValueError("checkpoint does not declare RTMPose preprocessing")
+        recipe["pose_model_sha256"] = trained_pose["pose_model_sha256"]
         if pose_model.suffix.lower() != ".onnx":
             raise ValueError("RTMPose release requires an FP16 ONNX pose asset")
         session, _ = open_session(pose_model, "cpu")

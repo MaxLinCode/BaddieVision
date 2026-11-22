@@ -366,6 +366,18 @@ def _player_stage_valid(
         )
 
 
+def resolve_person_detector(model: str | Path) -> Path:
+    """Resolve an Ultralytics alias to the checkpoint bytes used by the stage."""
+    model_path = Path(model).expanduser()
+    if not model_path.is_file():
+        from ultralytics import YOLO
+
+        model_path = Path(YOLO(str(model)).ckpt_path)
+    if not model_path.is_file():
+        raise FileNotFoundError(f"person detector is missing: {model_path}")
+    return model_path
+
+
 def run_person_stage(
     source: SourceEntry,
     *,
@@ -399,14 +411,7 @@ def run_person_stage(
                 source, "person", "completed", reused=True, origin="validated_import"
             )
             return False
-    # Resolve an Ultralytics alias before hashing; receipts always describe model bytes.
-    model_path = Path(model).expanduser()
-    if not model_path.is_file():
-        from ultralytics import YOLO
-
-        model_path = Path(YOLO(str(model)).ckpt_path)
-    if not model_path.is_file():
-        raise FileNotFoundError(f"person detector is missing: {model_path}")
+    model_path = resolve_person_detector(model)
     inputs = {
         "identity": identity.fingerprint,
         "detector_sha256": sha256_file(model_path),

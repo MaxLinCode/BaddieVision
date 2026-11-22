@@ -20,7 +20,6 @@ from src.temporal_selector import (
     collate_rally_windows,
     rally_checkpoint,
 )
-from src.temporal_selector.rally_dataset import player_assignment_guard_seconds
 from src.temporal_selector.rally_evaluation import (
     camera_held_out_folds,
     chronological_camera_train_validation_split,
@@ -29,6 +28,7 @@ from src.temporal_selector.rally_evaluation import (
     rally_metrics,
     stable_track_fusion_acceptance,
 )
+from src.temporal_selector.rally_audio import RALLY_AUDIO_FEATURE_NAMES
 
 
 def _config() -> RallySegmenterConfig:
@@ -124,6 +124,36 @@ def test_temporal_smoothing_uses_only_adjacent_owned_same_state_frames() -> None
     assert gradient is not None
     assert gradient[0, 1] < 0 < gradient[0, 2]
     assert gradient.count_nonzero() == 2
+
+
+def test_attention_masks_missing_audio_without_masking_its_video_frames() -> None:
+    audio_dim = len(RALLY_AUDIO_FEATURE_NAMES)
+    model = RallySegmenter(replace(
+        _config(), frame_feature_dim=RALLY_FEATURE_DIM + audio_dim, audio_attention=True,
+    )).eval()
+    batch = _batch()
+    batch.frame_values = torch.zeros(2, 4, model.config.frame_feature_dim)
+    batch.frame_validity = torch.ones_like(batch.frame_values, dtype=torch.bool)
+    audio_validity = batch.frame_validity[..., -audio_dim:]
+    audio_validity[0, 0] = False
+    audio_validity[0, 2, 1:] = False
+    audio_validity[1, :2] = False
+    masks = []
+    handle = model.transformer.register_forward_pre_hook(
+        lambda module, args, kwargs: masks.append(kwargs["src_key_padding_mask"]),
+        with_kwargs=True,
+    )
+    with torch.no_grad():
+        expected = model(batch).inplay_logits
+        batch.frame_values[..., -audio_dim:].masked_fill_(~audio_validity, 1000)
+        actual = model(batch).inplay_logits
+    handle.remove()
+    assert masks[0].tolist() == [
+        [False, False, False, False, True, False, False, False],
+        [False, False, True, True, True, True, True, True],
+    ]
+    torch.testing.assert_close(actual, expected)
+    assert torch.isfinite(actual[batch.frame_mask]).all()
 
 
 def test_padding_targets_and_centered_time_are_validated() -> None:
@@ -241,39 +271,6 @@ def test_camera_splits_are_contained_guarded_and_deterministic() -> None:
     assert set(folds[0].training_source_ids).isdisjoint(
         folds[0].test_source_ids
     )
-
-
-@pytest.mark.parametrize(("context_seconds", "assignment_parameters", "anchor_guard_frames"), [
-    (1.0, {}, 120),
-    (2.0, {}, 150),
-    (3.0, {}, 180),
-    (2.0, {"evidence_window_seconds": 7.0, "reassign_interval_seconds": 1.0}, 195),
-])
-def test_rally_split_guard_expands_with_both_windows(
-    context_seconds, assignment_parameters, anchor_guard_frames,
-):
-    fps = 30
-    frame_count = 1500
-    radius = round(context_seconds * fps)
-    windows = [
-        replace(
-            _window("a", frame, fps=fps, frame_count=frame_count),
-            frame_indices=tuple(range(max(0, frame - radius), min(frame_count, frame + radius + 1))),
-        )
-        for frame in range(frame_count)
-    ]
-    guard_seconds = player_assignment_guard_seconds(assignment_parameters, fps)
-    guard_frames = round(guard_seconds * fps)
-    train, validation, split = chronological_camera_train_validation_split(
-        windows, {"camera-a": ("a",)}, guard_seconds=guard_seconds, context_radius_seconds=context_seconds,
-    )
-    cut = split["cameras"]["camera-a"]["cut_frame"]
-    assert split["anchor_guard_seconds"] == guard_seconds + context_seconds
-    assert split["cameras"]["camera-a"]["anchor_guard_frames"] == anchor_guard_frames
-    assert train[-1].anchor_frame == cut - anchor_guard_frames - 1
-    assert validation[0].anchor_frame == cut + anchor_guard_frames
-    assert max(train[-1].frame_indices) + guard_frames < cut
-    assert min(validation[0].frame_indices) - guard_frames == cut
 
 
 def _rows(clean: bool) -> list[dict]:

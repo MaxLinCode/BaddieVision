@@ -9,7 +9,7 @@ from typing import Final
 import torch
 from torch import Tensor
 
-from .rally_audio import RALLY_AUDIO_FEATURE_NAMES, RallyAudioNormalization
+from .rally_audio import RALLY_AUDIO_FEATURE_NAMES
 
 RALLY_FEATURE_SCHEMA: Final = "baddievision.rally.feature_views"
 RALLY_FEATURE_VERSION: Final = 2
@@ -47,7 +47,7 @@ class RallyFeatureView:
     names: tuple[str, ...]
     full_indices: tuple[int, ...]
     uses_audio: bool = False
-    audio_normalization: RallyAudioNormalization = "raw"
+    audio_zscore: bool = False
 
     @property
     def dimension(self) -> int:
@@ -77,11 +77,7 @@ def _names_for_fields(fields: Sequence[str], *, include_pose: bool = True) -> tu
 
 
 def _view(
-    name: str,
-    names: Sequence[str],
-    *,
-    uses_audio: bool = False,
-    audio_normalization: RallyAudioNormalization = "raw",
+    name: str, names: Sequence[str], *, uses_audio: bool = False, audio_zscore: bool = False,
 ) -> RallyFeatureView:
     requested = tuple(names)
     if len(requested) != len(set(requested)):
@@ -92,8 +88,7 @@ def _view(
     if missing:
         raise AssertionError(f"unknown feature in rally view {name}: {missing}")
     return RallyFeatureView(
-        name, requested, tuple(positions[item] for item in requested),
-        uses_audio=uses_audio, audio_normalization=audio_normalization,
+        name, requested, tuple(positions[item] for item in requested), uses_audio, audio_zscore
     )
 
 
@@ -104,11 +99,7 @@ RALLY_FEATURE_VIEWS: Final[Mapping[str, RallyFeatureView]] = {
     ),
     "full_audio_zscore": _view(
         "full_audio_zscore", FULL_RALLY_FEATURE_NAMES + RALLY_AUDIO_FEATURE_NAMES,
-        uses_audio=True, audio_normalization="trailing_zscore",
-    ),
-    "full_audio_centered_flux": _view(
-        "full_audio_centered_flux", FULL_RALLY_FEATURE_NAMES + RALLY_AUDIO_FEATURE_NAMES,
-        uses_audio=True, audio_normalization="centered_flux",
+        uses_audio=True, audio_zscore=True,
     ),
     "calibrated_canonical": _view(
         "calibrated_canonical",
@@ -184,7 +175,6 @@ assert {name: view.dimension for name, view in RALLY_FEATURE_VIEWS.items()} == {
     "full": 154,
     "full_audio": 161,
     "full_audio_zscore": 161,
-    "full_audio_centered_flux": 161,
     "calibrated_canonical": 142,
     "no_position": 138,
     "image_position": 150,

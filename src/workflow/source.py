@@ -81,6 +81,8 @@ def resolve_rally_30fps_source(
     if video is not None:
         video = video.expanduser().resolve()
         fps = float(read_video_info(video)["fps"])
+        if fps < RALLY_INPUT_FPS - 1e-6:
+            raise ValueError(f"{video.name}: rally input is below {RALLY_INPUT_FPS:g} fps ({fps:g} fps)")
         if abs(fps - RALLY_INPUT_FPS) > 1e-6 or not has_constant_frame_rate(video, RALLY_INPUT_FPS):
             source_id = source_id or f"{video.stem}-30fps"
             if output_dir is None:

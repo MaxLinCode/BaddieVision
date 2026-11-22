@@ -36,13 +36,11 @@ from .training import (
 )
 from .model import JointRallyShuttleModel
 from .rally import (
-    RallyBatch,
     RallySegmenter,
     RallySegmenterConfig,
     RallyTrainingRecipe,
     rally_checkpoint,
 )
-from .rally_audio import RALLY_AUDIO_FEATURE_NAMES
 from .rally_dataset import (
     RALLY_TRANSFORMER_CONTEXT_RADIUS_SECONDS,
     RallyDataConfig,
@@ -63,7 +61,9 @@ from .rally_evaluation import (
     rally_metrics,
     tune_rally_decoder,
 )
-from .rally_features import FULL_RALLY_FEATURE_NAMES, RALLY_FEATURE_VIEWS, rally_feature_view
+from .rally_features import RALLY_FEATURE_VIEWS, rally_feature_view
+from .rally_intervals import read_rally_intervals
+from .rally_partitions import plan_rally_camera_splits, prepare_rally_partition
 
 
 class _RallyBatchSampler(Sampler[list[int]]):
@@ -187,6 +187,7 @@ def predict_rally_windows(
     device: torch.device,
     batch_size: int,
     partition: str,
+    include_unlabeled: bool = False,
 ) -> list[dict[str, Any]]:
     """Predict exactly the owned frames from each candidate-free window."""
     records: list[dict[str, Any]] = []
@@ -204,9 +205,14 @@ def predict_rally_windows(
                 if frame not in window.owned_frames:
                     continue
                 target = int(window.inplay_targets[local_frame])
-                if target not in (0, 1):
+                if target not in (0, 1) and not include_unlabeled:
                     continue
                 logit = float(inplay[batch_index, local_frame])
+                partial = next((
+                    (has_start, has_end)
+                    for first, last, has_start, has_end in window.metadata.get("partial_rally_spans", ())
+                    if first <= frame <= last
+                ), None)
                 records.append(
                     {
                         "source_id": window.source_id,
@@ -214,6 +220,7 @@ def predict_rally_windows(
                         "partition": partition,
                         "window_id": window.window_id,
                         "inplay_target": target,
+                        **({"partial_rally": partial} if partial is not None else {}),
                         "inplay_logit": logit,
                         "inplay_probability": float(
                             torch.sigmoid(torch.tensor(logit))
@@ -308,17 +315,6 @@ def _window_identity(windows: Sequence[RallyWindow]) -> str:
     return digest.hexdigest()
 
 
-def _drop_rally_audio(
-    batch: RallyBatch, probability: float, generator: torch.Generator
-) -> None:
-    """Drop the entire audio modality for independently selected training windows."""
-    dropped = torch.rand(batch.frame_values.shape[0], generator=generator) < probability
-    audio_start = len(FULL_RALLY_FEATURE_NAMES)
-    # The model consumes feature values and validity as separate inputs.
-    batch.frame_values[dropped, :, audio_start:] = 0
-    batch.frame_validity[dropped, :, audio_start:] = False
-
-
 def train_rally_segmenter(
     model: RallySegmenter,
     train_windows: Sequence[RallyWindow],
@@ -333,7 +329,6 @@ def train_rally_segmenter(
     learning_rate: float = 3e-4,
     gradient_clip_norm: float = 1.0,
     sampling: str = "boundary_balanced",
-    audio_dropout: float = 0.0,
     recovery_path: Path | None = None,
     resume: bool = False,
     recovery_identity: Mapping[str, Any] | None = None,
@@ -354,12 +349,7 @@ def train_rally_segmenter(
         gradient_clip_norm=gradient_clip_norm,
         sampling=sampling,
         device=device.type,
-        audio_dropout=audio_dropout,
     )
-    if audio_dropout and model.config.frame_feature_dim != (
-        len(FULL_RALLY_FEATURE_NAMES) + len(RALLY_AUDIO_FEATURE_NAMES)
-    ):
-        raise ValueError("audio dropout requires an audio feature view")
     if not train_windows or (validation_windows is not None and not validation_windows):
         raise ValueError(
             "rally training requires nonempty training and designated validation partitions"
@@ -411,7 +401,7 @@ def train_rally_segmenter(
         ):
             raise ValueError("not a compatible rally recovery checkpoint")
         saved_identity = checkpoint["identity"]
-        saved_identity["recipe"].setdefault("audio_dropout", 0.0)
+        saved_identity["model_config"].setdefault("audio_attention", False)
         if saved_identity != identity:
             raise ValueError(
                 "recovery configuration, data or split identity has changed"
@@ -431,13 +421,7 @@ def train_rally_segmenter(
         model.train()
         sums = [0.0, 0.0, 0.0, 0.0]
         batch_count = 0
-        # Seed separately from model randomness and the window sampler.
-        generator = (
-            torch.Generator().manual_seed(seed + epochs + epoch) if audio_dropout else None
-        )
         for batch in loader:
-            if generator is not None:
-                _drop_rally_audio(batch, audio_dropout, generator)
             batch = batch.to(device)
             optimizer.zero_grad(set_to_none=True)
             losses = model.losses(
@@ -646,6 +630,7 @@ def _prepare_rally_run(
     camera_sources: Mapping[str, Sequence[str]],
     *,
     resume: bool,
+    partition_fingerprints: Mapping[str, str] | None = None,
 ) -> tuple[Path, dict[str, list[str]]]:
     path = Path(path).expanduser().resolve()
     # Camera keys are labels. Source lists retain their chronological order.
@@ -659,6 +644,7 @@ def _prepare_rally_run(
         "dataset_fingerprint": dataset.manifest["dataset_fingerprint"],
         "annotation_fingerprint": dataset.annotation_fingerprint,
         "camera_sources": ordered_camera_sources,
+        **({"partition_fingerprints": dict(partition_fingerprints)} if partition_fingerprints is not None else {}),
     }
     configuration_path = path / "resolved-config.json"
     if resume:
@@ -673,7 +659,6 @@ def _prepare_rally_run(
                 "start a new run in a different output directory"
             )
         if isinstance(previous.get("training_recipe"), dict):
-            previous["training_recipe"].setdefault("audio_dropout", 0.0)
             previous["training_recipe"].setdefault("temporal_smoothing_weight", 0.0)
         if previous != configuration:
             raise ValueError("resume configuration or dataset identity has changed")
@@ -1013,31 +998,72 @@ def run_independent_rally_experiment(
 
 
 def run_clean_rally_experiment(
-    rally_dataset: RallyWindowDataset,
+    data_config: RallyDataConfig,
     output_dir: Path,
     *,
     camera_sources: Mapping[str, Sequence[str]],
     recipe: RallyTrainingRecipe | None = None,
     device: torch.device | None = None,
     resume: bool = False,
+    require_rtmpose: bool = False,
+    person_model: str | None = None,
+    pose_model: Path | None = None,
 ) -> dict[str, Any]:
     """Run candidate-free camera-held-out training without loading shuttle artifacts."""
     recipe = recipe or RallyTrainingRecipe()
     device = device or torch.device(recipe.device)
     recipe = replace(recipe, device=device.type)
-    feature_view = rally_dataset.feature_view
+    if data_config.rally_intervals_path is None or data_config.rally_manifest_path is None:
+        raise ValueError("clean rally training requires reviewed rally annotations")
+    folds = camera_held_out_folds(camera_sources)
+    sources = {source.source_id: source for source in data_config.sources}
+    if set(sources) != {source for fold in folds for source in fold.test_source_ids}:
+        raise ValueError("camera source groups must cover every configured source exactly once")
+    index = read_rally_intervals(data_config.rally_intervals_path, data_config.rally_manifest_path)
+    if missing := set(sources) - set(index.sources):
+        raise ValueError(f"rally manifest is missing sources: {sorted(missing)}")
+    plans = plan_rally_camera_splits(index, camera_sources)
+    feature_view = rally_feature_view(data_config.feature_view)
+
+    output_dir = Path(output_dir).expanduser().resolve()
+    # Full-source observations are used for held-out scoring and production.
+    # A source divided by a fold cut gets independently extracted observations.
+    rally_dataset = RallyWindowDataset(data_config)
+    if rally_dataset.rally_index != index:
+        raise ValueError("rally annotations changed while preparing the train/validation split")
     uses_rtmpose = "pose_training_metadata" in rally_dataset.manifest
-    if recipe.audio_dropout and not feature_view.uses_audio:
-        raise ValueError("audio dropout requires an audio feature view")
+    if require_rtmpose and not uses_rtmpose:
+        raise ValueError("the RTMPose audio preset requires RTMPose observations for every source")
+    full_windows: dict[str, list[RallyWindow]] = {source: [] for source in sources}
+    for window in rally_dataset.windows:
+        full_windows[window.source_id].append(window)
+    partition_windows = {}
+    partition_fingerprints = {}
+    for plan in plans.values():
+        for part in (*plan.train, *plan.validation):
+            count = index.sources[part.source_id].frame_count
+            if part.start == 0 and part.stop == count:
+                partition_windows[part] = full_windows[part.source_id]
+                continue
+            windows, fingerprint = prepare_rally_partition(
+                data_config, sources[part.source_id], part, index,
+                output_dir.parent / ".rally-partitions",
+                device=device.type, person_model=person_model, pose_model=pose_model,
+            )
+            partition_windows[part] = windows
+            partition_fingerprints[f"{part.source_id}:{part.start}:{part.stop}"] = fingerprint
     output_dir, camera_sources = _prepare_rally_run(
-        output_dir, rally_dataset, recipe, camera_sources, resume=resume
+        output_dir, rally_dataset, recipe, camera_sources, resume=resume,
+        partition_fingerprints=partition_fingerprints,
     )
     _seed_everything(recipe.seed)
     camera_metrics: dict[str, Any] = {}
     test_rows: list[dict[str, Any]] = []
     selected_epochs: list[int] = []
     fold_artifacts = []
-    model_config = RallySegmenterConfig(frame_feature_dim=feature_view.dimension)
+    model_config = RallySegmenterConfig(
+        frame_feature_dim=feature_view.dimension, audio_attention=feature_view.uses_audio
+    )
     calibration_fingerprints = {
         source: str(value["calibration_sha256"])
         for source, value in rally_dataset.manifest["sources"].items()
@@ -1045,19 +1071,35 @@ def run_clean_rally_experiment(
     for fold in camera_held_out_folds(camera_sources):
         fold_dir = output_dir / f"fold-{fold.fold_id}-{fold.held_out_camera}"
         fold_dir.mkdir(exist_ok=resume)
-        eligible = [window for window in rally_dataset.windows
-                    if window.source_id in fold.training_source_ids]
-        guard_seconds = (
-            max(float(window.metadata["player_assignment_guard_seconds"]) for window in eligible)
-            if uses_rtmpose else 1.0
-        )
-        train, validation, split = chronological_camera_train_validation_split(
-            eligible, _training_camera_groups(fold, camera_sources),
-            guard_seconds=guard_seconds,
-            context_radius_seconds=rally_dataset.config.context_seconds if uses_rtmpose else None,
-        )
-        test = [window for window in rally_dataset.windows
-                if window.source_id in fold.test_source_ids]
+        training_cameras = _training_camera_groups(fold, camera_sources)
+        train = [
+            window for camera in training_cameras for part in plans[camera].train
+            for window in partition_windows[part]
+        ]
+        validation = [
+            window for camera in training_cameras for part in plans[camera].validation
+            for window in partition_windows[part]
+        ]
+        split = {
+            "strategy": "chronological-source-ranges",
+            "frame_range_convention": "source-local, start inclusive, stop exclusive",
+            "partition_fingerprints": {
+                key: partition_fingerprints[key]
+                for camera in training_cameras
+                for part in (*plans[camera].train, *plans[camera].validation)
+                if (key := f"{part.source_id}:{part.start}:{part.stop}") in partition_fingerprints
+            },
+            "cameras": {
+                camera: {
+                    "cut_frame": plans[camera].cut,
+                    "total_frames": plans[camera].total_frames,
+                    "train": [asdict(part) for part in plans[camera].train],
+                    "validation": [asdict(part) for part in plans[camera].validation],
+                }
+                for camera in training_cameras
+            },
+        }
+        test = [window for source in fold.test_source_ids for window in full_windows[source]]
         if not validation or not test:
             raise ValueError("clean rally fold requires validation and held-out windows")
         split_manifest = {
@@ -1086,7 +1128,6 @@ def run_clean_rally_experiment(
             learning_rate=recipe.learning_rate,
             gradient_clip_norm=recipe.gradient_clip_norm,
             sampling=recipe.sampling,
-            audio_dropout=recipe.audio_dropout,
             recovery_path=fold_dir / "training-recovery.pt",
             resume=resume,
             recovery_identity={
@@ -1098,17 +1139,18 @@ def run_clean_rally_experiment(
         selected_epochs.append(epoch)
         validation_rows = predict_rally_windows(
             model, validation, device=device, batch_size=recipe.batch_size,
-            partition="validation",
+            partition="validation", include_unlabeled=True,
         )
         fps_by_source = {window.source_id: float(window.metadata["fps"])
-                         for window in (*validation, *test)}
+                         for window in validation}
+        test_fps_by_source = {window.source_id: float(window.metadata["fps"]) for window in test}
         decoder, decoder_search = tune_rally_decoder(
             validation_rows, fps_by_source=fps_by_source, hysteresis=uses_rtmpose
         )
         raw_test = predict_rally_windows(
-            model, test, device=device, batch_size=recipe.batch_size, partition="test"
+            model, test, device=device, batch_size=recipe.batch_size, partition="test", include_unlabeled=True,
         )
-        decoded = decode_prediction_rows(raw_test, fps_by_source=fps_by_source, config=decoder)
+        decoded = decode_prediction_rows(raw_test, fps_by_source=test_fps_by_source, config=decoder)
         metrics = rally_metrics(decoded)
         camera_metrics[fold.held_out_camera] = metrics
         test_rows.extend(decoded)
@@ -1145,7 +1187,6 @@ def run_clean_rally_experiment(
         learning_rate=recipe.learning_rate,
         gradient_clip_norm=recipe.gradient_clip_norm,
         sampling=recipe.sampling,
-        audio_dropout=recipe.audio_dropout,
         recovery_path=output_dir / "production-training-recovery.pt",
         resume=resume,
         recovery_identity={
@@ -1161,7 +1202,7 @@ def run_clean_rally_experiment(
         hysteresis=uses_rtmpose,
     )
     production_split = {
-        "strategy": "all-sources", "source_ids": [source.source_id for source in rally_dataset.config.sources],
+        "strategy": "all-sources", "source_ids": list(sources),
         "camera_groups": {camera: list(sources) for camera, sources in camera_sources.items()},
         "epoch_selection": "median_fold_best_epoch", "fold_best_epochs": selected_epochs,
         "decoder_calibration": "out_of_fold_predictions", "in_sample_decoder_labels_used": False,
@@ -1313,7 +1354,6 @@ def train_rally_segmenter_fixed_epochs(
     learning_rate: float = 3e-4,
     gradient_clip_norm: float = 1.0,
     sampling: str = "boundary_balanced",
-    audio_dropout: float = 0.0,
     recovery_path: Path | None = None,
     resume: bool = False,
     recovery_identity: Mapping[str, Any] | None = None,
@@ -1332,7 +1372,6 @@ def train_rally_segmenter_fixed_epochs(
         learning_rate=learning_rate,
         gradient_clip_norm=gradient_clip_norm,
         sampling=sampling,
-        audio_dropout=audio_dropout,
         recovery_path=recovery_path,
         resume=resume,
         recovery_identity=recovery_identity,
@@ -1412,10 +1451,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--boundary-aux-weight", type=float)
     parser.add_argument("--temporal-smoothing-weight", type=float)
     parser.add_argument("--seed", type=int)
-    parser.add_argument(
-        "--audio-dropout", type=float,
-        help="Probability of masking all audio for each training window (default: 0)",
-    )
     parser.add_argument("--sampling", choices=("boundary_balanced", "uniform"))
     parser.add_argument(
         "--resume",
@@ -1423,6 +1458,8 @@ def _parser() -> argparse.ArgumentParser:
         help="Resume the clean-only run from committed epochs",
     )
     parser.add_argument("--clean-only", action="store_true")
+    parser.add_argument("--person-model", help="Original detector asset for split recordings")
+    parser.add_argument("--pose-model", type=Path, help="Original pose asset for split recordings")
     parser.add_argument(
         "--feature-view",
         choices=tuple(RALLY_FEATURE_VIEWS),
@@ -1453,8 +1490,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if rtmpose_preset:
         if not args.clean_only:
             raise ValueError("the RTMPose audio preset requires --clean-only")
-        if args.feature_view not in (None, "full_audio"):
-            raise ValueError("the RTMPose audio preset requires the full_audio feature view")
+        if args.feature_view not in (None, "full_audio_zscore"):
+            raise ValueError("the RTMPose audio preset requires the full_audio_zscore feature view")
         overrides.setdefault("temporal_smoothing_weight", 0.1)
     recipe = RallyTrainingRecipe.from_preset(
         "default" if rtmpose_preset else args.preset, **overrides
@@ -1467,10 +1504,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     if args.clean_only and args.candidate_inclusive_only:
         raise ValueError("choose only one rally experiment arm")
-    if recipe.audio_dropout and not args.clean_only:
-        raise ValueError("audio dropout requires --clean-only")
     if args.feature_view is not None and not args.clean_only:
         raise ValueError("--feature-view requires --clean-only")
+    if not args.clean_only and (args.person_model is not None or args.pose_model is not None):
+        raise ValueError("partition extraction model options require --clean-only")
     if args.clean_only:
         config_path = args.config.expanduser().resolve()
         raw = json.loads(config_path.read_text(encoding="utf-8"))
@@ -1480,26 +1517,26 @@ def main(argv: Sequence[str] | None = None) -> int:
                 RALLY_TRANSFORMER_CONTEXT_RADIUS_SECONDS if rtmpose_preset else RallyDataConfig.context_seconds
             ),
         )
-        feature_view = "full_audio" if rtmpose_preset else args.feature_view
+        feature_view = "full_audio_zscore" if rtmpose_preset else args.feature_view
         if feature_view is not None:
             data_config = replace(data_config, feature_view=feature_view)
-        rally_dataset = RallyWindowDataset(data_config)
-        if rtmpose_preset and "pose_training_metadata" not in rally_dataset.manifest:
-            raise ValueError("the RTMPose audio preset requires RTMPose observations for every source")
         camera_sources = _load_camera_sources(raw.get("camera_sources"))
-        configured = {source.source_id for source in rally_dataset.config.sources}
+        configured = {source.source_id for source in data_config.sources}
         grouped = [source for sources in camera_sources.values() for source in sources]
         if configured != set(grouped) or len(grouped) != len(set(grouped)):
             raise ValueError(
                 "camera source groups must cover every configured source exactly once"
             )
         run_clean_rally_experiment(
-            rally_dataset,
+            data_config,
             args.output_dir,
             camera_sources=camera_sources,
             recipe=recipe,
             device=torch.device(recipe.device),
             resume=args.resume,
+            require_rtmpose=rtmpose_preset,
+            person_model=args.person_model,
+            pose_model=args.pose_model,
         )
         return 0
     if args.candidate_inclusive_only:

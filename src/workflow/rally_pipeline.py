@@ -111,8 +111,6 @@ def run_pipeline(
         extractor_identity=person_backend_identity,
     )
     pose_asset = assets["pose_model" if rtmpose else "pose_landmarker"]
-    if rtmpose:
-        preprocessing["pose_model_sha256"] = sha256_file(pose_asset)
     players_changed = run_player_stage(
         source,
         pose_model=pose_asset,
