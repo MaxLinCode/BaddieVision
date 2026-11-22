@@ -443,3 +443,34 @@ def test_rally_motion_pose_uses_crop_geometry_and_track_median_torso() -> None:
     wrist_x = FULL_RALLY_FEATURE_NAMES.index("p1_pose_15_x")
     assert values[:, wrist_x].tolist() == pytest.approx([0.5, 0.5, 0.5, 0.25, 0.0])
     assert valid[:, wrist_x].tolist() == [True, True, True, True, False]
+
+
+def test_court_median_suppresses_spikes_before_velocity_and_preserves_track_edges() -> None:
+    from src.temporal_selector.rally_features import (
+        FULL_RALLY_FEATURE_NAMES,
+        MOTION_FEATURE_NAMES,
+        rally_motion_features,
+        smooth_rally_court_positions,
+    )
+
+    values = torch.zeros(9, len(FULL_RALLY_FEATURE_NAMES))
+    valid = torch.ones_like(values, dtype=torch.bool)
+    tracks = torch.ones(9, 2, dtype=torch.long)
+    tracks[7:, 0] = 2
+    court_x = FULL_RALLY_FEATURE_NAMES.index("p1_court_x")
+    other_x = FULL_RALLY_FEATURE_NAMES.index("p2_court_x")
+    values[:, court_x] = torch.tensor([0., 0., 10., 0., 0., 8., 0., 7., 0.])
+    valid[6, court_x] = False
+    values[:, other_x] = torch.arange(len(values))
+    original_mask = valid.clone()
+
+    smooth_rally_court_positions(values, valid, tracks)
+    assert values[:, court_x].tolist() == [0., 0., 0., 0., 0., 8., 0., 7., 0.]
+    assert torch.equal(values[:, other_x], torch.arange(len(values)))
+    assert torch.equal(valid, original_mask)
+
+    velocity, mask = rally_motion_features(values, valid, tracks, fps=30)
+    court_vx = MOTION_FEATURE_NAMES.index("p1_court_velocity_x")
+    assert mask[3, court_vx]
+    assert velocity[3, court_vx] == 0
+    assert not mask[6:, court_vx].any()

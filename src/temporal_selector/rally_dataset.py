@@ -39,6 +39,7 @@ from .rally_features import (
     normalize_rally_motion_pose,
     rally_feature_view,
     rally_motion_features,
+    smooth_rally_court_positions,
 )
 from .rally_intervals import read_rally_intervals
 
@@ -430,6 +431,7 @@ class RallyWindowDataset(Dataset[RallyWindow]):
         if self.feature_view.uses_motion:
             track_tensor = torch.tensor(track_ids)
             normalize_rally_motion_pose(value_tensor, validity_tensor, track_tensor, image_size)
+            smooth_rally_court_positions(value_tensor, validity_tensor, track_tensor)
             velocity, velocity_valid = rally_motion_features(
                 value_tensor, validity_tensor, track_tensor, fps
             )

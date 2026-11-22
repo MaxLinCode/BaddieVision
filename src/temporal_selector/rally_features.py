@@ -39,14 +39,19 @@ FULL_RALLY_FEATURE_NAMES: Final = tuple(
 )
 
 
-MEDIAN_TORSO_FEATURE_NAMES: Final = tuple(
-    name.replace("_pose_", "_median_torso_pose_") for name in FULL_RALLY_FEATURE_NAMES
+MOTION_BASE_FEATURE_NAMES: Final = tuple(
+    name.replace("_pose_", "_median_torso_pose_").replace("_court_", "_smoothed_court_")
+    for name in FULL_RALLY_FEATURE_NAMES
 )
 _POSE_START: Final = len(PLAYER_CONTEXT_FIELDS) * 2
 
-MOTION_POSITION_INDICES: Final = tuple(
+_COURT_POSITION_INDICES: Final = tuple(
     index for index, name in enumerate(FULL_RALLY_FEATURE_NAMES)
-    if "_pose_" in name or name.endswith(("_court_x", "_court_y"))
+    if name.endswith(("_court_x", "_court_y"))
+)
+MOTION_POSITION_INDICES: Final = _COURT_POSITION_INDICES + tuple(
+    index for index, name in enumerate(FULL_RALLY_FEATURE_NAMES)
+    if "_pose_" in name
 )
 MOTION_FEATURE_NAMES: Final = tuple(
     FULL_RALLY_FEATURE_NAMES[index].rsplit("_", 1)[0] + "_velocity_" +
@@ -82,6 +87,22 @@ def normalize_rally_motion_pose(
         valid[:, player] &= usable[:, None, None]
         relative = (poses[:, player] - hips[:, player]) / scale.clamp_min(1)[:, None, None]
         poses[:, player] = torch.where(valid[:, player], relative, 0.0)
+
+
+def smooth_rally_court_positions(values: Tensor, validity: Tensor, track_ids: Tensor) -> None:
+    """Apply a centered three-sample median within a continuously observed track."""
+    if len(values) < 3:
+        return
+
+    court = values[:, _COURT_POSITION_INDICES]
+    samples = court.unfold(0, 3, 1)
+    observed = validity[:, _COURT_POSITION_INDICES].unfold(0, 3, 1).all(dim=-1)
+    tracks = track_ids.unfold(0, 3, 1)
+    same_track = (tracks == tracks[..., :1]).all(dim=-1) & (tracks[..., 0] >= 0)
+    usable = observed & same_track.repeat_interleave(2, dim=-1)
+    values[1:-1, _COURT_POSITION_INDICES] = torch.where(
+        usable, samples.median(dim=-1).values, court[1:-1]
+    )
 
 
 def rally_motion_features(
@@ -159,7 +180,7 @@ def _view(
     if len(requested) != len(set(requested)):
         raise AssertionError(f"duplicate feature in rally view {name}")
     input_names = (
-        (MEDIAN_TORSO_FEATURE_NAMES + MOTION_FEATURE_NAMES if uses_motion else FULL_RALLY_FEATURE_NAMES)
+        (MOTION_BASE_FEATURE_NAMES + MOTION_FEATURE_NAMES if uses_motion else FULL_RALLY_FEATURE_NAMES)
         + (RALLY_AUDIO_FEATURE_NAMES if uses_audio else ())
     )
     positions = {feature: index for index, feature in enumerate(input_names)}
@@ -174,11 +195,11 @@ def _view(
 RALLY_FEATURE_VIEWS: Final[Mapping[str, RallyFeatureView]] = {
     "full": _view("full", FULL_RALLY_FEATURE_NAMES),
     "full_motion": _view(
-        "full_motion", MEDIAN_TORSO_FEATURE_NAMES + MOTION_FEATURE_NAMES, uses_motion=True
+        "full_motion", MOTION_BASE_FEATURE_NAMES + MOTION_FEATURE_NAMES, uses_motion=True
     ),
     "full_audio_zscore_motion": _view(
         "full_audio_zscore_motion",
-        MEDIAN_TORSO_FEATURE_NAMES + MOTION_FEATURE_NAMES + RALLY_AUDIO_FEATURE_NAMES,
+        MOTION_BASE_FEATURE_NAMES + MOTION_FEATURE_NAMES + RALLY_AUDIO_FEATURE_NAMES,
         uses_audio=True, audio_zscore=True, uses_motion=True,
     ),
     "full_audio": _view(

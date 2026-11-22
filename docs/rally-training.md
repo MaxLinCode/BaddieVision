@@ -158,7 +158,13 @@ predictions, along with the gap and minimum-duration settings.
 Use `--clean-only --feature-view full_motion` to add signed x/y velocity for
 each pose landmark and each player's court position. Use
 `full_audio_zscore_motion` for the corresponding normalized-audio recipe.
-Both views retain the original normalized court x/y positions.
+Both views use the existing court-centered coordinate convention, with the
+court center at zero and the outer lines at ±1 along each axis. Coordinates
+can extend beyond the lines. A centered three-frame median on each court
+axis suppresses isolated foot-position spikes before the position and
+velocity features are emitted. The median uses one frame of lookahead
+within the offline source or split clip. At source edges, missing
+observations, and track changes, it keeps the current sample and its mask.
 
 The motion views map crop landmarks back to image pixels using the exact
 stored crop box. They center pose on the midpoint of the hips and normalize
