@@ -353,10 +353,13 @@ class RallySegmenter(nn.Module):
         boundary_start_pos_weight: Tensor | None = None,
         boundary_end_pos_weight: Tensor | None = None,
         boundary_aux_weight: float = 0.25,
+        temporal_smoothing_weight: float = 0.0,
         return_counts: bool = True,
     ) -> RallyLosses:
         if boundary_aux_weight < 0:
             raise ValueError("boundary auxiliary weight cannot be negative")
+        if not math.isfinite(temporal_smoothing_weight) or temporal_smoothing_weight < 0:
+            raise ValueError("temporal smoothing weight must be finite and nonnegative")
         output = output or self(batch)
         inplay_mask = batch.frame_mask & (
             batch.inplay_targets != MASKED_TARGET
@@ -398,6 +401,14 @@ class RallySegmenter(nn.Module):
                 int((start_mask | end_mask).sum()) if return_counts else None
             )
         total = inplay + float(boundary_aux_weight) * (start + end) / 2
+        if temporal_smoothing_weight:
+            # Each row is a contiguous source window. Unowned targets are masked.
+            same_state = batch.inplay_targets[:, 1:] == batch.inplay_targets[:, :-1]
+            pair_mask = inplay_mask[:, 1:] & inplay_mask[:, :-1] & same_state
+            probabilities = output.inplay_logits.masked_fill(~inplay_mask, 0.0).sigmoid()
+            differences = (probabilities[:, 1:] - probabilities[:, :-1]).abs()
+            smoothing = differences.masked_fill(~pair_mask, 0.0).sum()
+            total = total + temporal_smoothing_weight * smoothing / pair_mask.sum().clamp_min(1)
         return RallyLosses(
             total=total,
             inplay=inplay,
@@ -471,6 +482,7 @@ class RallyTrainingRecipe:
     learning_rate: float = 3e-4
     gradient_clip_norm: float = 1.0
     device: str = "mps"
+    temporal_smoothing_weight: float = 0.0
 
     def __post_init__(self) -> None:
         for name in ("epochs", "batch_size"):
@@ -499,6 +511,16 @@ class RallyTrainingRecipe:
                 raise ValueError(
                     f"{name} must be finite and {'nonnegative' if name == 'boundary_aux_weight' else 'positive'}"
                 )
+
+        if not math.isfinite(self.temporal_smoothing_weight) or self.temporal_smoothing_weight < 0:
+            raise ValueError("temporal smoothing weight must be finite and nonnegative")
+
+    def recovery_settings(self) -> dict[str, Any]:
+        settings = asdict(self)
+        # Older runs have no smoothing setting in their recovery files.
+        if not self.temporal_smoothing_weight:
+            settings.pop("temporal_smoothing_weight")
+        return settings
 
     @classmethod
     def benchmark(cls) -> "RallyTrainingRecipe":
@@ -530,6 +552,7 @@ def rally_checkpoint(
     decoder_configuration: Mapping[str, Any],
     feature_view: str | None = None,
     calibration_fingerprints: Mapping[str, str] | None = None,
+    pose_training_metadata: Mapping[str, Any] | None = None,
     extra: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a self-describing checkpoint without altering legacy formats."""
@@ -575,6 +598,8 @@ def rally_checkpoint(
         "decoder_configuration": dict(decoder_configuration),
         "calibration_fingerprints": dict(calibration_fingerprints or {}),
     }
+    if pose_training_metadata is not None:
+        payload["pose_training_metadata"] = dict(pose_training_metadata)
     if extra:
         overlap = set(payload).intersection(extra)
         if overlap:

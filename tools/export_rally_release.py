@@ -16,9 +16,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--person-detector", type=Path, required=True)
-    parser.add_argument("--pose-landmarker", type=Path, required=True)
+    pose = parser.add_mutually_exclusive_group(required=True)
+    pose.add_argument("--pose-model", type=Path, help="RTMPose-L Halpe26 FP16 ONNX used for training")
+    pose.add_argument("--pose-landmarker", type=Path, help="Legacy MediaPipe asset for a v1 release")
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--model-id", default="rally-six-source-v1")
+    parser.add_argument("--model-id")
     parser.add_argument("--code-revision", required=True)
     parser.add_argument("--base-url", required=True)
     parser.add_argument(
@@ -34,7 +36,7 @@ def main() -> None:
         args.checkpoint,
         args.output_dir,
         person_detector=args.person_detector,
-        pose_landmarker=args.pose_landmarker,
+        pose_landmarker=args.pose_landmarker, pose_model=args.pose_model,
         code_revision=args.code_revision,
         base_url=args.base_url,
         model_id=args.model_id,

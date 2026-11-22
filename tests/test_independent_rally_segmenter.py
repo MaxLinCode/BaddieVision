@@ -104,6 +104,28 @@ def test_padding_missing_features_and_boundary_masks_produce_finite_cpu_loss() -
     assert model.frame_projection.network[0].weight.grad is not None
 
 
+def test_temporal_smoothing_uses_only_adjacent_owned_same_state_frames() -> None:
+    batch = _batch()
+    model = RallySegmenter(_config())
+    output = model(batch)
+    # Only the middle pair of the first row has matching supervised labels.
+    output.inplay_logits = torch.tensor(
+        [[-2.0, -1.0, 1.0, -2.0], [0.0, 2.0, -torch.inf, -torch.inf]],
+        requires_grad=True,
+    )
+    baseline = model.losses(batch, output)
+    smoothed = model.losses(batch, output, temporal_smoothing_weight=0.5)
+    probabilities = output.inplay_logits.detach().sigmoid()
+    expected = 0.5 * (probabilities[0, 2] - probabilities[0, 1])
+    penalty = smoothed.total - baseline.total
+    torch.testing.assert_close(penalty, expected)
+    penalty.backward()
+    gradient = output.inplay_logits.grad
+    assert gradient is not None
+    assert gradient[0, 1] < 0 < gradient[0, 2]
+    assert gradient.count_nonzero() == 2
+
+
 def test_attention_masks_missing_audio_without_masking_its_video_frames() -> None:
     audio_dim = len(RALLY_AUDIO_FEATURE_NAMES)
     model = RallySegmenter(replace(

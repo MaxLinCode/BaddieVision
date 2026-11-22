@@ -77,34 +77,8 @@ def rally_audio_runtime() -> dict[str, str]:
     }
 
 
-def read_rally_audio(
-    video: Path, *, frame_count: int, fps: float
-) -> RallyAudio:
-    """Return finite audio values and a per-feature coverage mask for every frame."""
-    values = np.zeros((frame_count, len(RALLY_AUDIO_FEATURE_NAMES)), dtype=np.float32)
-    valid = np.zeros_like(values, dtype=bool)
-    audio_streams = json.loads(
-        _run_media_tool(
-            "ffprobe",
-            "-v",
-            "error",
-            "-select_streams",
-            "a:0",
-            "-show_entries",
-            "stream=start_time,time_base",
-            "-of",
-            "json",
-            str(video),
-        )
-    )["streams"]
-    if not audio_streams:
-        return RallyAudio(values, valid, np.arange(frame_count) / fps)
-    audio_start = float(audio_streams[0].get("start_time", "nan"))
-    if not np.isfinite(audio_start):
-        raise ValueError("rally audio stream has no usable start timestamp")
-    # Allow timestamp rounding within one container tick and one output sample.
-    timestamp_tolerance = float(Fraction(audio_streams[0]["time_base"])) + 1 / _SAMPLE_RATE
-
+def video_frame_timestamps(video: Path, frame_count: int) -> np.ndarray:
+    """Read one presentation timestamp per decoded frame, in presentation order."""
     # Packet order may differ from presentation order (e.g. H.264 B frames).
     # Using actual presentation timestamps also keeps VFR recordings aligned.
     packets = json.loads(
@@ -151,8 +125,40 @@ def read_rally_audio(
             or np.any(np.diff(times) <= 0)
         ):
             raise ValueError(
-                "rally audio requires a presentation timestamp for each source frame"
+                "rally processing requires a presentation timestamp for each source frame"
             )
+    return times
+
+
+def read_rally_audio(
+    video: Path, *, frame_count: int, fps: float
+) -> RallyAudio:
+    """Return finite audio values and a per-feature coverage mask for every frame."""
+    values = np.zeros((frame_count, len(RALLY_AUDIO_FEATURE_NAMES)), dtype=np.float32)
+    valid = np.zeros_like(values, dtype=bool)
+    audio_streams = json.loads(
+        _run_media_tool(
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=start_time,time_base",
+            "-of",
+            "json",
+            str(video),
+        )
+    )["streams"]
+    if not audio_streams:
+        return RallyAudio(values, valid, np.arange(frame_count) / fps)
+    audio_start = float(audio_streams[0].get("start_time", "nan"))
+    if not np.isfinite(audio_start):
+        raise ValueError("rally audio stream has no usable start timestamp")
+    # Allow timestamp rounding within one container tick and one output sample.
+    timestamp_tolerance = float(Fraction(audio_streams[0]["time_base"])) + 1 / _SAMPLE_RATE
+
+    times = video_frame_timestamps(video, frame_count)
     ends = np.append(times[1:], times[-1] + 1 / fps)
     timestamps = (times + ends) / 2
     first_sample = round(audio_start * _SAMPLE_RATE)

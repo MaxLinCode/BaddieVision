@@ -75,11 +75,11 @@ def chronological_camera_train_validation_split(
     train_fraction: float = 0.8,
     guard_seconds: float = 1.0,
 ) -> tuple[list[RallyWindow], list[RallyWindow], dict[str, Any]]:
-    """Split each training camera in chronology with context containment."""
+    """Historical split for comparative experiments using matched prebuilt windows."""
     if not 0.0 < train_fraction < 1.0:
         raise ValueError("train fraction must be between zero and one")
-    if guard_seconds < 0:
-        raise ValueError("guard seconds cannot be negative")
+    if not math.isfinite(guard_seconds) or guard_seconds < 0:
+        raise ValueError("guard seconds must be finite and nonnegative")
     by_source: dict[str, list[RallyWindow]] = {}
     for window in windows:
         by_source.setdefault(window.source_id, []).append(window)
@@ -116,7 +116,8 @@ def chronological_camera_train_validation_split(
             raise ValueError(
                 "sources from one camera must share FPS for guard bands"
             )
-        guard_frames = round(next(iter(fps_values)) * guard_seconds)
+        fps = next(iter(fps_values))
+        guard_frames = round(fps * guard_seconds)
         train_range = (0, cut - guard_frames - 1)
         validation_range = (cut + guard_frames, total_frames - 1)
         camera_train: list[RallyWindow] = []
@@ -327,7 +328,7 @@ def _intervals_from_rows(
                 state = False
             else:
                 frame = int(row["frame"])
-                state = bool(row[field])
+                state = bool(row.get(field, False))
                 if last is not None and frame != last + 1 and start is not None:
                     interval_number += 1
                     intervals.append(
@@ -435,12 +436,50 @@ def rally_metrics(rows: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
         for row, state in zip(values, decoded_predicted)
     ]
     truth_intervals = _intervals_from_rows(interval_rows, "truth_state")
-    predicted_intervals = _intervals_from_rows(
-        interval_rows, "prediction_state"
-    )
+    predicted_intervals = _intervals_from_rows(interval_rows, "prediction_state")
+    partial_flags = {
+        (str(row["source_id"]), int(row["frame"])): row["partial_rally"]
+        for row in interval_rows if row.get("partial_rally")
+    }
+    partial_boundary_errors: list[int] = []
+    if partial_flags:
+        partial_truth = [
+            interval for interval in truth_intervals
+            if any((interval.source_id, frame) in partial_flags for frame in range(interval.start, interval.end + 1))
+        ]
+
+        def overlaps_partial(interval: Interval) -> bool:
+            return any(
+                interval.source_id == partial.source_id
+                and interval.end >= partial.start and interval.start <= partial.end
+                for partial in partial_truth
+            )
+
+        partial_predictions = [interval for interval in predicted_intervals if overlaps_partial(interval)]
+        _, partial_matches = evaluate_intervals(partial_predictions, partial_truth, threshold=0.5)
+        visible_boundaries = {
+            (interval.source_id, interval.rally_id): (
+                partial_flags.get((interval.source_id, interval.start), (False, False))[0],
+                partial_flags.get((interval.source_id, interval.end), (False, False))[1],
+            )
+            for interval in partial_truth
+        }
+        for match in partial_matches:
+            if match["match_status"] == "matched":
+                visible = visible_boundaries[match["source_id"], match["label_rally_id"]]
+                partial_boundary_errors.extend(
+                    abs(int(match[f"{side}_error"]))
+                    for side, known in zip(("start", "end"), visible, strict=True) if known
+                )
+        truth_intervals = [interval for interval in truth_intervals if interval not in partial_truth]
+        predicted_intervals = [interval for interval in predicted_intervals if not overlaps_partial(interval)]
     interval_metrics, matches = evaluate_intervals(
         predicted_intervals, truth_intervals, threshold=0.5
     )
+    boundary_errors = [
+        abs(int(match[f"{side}_error"]))
+        for match in matches if match["match_status"] == "matched" for side in ("start", "end")
+    ] + partial_boundary_errors
     overlap_counts = {
         label.rally_id: sum(
             prediction.source_id == label.source_id
@@ -462,6 +501,7 @@ def rally_metrics(rows: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
         "raw_frame": raw_classification,
         "decoded_frame": decoded_classification,
         "calibration": _calibration(labels, scores),
+        "visible_boundary_mae": statistics.fmean(boundary_errors) if boundary_errors else None,
         "intervals": {
             **interval_metrics,
             "fragmentation_count": sum(fragment_counts),
@@ -491,50 +531,60 @@ def tune_rally_decoder(
     validation_rows: Sequence[Mapping[str, Any]],
     *,
     fps_by_source: Mapping[str, float],
+    hysteresis: bool = False,
 ) -> tuple[InPlayDecoderConfig, list[dict[str, Any]]]:
-    """Tune threshold/gap/minimum duration using validation labels only."""
+    """Tune entry/continuation thresholds, gap and minimum duration using validation labels only."""
     if not validation_rows:
         raise ValueError("decoder tuning requires validation predictions")
     candidates: list[
         tuple[tuple[float, ...], InPlayDecoderConfig, dict[str, Any]]
     ] = []
+    drops = (0.05, 0.10) if hysteresis else (0.0,)
+    use_decoded_f1 = hysteresis or any(row.get("partial_rally") for row in validation_rows)
     for threshold in DECODER_THRESHOLDS:
-        for gap in DECODER_GAPS_SECONDS:
-            for minimum in DECODER_MINIMUM_SECONDS:
-                config = InPlayDecoderConfig(
-                    threshold=threshold,
-                    max_gap_seconds=gap,
-                    minimum_duration_seconds=minimum,
-                    preserve_edge_runs=True,
-                )
-                decoded = decode_prediction_rows(
-                    validation_rows,
-                    fps_by_source=fps_by_source,
-                    config=config,
-                )
-                metrics = rally_metrics(decoded)
-                intervals = metrics["intervals"]
-                boundary = intervals["mean_absolute_boundary_error"]
-                score = (
-                    float(intervals["f1"]),
-                    -float(boundary if boundary is not None else math.inf),
-                    float(metrics["f1"]),
-                    -gap,
-                    -minimum,
-                    -abs(threshold - 0.5),
-                )
-                candidates.append(
-                    (
-                        score,
-                        config,
-                        {
-                            "configuration": asdict(config),
-                            "validation_interval_f1": intervals["f1"],
-                            "validation_boundary_mae": boundary,
-                            "validation_frame_f1": metrics["f1"],
-                        },
+        for drop in drops:
+            if drop >= threshold:
+                continue
+            continuation = round(threshold - drop, 2) if drop else None
+            for gap in DECODER_GAPS_SECONDS:
+                for minimum in DECODER_MINIMUM_SECONDS:
+                    config = InPlayDecoderConfig(
+                        threshold=threshold,
+                        max_gap_seconds=gap,
+                        minimum_duration_seconds=minimum,
+                        preserve_edge_runs=True,
+                        continuation_threshold=continuation,
                     )
-                )
+                    decoded = decode_prediction_rows(
+                        validation_rows,
+                        fps_by_source=fps_by_source,
+                        config=config,
+                    )
+                    metrics = rally_metrics(decoded)
+                    intervals = metrics["intervals"]
+                    boundary = metrics["visible_boundary_mae"]
+                    frame_f1 = metrics["decoded_frame"]["f1"] if use_decoded_f1 else metrics["f1"]
+                    score = (
+                        float(intervals["f1"]),
+                        -float(boundary if boundary is not None else math.inf),
+                        float(frame_f1),
+                        -gap,
+                        -minimum,
+                        -abs(threshold - 0.5),
+                        -drop,
+                    )
+                    candidates.append(
+                        (
+                            score,
+                            config,
+                            {
+                                "configuration": asdict(config),
+                                "validation_interval_f1": intervals["f1"],
+                                "validation_boundary_mae": boundary,
+                                "validation_frame_f1": frame_f1,
+                            },
+                        )
+                    )
     candidates.sort(key=lambda item: item[0], reverse=True)
     return candidates[0][1], [candidate[2] for candidate in candidates]
 

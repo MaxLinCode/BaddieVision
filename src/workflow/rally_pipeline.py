@@ -21,6 +21,7 @@ from .registry import SourceCatalog
 from .source import (
     calibrate_source as _calibrate,
     select_device as select_device,
+    resolve_rally_30fps_source,
     resolve_source,
 )
 
@@ -57,13 +58,7 @@ def run_pipeline(
         raise ValueError("--checkpoint and --model-manifest must be supplied together")
     resolved_device = select_device(device)
 
-    source = resolve_source(
-        catalog, source_id=source_id, video=video, output_dir=output_dir
-    )
-    identity = SourceIdentity.read(source.identity_path)
-    _calibrate(source, calibration, force=force or "pose" in rebuild)
-
-    from src.rally_release import resolve_release
+    from src.rally_release import LEGACY_RELEASE_VERSION, resolve_release
     from src.temporal_selector.rally_audio import rally_audio_runtime
     from src.temporal_selector.rally_dataset import RallySourceConfig
     from src.temporal_selector.rally_features import rally_feature_view
@@ -75,6 +70,13 @@ def run_pipeline(
     model, manifest, assets = resolve_release(
         model_id, checkpoint=checkpoint, manifest=model_manifest, cache_dir=cache_dir
     )
+    rtmpose = manifest["schema_version"] != LEGACY_RELEASE_VERSION
+    source_resolver = resolve_rally_30fps_source if rtmpose else resolve_source
+    source = source_resolver(
+        catalog, source_id=source_id, video=video, output_dir=output_dir
+    )
+    identity = SourceIdentity.read(source.identity_path)
+    _calibrate(source, calibration, force=force or "pose" in rebuild)
     print(
         f"{source.source_id}: verified model assets; using {resolved_device}",
         flush=True,
@@ -108,9 +110,12 @@ def run_pipeline(
         extractor=person_extractor,
         extractor_identity=person_backend_identity,
     )
+    pose_asset = assets["pose_model" if rtmpose else "pose_landmarker"]
     players_changed = run_player_stage(
         source,
-        pose_model=assets["pose_landmarker"],
+        pose_model=pose_asset,
+        pose_backend="rtmpose" if rtmpose else "mediapipe",
+        pose_device="cuda" if rtmpose and resolved_device == "cuda" else None,
         pose_crop_padding=preprocessing["pose_crop_padding"],
         force=force or person_changed or "pose" in rebuild,
         interpreter=player_interpreter,

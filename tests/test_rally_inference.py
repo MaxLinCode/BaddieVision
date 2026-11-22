@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 import torch
 
+from src.pose_estimator import POSE_BACKEND_TYPE
 from src.temporal_selector.rally import RallySegmenter, RallySegmenterConfig
 from src.temporal_selector.rally_audio import RallyAudio, read_rally_audio
 from src.temporal_selector.rally_dataset import (
@@ -149,6 +150,38 @@ def test_targets_remain_masked_and_duplicate_ownership_is_rejected(source):
         predict_windows(_model(), [dataset.windows[0], dataset.windows[0]])
     with pytest.raises(ValueError, match="one source"):
         predict_windows(_model(), [dataset.windows[0], replace(dataset.windows[0], source_id="other")])
+
+
+@pytest.mark.parametrize("inactive_fingerprint", ["pose_model_fingerprint", "preprocessing_fingerprint"])
+def test_mediapipe_uses_only_active_pose_cache_records(source, inactive_fingerprint):
+    cache_path = source.pose_cache_path
+    metadata = json.loads(cache_path.read_text().splitlines()[0])
+    metadata["pose_backend"] = {"backend_type": POSE_BACKEND_TYPE}
+    active = {
+        "type": "pose", "frame": 0, "track_id": 1, "status": "detected",
+        "bbox": [20, 10, 40, 40], "pose_bbox": [20, 10, 40, 40],
+        "pose_model_fingerprint": metadata["pose_model_fingerprint"],
+        "preprocessing_fingerprint": metadata["preprocessing_fingerprint"],
+        "pose_landmarks": [
+            {"x": .8 if joint == 0 else .5, "y": .5, "visibility": 1.}
+            for joint in range(33)
+        ],
+    }
+    inactive = {
+        **active, inactive_fingerprint: "sha256:" + "b" * 64,
+        "pose_landmarks": [
+            {**active["pose_landmarks"][0], "x": .2},
+            *active["pose_landmarks"][1:],
+        ],
+    }
+    _jsonl(cache_path, metadata, [active, inactive, {**inactive, "frame": 1}])
+
+    dataset = RallyWindowDataset(RallyDataConfig((source,), None, None))
+    window = dataset.windows[0]
+    pose_x = dataset.feature_view.names.index("p1_pose_0_x")
+    assert window.frame_validity[window.frame_indices.index(0), pose_x].item()
+    assert window.frame_values[window.frame_indices.index(0), pose_x].item() == pytest.approx(.2)
+    assert not window.frame_validity[window.frame_indices.index(1), pose_x].item()
 
 
 @pytest.mark.parametrize("decoder", [

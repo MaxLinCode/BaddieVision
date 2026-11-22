@@ -23,6 +23,7 @@ def _parser() -> argparse.ArgumentParser:
     source = commands.add_parser("source")
     source_commands = source.add_subparsers(dest="source_command", required=True)
     add = source_commands.add_parser("add")
+    add.add_argument("--rally-30-fps", action="store_true")
     add.add_argument("--video", type=Path, required=True)
     add.add_argument("--source-id")
     add.add_argument("--artifact-root", type=Path)
@@ -70,7 +71,9 @@ def _parser() -> argparse.ArgumentParser:
     players.add_argument("--source", required=True)
     players.add_argument("--pose-model", type=Path)
     players.add_argument("--force", action="store_true")
-    players.add_argument("--pose-crop-padding", type=float, default=0.20)
+    players.add_argument("--pose-crop-padding", type=float)
+    players.add_argument("--pose-backend", choices=("mediapipe", "rtmpose"), default="mediapipe")
+    players.add_argument("--pose-device", choices=("cpu", "cuda"))
     check = stage_commands.add_parser("check")
     check.add_argument("--source", required=True)
     check.add_argument(
@@ -285,6 +288,14 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{name}: {path}")
         return 0
     if args.command == "source" and args.source_command == "add":
+        if args.rally_30_fps:
+            from .source import resolve_rally_30fps_source
+
+            source = resolve_rally_30fps_source(
+                catalog, source_id=args.source_id, video=args.video, output_dir=args.artifact_root
+            )
+            print(f"{source.source_id}\t{source.artifact_root}")
+            return 0
         source = catalog.add(
             args.video,
             source_id=args.source_id,
@@ -393,6 +404,8 @@ def main(argv: list[str] | None = None) -> int:
                 source,
                 pose_model=args.pose_model,
                 pose_crop_padding=args.pose_crop_padding,
+                pose_backend=args.pose_backend,
+                pose_device=args.pose_device,
                 force=args.force,
             )
             print(source.assignments_path)

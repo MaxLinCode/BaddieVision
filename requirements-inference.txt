@@ -6,6 +6,8 @@ numpy==2.4.6
 opencv-python==5.0.0.93
 opencv-contrib-python==5.0.0.93
 mediapipe==0.10.35
+# Use onnxruntime-gpu instead for CUDA pose inference.
+onnxruntime>=1.23,<2
 ultralytics==8.4.211
 pandas==2.3.3
 scipy==1.17.1

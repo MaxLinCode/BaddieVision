@@ -34,6 +34,9 @@ STAGE_CODE = {
     "pose": (
         "InPlay/heuristic/player_interpretation.py",
         "src/pose_estimator.py",
+        "src/pose_backends.py",
+        "src/rtmpose.py",
+        "InPlay/heuristic/pose_crops.py",
         "src/court_projection.py",
     ),
     "shuttle": (
@@ -65,7 +68,7 @@ STAGE_CODE = {
 }
 STAGE_PACKAGES = {
     "person": ("torch", "numpy", "opencv-python", "ultralytics", "lap"),
-    "pose": ("numpy", "opencv-python", "mediapipe"),
+    "pose": ("numpy", "opencv-python", "mediapipe", "onnxruntime", "onnxruntime-gpu"),
     "shuttle": ("torch", "numpy", "opencv-python"),
     "predict": ("torch", "numpy"),
 }
@@ -363,6 +366,18 @@ def _player_stage_valid(
         )
 
 
+def resolve_person_detector(model: str | Path) -> Path:
+    """Resolve an Ultralytics alias to the checkpoint bytes used by the stage."""
+    model_path = Path(model).expanduser()
+    if not model_path.is_file():
+        from ultralytics import YOLO
+
+        model_path = Path(YOLO(str(model)).ckpt_path)
+    if not model_path.is_file():
+        raise FileNotFoundError(f"person detector is missing: {model_path}")
+    return model_path
+
+
 def run_person_stage(
     source: SourceEntry,
     *,
@@ -396,14 +411,7 @@ def run_person_stage(
                 source, "person", "completed", reused=True, origin="validated_import"
             )
             return False
-    # Resolve an Ultralytics alias before hashing; receipts always describe model bytes.
-    model_path = Path(model).expanduser()
-    if not model_path.is_file():
-        from ultralytics import YOLO
-
-        model_path = Path(YOLO(str(model)).ckpt_path)
-    if not model_path.is_file():
-        raise FileNotFoundError(f"person detector is missing: {model_path}")
+    model_path = resolve_person_detector(model)
     inputs = {
         "identity": identity.fingerprint,
         "detector_sha256": sha256_file(model_path),
@@ -438,7 +446,9 @@ def run_player_stage(
     source: SourceEntry,
     *,
     pose_model: Path | None = None,
-    pose_crop_padding: float = 0.20,
+    pose_crop_padding: float | None = None,
+    pose_backend: str = "mediapipe",
+    pose_device: str | None = None,
     force: bool = False,
     interpreter: Callable[..., Any] | None = None,
     interpreter_identity: str | None = None,
@@ -468,15 +478,30 @@ def run_player_stage(
                 "rebuild or reimport the tracks"
             )
         validate_person_tracks(tracks, identity)
-        from src.pose_estimator import ensure_pose_model_asset
+        if pose_backend == "rtmpose":
+            from src.rtmpose import DEFAULT_RTMPOSE_MODEL_PATH, RTMPOSE_CROP_PADDING
+            from src.temporal_selector.rally_dataset import validate_rally_source_fps
 
-        pose_model = Path(ensure_pose_model_asset(pose_model))
+            validate_rally_source_fps(source.source_id, identity.fps_numerator / identity.fps_denominator)
+            pose_model = Path(pose_model or DEFAULT_RTMPOSE_MODEL_PATH).expanduser()
+            if pose_crop_padding is None:
+                pose_crop_padding = RTMPOSE_CROP_PADDING
+        elif pose_backend == "mediapipe":
+            from src.pose_estimator import ensure_pose_model_asset
+
+            pose_model = Path(ensure_pose_model_asset(pose_model))
+            if pose_crop_padding is None:
+                pose_crop_padding = 0.20
+        else:
+            raise ValueError(f"unknown crop pose backend: {pose_backend}")
         inputs = {
             "identity": identity.fingerprint,
             "person_tracks_sha256": tracks_sha256,
             "calibration_sha256": calibration_fingerprint(source),
             "pose_sha256": sha256_file(pose_model),
             "pose_crop_padding": pose_crop_padding,
+            **({"pose_backend": pose_backend, "pose_device": pose_device or "cpu"}
+               if pose_backend == "rtmpose" else {}),
             "implementation": implementation_identity("pose"),
             "backend": backend_identity(interpreter, interpreter_identity),
         }
@@ -498,6 +523,8 @@ def run_player_stage(
                 "pose_model_asset": pose_model,
                 "pose_crop_padding": pose_crop_padding,
             }
+            if pose_backend == "rtmpose":
+                kwargs.update(pose_backend=pose_backend, pose_device=pose_device)
             if "pose_work_dir" in inspect.signature(callback).parameters:
                 kwargs["pose_work_dir"] = source.artifact_root / "players" / ".pose-work"
             if (
@@ -514,6 +541,19 @@ def run_player_stage(
                 **kwargs,
             )
 
+        def validate(paths):
+            _player_stage_valid(paths, source, identity)
+            if pose_backend == "rtmpose":
+                from src.rtmpose import RTMPOSE_BACKEND_TYPE
+
+                with paths[1].open(encoding="utf-8") as handle:
+                    metadata = json.loads(next(handle))
+                if (
+                    (metadata.get("pose_backend") or {}).get("backend_type") != RTMPOSE_BACKEND_TYPE
+                    or metadata.get("pose_model_sha256") != inputs["pose_sha256"]
+                ):
+                    raise ValueError("pose cache does not match the selected RTMPose asset")
+
         return run_stage(
             source,
             "pose",
@@ -521,6 +561,6 @@ def run_player_stage(
             outputs,
             source.artifact_root / "players" / "players.manifest.json",
             execute,
-            lambda paths: _player_stage_valid(paths, source, identity),
+            validate,
             force=force,
         )

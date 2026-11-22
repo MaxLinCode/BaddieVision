@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import shutil
 import subprocess
 import sys
 from dataclasses import asdict
@@ -14,7 +15,7 @@ import numpy as np
 import pytest
 import torch
 
-from src.rally_release import export_release
+from src.rally_release import DEFAULT_PREPROCESSING, export_release, resolve_release
 from src.temporal_selector.joint_inference import InPlayDecoderConfig
 from src.temporal_selector.rally import (
     RallySegmenter,
@@ -178,6 +179,84 @@ def pipeline(tmp_path):
         "person_extractor": extract,
         "player_interpreter": interpret,
     }, calls
+
+
+def test_rtmpose_release_converts_fps_before_extraction_and_reuses_source(
+    pipeline, tmp_path, monkeypatch,
+):
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        pytest.skip("FFmpeg and FFprobe are required")
+    kwargs, calls = pipeline
+    raw_video = kwargs["video"]
+    audio_video = tmp_path / "with-audio.mp4"
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", str(raw_video),
+         "-f", "lavfi", "-i", "sine=frequency=660", "-shortest",
+         "-vf", "fps=60", "-c:v", "libx264", "-c:a", "aac", str(audio_video)],
+        check=True,
+    )
+    pose = tmp_path / "rtmpose.onnx"
+    pose.write_bytes(b"test pose model")
+    research = tmp_path / "rtm-research.pt"
+    model = RallySegmenter(RallySegmenterConfig(
+        frame_feature_dim=RALLY_FEATURE_VIEWS["full_audio_zscore"].dimension,
+        audio_attention=True,
+        token_size=8, num_layers=1, num_attention_heads=2, feed_forward_size=16,
+    ))
+    torch.save(rally_checkpoint(
+        model, dataset_fingerprint="test", annotation_fingerprint="test",
+        split_manifest={}, training_recipe=RallyTrainingRecipe(temporal_smoothing_weight=0.1),
+        chosen_epoch=1, feature_view="full_audio_zscore",
+        decoder_configuration=asdict(InPlayDecoderConfig(continuation_threshold=0.4)),
+        pose_training_metadata={
+            "pose_model_sha256": sha256_file(pose),
+            "preprocessing": DEFAULT_PREPROCESSING,
+        },
+    ), research)
+    monkeypatch.setattr("src.rally_release.open_session", lambda *args: (object(), "CPU"))
+    monkeypatch.setattr("src.rally_release.validate_fp16_halpe26_model", lambda _: None)
+    monkeypatch.setattr("src.pose_backends.version", lambda _: "test")
+    release = tmp_path / "rtm-release"
+    manifest = export_release(
+        research, release, pose_model=pose, code_revision="a" * 40,
+        person_detector=tmp_path / "detector.pt", base_url=release.as_uri(),
+    )
+    kwargs.update(
+        video=audio_video, checkpoint=release / "rally-segmenter.pt",
+        model_manifest=manifest, player_interpreter=None, overlay=False,
+    )
+    outputs = run_pipeline(**kwargs)
+    source = kwargs["catalog"].select(["generated"])[0]
+    identity = SourceIdentity.read(source.identity_path)
+    assert (identity.fps_numerator, identity.fps_denominator) == (30, 1)
+    assert identity.frame_count == 45
+    assert identity.parent_video.video_sha256 == sha256_file(audio_video)
+    assert source.video_path != audio_video
+    with outputs["predictions"].open() as handle:
+        assert len(handle.readlines()) == identity.frame_count + 1
+    from src.temporal_selector.rally_audio import read_rally_audio
+
+    validity = read_rally_audio(source.video_path, frame_count=45, fps=30).validity
+    assert validity[:, 0].any()
+    assert run_pipeline(**kwargs) == outputs
+    assert calls["person"] == 1
+
+    manifest_value = json.loads(manifest.read_text())
+    pose_entry = manifest_value["assets"]["pose_model"]
+    replacement = release / pose_entry["filename"]
+    replacement.write_bytes(b"different pose model")
+    pose_entry.update(sha256=sha256_file(replacement), size_bytes=replacement.stat().st_size)
+    manifest.write_text(json.dumps(manifest_value))
+    resolve_kwargs = {
+        "checkpoint": kwargs["checkpoint"], "manifest": manifest, "cache_dir": kwargs["cache_dir"],
+    }
+    with pytest.raises(ValueError, match="RTMPose asset SHA-256 differs from release preprocessing"):
+        resolve_release(**resolve_kwargs)
+
+    manifest_value["preprocessing"]["pose_model_sha256"] = pose_entry["sha256"]
+    manifest.write_text(json.dumps(manifest_value))
+    with pytest.raises(ValueError, match="checkpoint and manifest inference contracts differ"):
+        resolve_release(**resolve_kwargs)
 
 
 def test_complete_pipeline_and_verified_cached_rerun(pipeline, monkeypatch):
