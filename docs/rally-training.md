@@ -152,3 +152,24 @@ Each fold tunes a higher rally entry threshold and a lower continuation
 threshold on its validation frames.
 The production checkpoint freezes both thresholds using out-of-fold
 predictions, along with the gap and minimum-duration settings.
+
+## Joint and court velocity experiment
+
+Use `--clean-only --feature-view full_motion` to add signed x/y velocity for
+each pose landmark and each player's court position. Use
+`full_audio_zscore_motion` for the corresponding normalized-audio recipe.
+Both views retain the original normalized court x/y positions.
+
+The features fit a trailing four-frame linear slope to the player-relative
+pose coordinates and the normalized coordinates of the projected court foot
+position. Slopes are expressed per second, in pose-scale units for joints
+and court half-width or half-length units for court position. A velocity
+requires four valid consecutive samples of the same track. The first three
+frames, missing observations, and track changes invalidate the affected
+velocity channels. The computation runs once per source or split clip before
+creating overlapping model windows.
+
+Compare each motion view with its corresponding position-only view on the
+same camera folds and source artifacts. Hold the training recipe fixed and
+compare interval F1 and signed start/end errors by camera. The four-frame
+window is an experimental default and has a shorter time span at higher FPS.

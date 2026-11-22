@@ -47,6 +47,8 @@ def test_registered_feature_views_have_exact_names_dimensions_and_masks() -> Non
     assert len(FULL_RALLY_FEATURE_NAMES) == 154
     assert {name: view.dimension for name, view in RALLY_FEATURE_VIEWS.items()} == {
         "full": 154,
+        "full_motion": 290,
+        "full_audio_zscore_motion": 297,
         "full_audio": 161,
         "full_audio_zscore": 161,
         "calibrated_canonical": 142,
@@ -55,7 +57,7 @@ def test_registered_feature_views_have_exact_names_dimensions_and_masks() -> Non
     }
     full = _window()
     for name, view in RALLY_FEATURE_VIEWS.items():
-        if view.uses_audio:
+        if view.uses_audio or view.uses_motion:
             with pytest.raises(ValueError, match="compiled from the source recording"):
                 project_rally_windows([full], name)
             continue

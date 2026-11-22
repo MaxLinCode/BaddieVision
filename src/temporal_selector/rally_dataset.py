@@ -36,6 +36,7 @@ from .rally import (
 from .rally_audio import read_rally_audio
 from .rally_features import (
     FULL_RALLY_FEATURE_NAMES,
+    rally_motion_features,
     rally_feature_view,
 )
 from .rally_intervals import read_rally_intervals
@@ -383,6 +384,57 @@ class RallyWindowDataset(Dataset[RallyWindow]):
         radius = max(1, round(fps * self.config.context_seconds))
         if radius < ownership // 2:
             raise ValueError("rally context radius must cover the entire ownership window")
+        source_values: list[list[float]] = []
+        source_validity: list[list[bool]] = []
+        track_ids: list[list[int]] = []
+        for frame in range(frame_count):
+            frame_values, frame_validity = frame_context(
+                assignments[frame],
+                poses,
+                frame,
+                image_size,
+                "full_context",
+                self.config.pose_visibility_threshold,
+                self.config.pose_coordinate_mode,
+            )
+            for player_index, role in enumerate(("P1", "P2")):
+                item = assignments[frame].get("slots", {}).get(role, {}).get("assignment")
+                if not isinstance(item, Mapping):
+                    continue
+                projected = homography.project_to_court([item["foot"]])[0]
+                cached = np.asarray([item.get("court_x"), item.get("court_y")], dtype=float)
+                if not np.isfinite(cached).all() or not np.allclose(
+                    cached,
+                    projected,
+                    rtol=0.0,
+                    atol=self.config.cached_court_tolerance,
+                ):
+                    raise ValueError(
+                        f"cached assignment court coordinates disagree with canonical calibration at frame {frame} {role}"
+                    )
+                offset = player_index * 11
+                frame_values[offset + 6] = float(projected[0]) / HALF_WIDTH
+                frame_values[offset + 7] = float(projected[1]) / HALF_LENGTH
+            source_values.append(frame_values)
+            source_validity.append(frame_validity)
+            if self.feature_view.uses_motion:
+                slots = assignments[frame]["slots"]
+                track_ids.append([
+                    int(item["track_id"]) if isinstance(item, Mapping) else -1
+                    for item in (slots.get(role, {}).get("assignment") for role in ("P1", "P2"))
+                ])
+        value_tensor = torch.tensor(source_values, dtype=torch.float32)
+        validity_tensor = torch.tensor(source_validity, dtype=torch.bool)
+        if self.feature_view.uses_motion:
+            velocity, velocity_valid = rally_motion_features(
+                value_tensor, validity_tensor, torch.tensor(track_ids), fps
+            )
+            value_tensor = torch.cat((value_tensor, velocity), dim=-1)
+            validity_tensor = torch.cat((validity_tensor, velocity_valid), dim=-1)
+        if audio is not None:
+            value_tensor = torch.cat((value_tensor, torch.as_tensor(audio_values)), dim=-1)
+            validity_tensor = torch.cat((validity_tensor, torch.as_tensor(audio.validity)), dim=-1)
+        value_tensor, validity_tensor = self.feature_view.select(value_tensor, validity_tensor)
         windows: list[RallyWindow] = []
         for owned_start in range(0, frame_count, ownership):
             owned = frozenset(
@@ -392,51 +444,12 @@ class RallyWindowDataset(Dataset[RallyWindow]):
             start = max(0, anchor - radius)
             end = min(frame_count - 1, anchor + radius)
             frames = tuple(range(start, end + 1))
-            values: list[list[float]] = []
-            validity: list[list[bool]] = []
-            targets: list[int] = []
-            for frame in frames:
-                frame_values, frame_validity = frame_context(
-                    assignments[frame],
-                    poses,
-                    frame,
-                    image_size,
-                    "full_context",
-                    self.config.pose_visibility_threshold,
-                    self.config.pose_coordinate_mode,
-                )
-                for player_index, role in enumerate(("P1", "P2")):
-                    item = assignments[frame].get("slots", {}).get(role, {}).get("assignment")
-                    if not isinstance(item, Mapping):
-                        continue
-                    projected = homography.project_to_court([item["foot"]])[0]
-                    cached = np.asarray([item.get("court_x"), item.get("court_y")], dtype=float)
-                    if not np.isfinite(cached).all() or not np.allclose(
-                        cached,
-                        projected,
-                        rtol=0.0,
-                        atol=self.config.cached_court_tolerance,
-                    ):
-                        raise ValueError(
-                            f"cached assignment court coordinates disagree with canonical calibration at frame {frame} {role}"
-                        )
-                    offset = player_index * 11
-                    frame_values[offset + 6] = float(projected[0]) / HALF_WIDTH
-                    frame_values[offset + 7] = float(projected[1]) / HALF_LENGTH
-                if audio is not None:
-                    frame_values.extend(audio_values[frame].tolist())
-                    frame_validity.extend(audio.validity[frame].tolist())
-                selected_values, selected_validity = self.feature_view.select(
-                    torch.tensor(frame_values, dtype=torch.float32),
-                    torch.tensor(frame_validity, dtype=torch.bool),
-                )
-                values.append(selected_values.tolist())
-                validity.append(selected_validity.tolist())
-                targets.append(
-                    self.rally_index.target(source.source_id, frame)
-                    if self.rally_index is not None and frame in owned
-                    else MASKED_TARGET
-                )
+            targets = [
+                self.rally_index.target(source.source_id, frame)
+                if self.rally_index is not None and frame in owned
+                else MASKED_TARGET
+                for frame in frames
+            ]
             if self.rally_index is not None:
                 start_targets, end_targets = rally_boundary_targets(
                     self.rally_index.for_source(source.source_id),
@@ -460,12 +473,8 @@ class RallyWindowDataset(Dataset[RallyWindow]):
                         [(frame - anchor) / fps for frame in frames],
                         dtype=torch.float32,
                     ),
-                    frame_values=torch.tensor(
-                        values, dtype=torch.float32
-                    ).reshape(len(frames), self.feature_view.dimension),
-                    frame_validity=torch.tensor(
-                        validity, dtype=torch.bool
-                    ).reshape(len(frames), self.feature_view.dimension),
+                    frame_values=value_tensor[start : end + 1].clone(),
+                    frame_validity=validity_tensor[start : end + 1].clone(),
                     inplay_targets=torch.tensor(targets, dtype=torch.long),
                     rally_start_targets=start_targets,
                     rally_end_targets=end_targets,

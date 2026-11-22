@@ -367,3 +367,41 @@ def test_mixed_fps_camera_split_includes_exact_fractional_boundary() -> None:
     assert [window.window_id for window in validation] == [
         f"late-{frame}" for frame in range(140, 175)
     ]
+
+
+@pytest.mark.parametrize("fps", [25.0, 30.0, 60.0])
+def test_rally_motion_uses_elapsed_time_and_masks_gaps_and_track_changes(fps) -> None:
+    from src.temporal_selector.rally_features import (
+        FULL_RALLY_FEATURE_NAMES,
+        MOTION_FEATURE_NAMES,
+        rally_feature_view,
+        rally_motion_features,
+    )
+
+    positions = torch.zeros(9, len(FULL_RALLY_FEATURE_NAMES))
+    observed = torch.ones_like(positions, dtype=torch.bool)
+    tracks = torch.ones(9, 2, dtype=torch.long)
+    tracks[4:, 0] = 2
+    time = torch.arange(9) / fps
+    positions[:, FULL_RALLY_FEATURE_NAMES.index("p1_court_x")] = -2 * time
+    joint = FULL_RALLY_FEATURE_NAMES.index("p2_pose_0_y")
+    positions[:, joint] = 3 * time
+    observed[4, joint] = False
+
+    velocity, valid = rally_motion_features(positions, observed, tracks, fps)
+    court_x = MOTION_FEATURE_NAMES.index("p1_court_velocity_x")
+    joint_y = MOTION_FEATURE_NAMES.index("p2_pose_0_velocity_y")
+    expected_valid = [False, False, False, True, False, False, False, True, True]
+    assert valid[:, court_x].tolist() == expected_valid
+    assert valid[:, joint_y].tolist() == [*expected_valid[:7], False, True]
+    assert torch.allclose(velocity[valid[:, court_x], court_x], torch.full((3,), -2.0))
+    assert torch.allclose(velocity[valid[:, joint_y], joint_y], torch.full((2,), 3.0))
+    assert torch.count_nonzero(velocity[~valid]) == 0
+
+    view = rally_feature_view("full_motion")
+    values, mask = view.select(
+        torch.cat((positions, velocity), dim=-1),
+        torch.cat((observed, valid), dim=-1),
+    )
+    assert values.shape == mask.shape == (9, 290)
+    assert torch.equal(values[:, :positions.shape[1]], positions)

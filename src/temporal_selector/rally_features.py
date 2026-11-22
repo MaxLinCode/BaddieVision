@@ -39,6 +39,42 @@ FULL_RALLY_FEATURE_NAMES: Final = tuple(
 )
 
 
+MOTION_POSITION_INDICES: Final = tuple(
+    index for index, name in enumerate(FULL_RALLY_FEATURE_NAMES)
+    if "_pose_" in name or name.endswith(("_court_x", "_court_y"))
+)
+MOTION_FEATURE_NAMES: Final = tuple(
+    FULL_RALLY_FEATURE_NAMES[index].rsplit("_", 1)[0] + "_velocity_" +
+    FULL_RALLY_FEATURE_NAMES[index][-1]
+    for index in MOTION_POSITION_INDICES
+)
+
+
+# Two court coordinates per player, followed by 66 pose coordinates per player.
+_MOTION_PLAYER_INDICES: Final = (0, 0, 1, 1) + (0,) * 66 + (1,) * 66
+
+
+def rally_motion_features(
+    values: Tensor, validity: Tensor, track_ids: Tensor, fps: float,
+) -> tuple[Tensor, Tensor]:
+    """Fit a trailing four-frame slope over each continuously observed coordinate."""
+    positions = values[:, MOTION_POSITION_INDICES]
+    observed = validity[:, MOTION_POSITION_INDICES]
+    velocity = torch.zeros_like(positions)
+    valid = torch.zeros_like(observed)
+    if len(positions) < 4:
+        return velocity, valid
+
+    # Least-squares slope for four uniformly spaced samples, per second.
+    track_history = track_ids.unfold(0, 4, 1)
+    same_track = (track_history == track_history[..., :1]).all(dim=-1)
+    same_track &= track_history[..., 0] >= 0
+    valid[3:] = observed.unfold(0, 4, 1).all(dim=-1) & same_track[:, _MOTION_PLAYER_INDICES]
+    slope = (3 * (positions[3:] - positions[:-3]) + positions[2:-1] - positions[1:-2])
+    velocity[3:] = torch.where(valid[3:], slope * (fps / 10), 0.0)
+    return velocity, valid
+
+
 @dataclass(frozen=True)
 class RallyFeatureView:
     """A stable ordered projection of visual features and optional audio features."""
@@ -48,6 +84,7 @@ class RallyFeatureView:
     full_indices: tuple[int, ...]
     uses_audio: bool = False
     audio_zscore: bool = False
+    uses_motion: bool = False
 
     @property
     def dimension(self) -> int:
@@ -57,6 +94,8 @@ class RallyFeatureView:
         if values.shape != validity.shape:
             raise ValueError("rally values and validity must have identical shapes")
         input_dimension = len(FULL_RALLY_FEATURE_NAMES)
+        if self.uses_motion:
+            input_dimension += len(MOTION_FEATURE_NAMES)
         if self.uses_audio:
             input_dimension += len(RALLY_AUDIO_FEATURE_NAMES)
         if values.shape[-1] != input_dimension:
@@ -78,22 +117,35 @@ def _names_for_fields(fields: Sequence[str], *, include_pose: bool = True) -> tu
 
 def _view(
     name: str, names: Sequence[str], *, uses_audio: bool = False, audio_zscore: bool = False,
+    uses_motion: bool = False,
 ) -> RallyFeatureView:
     requested = tuple(names)
     if len(requested) != len(set(requested)):
         raise AssertionError(f"duplicate feature in rally view {name}")
-    input_names = FULL_RALLY_FEATURE_NAMES + (RALLY_AUDIO_FEATURE_NAMES if uses_audio else ())
+    input_names = (
+        FULL_RALLY_FEATURE_NAMES
+        + (MOTION_FEATURE_NAMES if uses_motion else ())
+        + (RALLY_AUDIO_FEATURE_NAMES if uses_audio else ())
+    )
     positions = {feature: index for index, feature in enumerate(input_names)}
     missing = [feature for feature in requested if feature not in positions]
     if missing:
         raise AssertionError(f"unknown feature in rally view {name}: {missing}")
     return RallyFeatureView(
-        name, requested, tuple(positions[item] for item in requested), uses_audio, audio_zscore
+        name, requested, tuple(positions[item] for item in requested), uses_audio, audio_zscore, uses_motion
     )
 
 
 RALLY_FEATURE_VIEWS: Final[Mapping[str, RallyFeatureView]] = {
     "full": _view("full", FULL_RALLY_FEATURE_NAMES),
+    "full_motion": _view(
+        "full_motion", FULL_RALLY_FEATURE_NAMES + MOTION_FEATURE_NAMES, uses_motion=True
+    ),
+    "full_audio_zscore_motion": _view(
+        "full_audio_zscore_motion",
+        FULL_RALLY_FEATURE_NAMES + MOTION_FEATURE_NAMES + RALLY_AUDIO_FEATURE_NAMES,
+        uses_audio=True, audio_zscore=True, uses_motion=True,
+    ),
     "full_audio": _view(
         "full_audio", FULL_RALLY_FEATURE_NAMES + RALLY_AUDIO_FEATURE_NAMES, uses_audio=True
     ),
@@ -173,6 +225,8 @@ def rally_feature_indices(names: Sequence[str]) -> tuple[int, ...]:
 assert len(FULL_RALLY_FEATURE_NAMES) == 154
 assert {name: view.dimension for name, view in RALLY_FEATURE_VIEWS.items()} == {
     "full": 154,
+    "full_motion": 290,
+    "full_audio_zscore_motion": 297,
     "full_audio": 161,
     "full_audio_zscore": 161,
     "calibrated_canonical": 142,
