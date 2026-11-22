@@ -260,6 +260,41 @@ def test_cli_resolves_config_and_command_line_overrides(tmp_path, monkeypatch):
     assert called["resume"]
 
 
+@pytest.mark.parametrize(("dataset_overrides", "expected_seconds"), [({}, 2.0), ({"rally_context_seconds": 3.0}, 3.0)])
+def test_rtmpose_preset_defaults_to_four_second_context(
+    tmp_path, monkeypatch, dataset_overrides, expected_seconds,
+):
+    import json
+    from types import SimpleNamespace
+
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({
+        "dataset": {
+            "sources": [{
+                "source_id": "a", "video_path": "video.mp4", "assignments_path": "assignments.jsonl",
+                "pose_cache_path": "poses.jsonl", "calibration_path": "calibration.json",
+            }],
+            "rally_intervals_path": "rallies.csv", "rally_manifest_path": "rallies.json",
+            **dataset_overrides,
+        },
+        "camera_sources": {"A": ["a"]},
+    }))
+    monkeypatch.setattr(training, "RallyWindowDataset", lambda data_config: SimpleNamespace(
+        config=data_config, manifest={"pose_training_metadata": {}},
+    ))
+    called = {}
+    monkeypatch.setattr(training, "run_clean_rally_experiment", lambda dataset, *a, **k: called.update(
+        context=dataset.config.context_seconds,
+        feature_view=dataset.config.feature_view,
+        smoothing_weight=k["recipe"].temporal_smoothing_weight,
+    ))
+    assert training.main([
+        "--config", str(config), "--output-dir", str(tmp_path / "output"),
+        "--clean-only", "--preset", "rtmpose-audio", "--device", "cpu",
+    ]) == 0
+    assert called == {"context": expected_seconds, "feature_view": "full_audio", "smoothing_weight": 0.1}
+
+
 def test_run_records_config_and_rejects_changed_resume_identity(tmp_path):
     import json
     from types import SimpleNamespace

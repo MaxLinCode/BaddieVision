@@ -33,6 +33,7 @@ from src.temporal_selector.rally import (
     RallySegmenter,
     RallySegmenterConfig,
 )
+from src.temporal_selector.rally_dataset import RALLY_TRANSFORMER_CONTEXT_RADIUS_SECONDS
 from src.temporal_selector.rally_features import (
     RALLY_FEATURE_SCHEMA,
     RALLY_FEATURE_VERSION,
@@ -57,6 +58,7 @@ LEGACY_PREPROCESSING = {
 }
 DEFAULT_PREPROCESSING = {
     **LEGACY_PREPROCESSING,
+    "context_seconds": RALLY_TRANSFORMER_CONTEXT_RADIUS_SECONDS,
     "pose_crop_padding": RTMPOSE_CROP_PADDING,
     "pose_retry_padding": None,
     "pose_backend": RTMPOSE_BACKEND_TYPE,

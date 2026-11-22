@@ -74,12 +74,17 @@ def chronological_camera_train_validation_split(
     *,
     train_fraction: float = 0.8,
     guard_seconds: float = 1.0,
+    context_radius_seconds: float | None = None,
 ) -> tuple[list[RallyWindow], list[RallyWindow], dict[str, Any]]:
-    """Split each training camera in chronology with context containment."""
+    """Keep all input frames outside the split guard and optionally guard full window centers."""
     if not 0.0 < train_fraction < 1.0:
         raise ValueError("train fraction must be between zero and one")
-    if guard_seconds < 0:
-        raise ValueError("guard seconds cannot be negative")
+    if not math.isfinite(guard_seconds) or guard_seconds < 0:
+        raise ValueError("guard seconds must be finite and nonnegative")
+    if context_radius_seconds is not None and (
+        not math.isfinite(context_radius_seconds) or context_radius_seconds <= 0
+    ):
+        raise ValueError("context radius seconds must be finite and positive")
     by_source: dict[str, list[RallyWindow]] = {}
     for window in windows:
         by_source.setdefault(window.source_id, []).append(window)
@@ -116,7 +121,12 @@ def chronological_camera_train_validation_split(
             raise ValueError(
                 "sources from one camera must share FPS for guard bands"
             )
-        guard_frames = round(next(iter(fps_values)) * guard_seconds)
+        fps = next(iter(fps_values))
+        guard_frames = round(fps * guard_seconds)
+        anchor_guard_frames = (
+            guard_frames + max(1, round(fps * context_radius_seconds))
+            if context_radius_seconds is not None else None
+        )
         train_range = (0, cut - guard_frames - 1)
         validation_range = (cut + guard_frames, total_frames - 1)
         camera_train: list[RallyWindow] = []
@@ -126,6 +136,10 @@ def chronological_camera_train_validation_split(
             for window in by_source[source]:
                 first = offset + min(window.frame_indices)
                 last = offset + max(window.frame_indices)
+                if anchor_guard_frames is not None:
+                    anchor = offset + window.anchor_frame
+                    if cut - anchor_guard_frames <= anchor < cut + anchor_guard_frames:
+                        continue
                 if train_range[0] <= first and last <= train_range[1]:
                     camera_train.append(window)
                 elif (
@@ -147,6 +161,7 @@ def chronological_camera_train_validation_split(
             "cut_frame": cut,
             "guard_seconds": guard_seconds,
             "guard_frames": guard_frames,
+            **({"anchor_guard_frames": anchor_guard_frames} if anchor_guard_frames is not None else {}),
             "train_global_range": list(train_range),
             "validation_global_range": list(validation_range),
             "train_window_ids": [window.window_id for window in camera_train],
@@ -158,6 +173,10 @@ def chronological_camera_train_validation_split(
         "strategy": "per-training-camera-chronological-80-20",
         "train_fraction": train_fraction,
         "guard_seconds": guard_seconds,
+        **({
+            "context_radius_seconds": context_radius_seconds,
+            "anchor_guard_seconds": guard_seconds + context_radius_seconds,
+        } if context_radius_seconds is not None else {}),
         "cameras": camera_metadata,
         "train_window_count": len(train),
         "validation_window_count": len(validation),

@@ -135,15 +135,21 @@ python -m src.temporal_selector.rally_experiment \
   --clean-only --preset rtmpose-audio --device cuda
 ```
 
-The preset selects the raw `full_audio` view and defaults to a smoothing
-weight of 0.1. The loss penalizes probability changes between adjacent
+The preset selects the raw `full_audio` view, a four-second centered transformer
+window (two seconds on either side), and a smoothing weight of 0.1. At 30 fps, a
+full window contains 121 frames including the center and owns 30 frames.
+To compare another context radius, set `dataset.rally_context_seconds`
+in the local experiment config. The loss penalizes probability changes between adjacent
 supervised frames with the same label. It excludes rally boundaries and
 masked frames. A four-camera replay of earlier experiments favored 0.1 over
 0.3 for macro interval F1 (0.501 versus 0.463). The combined recipe requires
 its own camera-held-out evaluation.
 
-For RTMPose, the chronological split uses a three-second guard for the
-centered player-assignment context. Each fold tunes a higher rally entry
-threshold and a lower continuation threshold on its validation frames.
+The split for this recipe keeps every transformer input frame at least three seconds from the
+train/validation cut for centered player-assignment evidence. It adds the
+configured context radius to that guard for window centers, giving the
+standard recipe a five-second guard on each side of the cut. Each fold tunes
+a higher rally entry threshold and a lower continuation threshold on its
+validation frames.
 The production checkpoint freezes both thresholds using out-of-fold
 predictions, along with the gap and minimum-duration settings.

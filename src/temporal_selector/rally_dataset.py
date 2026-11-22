@@ -43,6 +43,7 @@ from .rally_intervals import read_rally_intervals
 
 RALLY_FEATURE_NAMES = FULL_RALLY_FEATURE_NAMES
 RALLY_INPUT_FPS = 30.0
+RALLY_TRANSFORMER_CONTEXT_RADIUS_SECONDS = 2.0
 
 
 def validate_rally_source_fps(source_id: str, fps: float) -> None:
@@ -94,8 +95,11 @@ class RallyDataConfig:
             )
         if not 0.0 <= self.pose_visibility_threshold <= 1.0:
             raise ValueError("pose visibility threshold must be in [0, 1]")
-        if self.context_seconds <= 0 or self.ownership_seconds <= 0:
-            raise ValueError("rally context and ownership durations must be positive")
+        if any(
+            not math.isfinite(value) or value <= 0
+            for value in (self.context_seconds, self.ownership_seconds)
+        ):
+            raise ValueError("rally context and ownership durations must be finite and positive")
         rally_feature_view(self.feature_view)
         if self.cached_court_tolerance < 0:
             raise ValueError("cached court-coordinate tolerance cannot be negative")
@@ -378,6 +382,8 @@ class RallyWindowDataset(Dataset[RallyWindow]):
             }
         ownership = max(1, round(fps * self.config.ownership_seconds))
         radius = max(1, round(fps * self.config.context_seconds))
+        if radius < ownership // 2:
+            raise ValueError("rally context radius must cover the entire ownership window")
         windows: list[RallyWindow] = []
         for owned_start in range(0, frame_count, ownership):
             owned = frozenset(
@@ -546,7 +552,7 @@ def collate_rally_windows(windows: Sequence[RallyWindow]) -> RallyBatch:
 
 
 def rally_data_config_from_selector_mapping(
-    config: Mapping[str, Any], *, base_dir: Path
+    config: Mapping[str, Any], *, base_dir: Path, default_context_seconds: float = RallyDataConfig.context_seconds
 ) -> RallyDataConfig:
     """Read only player/pose/rally paths from an existing experiment config."""
     dataset = config["dataset"]
@@ -571,5 +577,6 @@ def rally_data_config_from_selector_mapping(
         pose_visibility_threshold=float(
             dataset.get("pose_visibility_threshold", 0.5)
         ),
+        context_seconds=float(dataset.get("rally_context_seconds", default_context_seconds)),
         feature_view=str(dataset.get("rally_feature_view", "full")),
     )

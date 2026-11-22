@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import fields
+from dataclasses import fields, replace
 
 import pytest
 import torch
@@ -240,6 +240,30 @@ def test_camera_splits_are_contained_guarded_and_deterministic() -> None:
     assert set(folds[0].training_source_ids).isdisjoint(
         folds[0].test_source_ids
     )
+
+
+@pytest.mark.parametrize(("context_seconds", "anchor_guard_frames"), [(1.0, 120), (2.0, 150), (3.0, 180)])
+def test_rally_split_guard_expands_with_the_context(context_seconds, anchor_guard_frames):
+    fps = 30
+    frame_count = 1500
+    radius = round(context_seconds * fps)
+    windows = [
+        replace(
+            _window("a", frame, fps=fps, frame_count=frame_count),
+            frame_indices=tuple(range(max(0, frame - radius), min(frame_count, frame + radius + 1))),
+        )
+        for frame in range(frame_count)
+    ]
+    train, validation, split = chronological_camera_train_validation_split(
+        windows, {"camera-a": ("a",)}, guard_seconds=3.0, context_radius_seconds=context_seconds,
+    )
+    cut = split["cameras"]["camera-a"]["cut_frame"]
+    assert split["anchor_guard_seconds"] == 3.0 + context_seconds
+    assert split["cameras"]["camera-a"]["anchor_guard_frames"] == anchor_guard_frames
+    assert train[-1].anchor_frame == cut - anchor_guard_frames - 1
+    assert validation[0].anchor_frame == cut + anchor_guard_frames
+    assert max(train[-1].frame_indices) + 90 < cut
+    assert min(validation[0].frame_indices) - 90 == cut
 
 
 def _rows(clean: bool) -> list[dict]:

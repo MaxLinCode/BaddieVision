@@ -44,6 +44,7 @@ from .rally import (
 )
 from .rally_audio import RALLY_AUDIO_FEATURE_NAMES
 from .rally_dataset import (
+    RALLY_TRANSFORMER_CONTEXT_RADIUS_SECONDS,
     RallyDataConfig,
     RallyWindow,
     RallyWindowDataset,
@@ -1048,7 +1049,9 @@ def run_clean_rally_experiment(
                     if window.source_id in fold.training_source_ids]
         train, validation, split = chronological_camera_train_validation_split(
             eligible, _training_camera_groups(fold, camera_sources),
+            # Player assignment uses five seconds of evidence and a half-second hold.
             guard_seconds=3.0 if uses_rtmpose else 1.0,
+            context_radius_seconds=rally_dataset.config.context_seconds if uses_rtmpose else None,
         )
         test = [window for window in rally_dataset.windows
                 if window.source_id in fold.test_source_ids]
@@ -1468,7 +1471,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.clean_only:
         config_path = args.config.expanduser().resolve()
         raw = json.loads(config_path.read_text(encoding="utf-8"))
-        data_config = rally_data_config_from_selector_mapping(raw, base_dir=config_path.parent)
+        data_config = rally_data_config_from_selector_mapping(
+            raw, base_dir=config_path.parent,
+            default_context_seconds=(
+                RALLY_TRANSFORMER_CONTEXT_RADIUS_SECONDS if rtmpose_preset else RallyDataConfig.context_seconds
+            ),
+        )
         feature_view = "full_audio" if rtmpose_preset else args.feature_view
         if feature_view is not None:
             data_config = replace(data_config, feature_view=feature_view)
