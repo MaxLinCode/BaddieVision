@@ -13,6 +13,8 @@ import tempfile
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
+from InPlay.heuristic.person_tracks import BOTSORT_CONTINUOUS, BYTETRACK_PERIODIC
+
 from .artifacts import (
     atomic_write_json,
     calibration_fingerprint,
@@ -22,16 +24,18 @@ from .artifacts import (
 from .identity import SourceIdentity, sha256_file
 from .registry import SourceEntry
 from .publication import publish, recover, recovered_publication
-from .source import verify_source as verify_source
+from .source import select_device, verify_source as verify_source
 
 
 STAGE_CODE = {
     "person": (
+        "config/botsort-fixed-camera.yaml",
         "InPlay/heuristic/person_tracks.py",
         "InPlay/heuristic/players.py",
         "src/single_video/video.py",
     ),
     "pose": (
+        "InPlay/heuristic/legacy_player_assignment.py",
         "InPlay/heuristic/player_interpretation.py",
         "src/pose_estimator.py",
         "src/pose_backends.py",
@@ -366,9 +370,29 @@ def _player_stage_valid(
         )
 
 
-def resolve_person_detector(model: str | Path) -> Path:
+def resolve_person_detector(
+    model: str | Path | None,
+    *,
+    device: str = "auto",
+    tracking_profile: str = BOTSORT_CONTINUOUS,
+) -> Path:
     """Resolve an Ultralytics alias to the checkpoint bytes used by the stage."""
+    from InPlay.heuristic.person_tracks import default_person_model
+
+    if model is None:
+        if device == "auto":
+            device = select_device(device)
+        model = (
+            "yolov8n.pt"
+            if tracking_profile == BYTETRACK_PERIODIC
+            else default_person_model(device)
+        )
     model_path = Path(model).expanduser()
+    if not model_path.is_file() and model_path.suffix.lower() == ".engine":
+        raise FileNotFoundError(
+            f"person detector engine is missing: {model_path}; "
+            "export YOLO26L on the target NVIDIA GPU (see docs/workflow.md)"
+        )
     if not model_path.is_file():
         from ultralytics import YOLO
 
@@ -381,11 +405,12 @@ def resolve_person_detector(model: str | Path) -> Path:
 def run_person_stage(
     source: SourceEntry,
     *,
-    model: str | Path = "yolov8n.pt",
+    model: str | Path | None = None,
     device: str = "auto",
     force: bool = False,
     extractor: Callable[..., Any] | None = None,
     extractor_identity: str | None = None,
+    tracking_profile: str = BOTSORT_CONTINUOUS,
 ) -> bool:
     identity = verify_source(source)
     imported_receipt = source.person_tracks_path.with_name(
@@ -411,13 +436,18 @@ def run_person_stage(
                 source, "person", "completed", reused=True, origin="validated_import"
             )
             return False
-    model_path = resolve_person_detector(model)
+    if device == "auto":
+        device = select_device(device)
+    model_path = resolve_person_detector(
+        model, device=device, tracking_profile=tracking_profile
+    )
     inputs = {
         "identity": identity.fingerprint,
         "detector_sha256": sha256_file(model_path),
         "implementation": implementation_identity("person"),
         "backend": backend_identity(extractor, extractor_identity),
         "device": device,
+        "tracking_profile": tracking_profile,
     }
 
     def execute(paths):
@@ -425,7 +455,11 @@ def run_person_stage(
             from InPlay.heuristic.person_tracks import extract_person_tracks
 
             extract_person_tracks(
-                source.video_path, paths[0], str(model_path), device=device
+                source.video_path,
+                paths[0],
+                str(model_path),
+                device=device,
+                tracking_profile=tracking_profile,
             )
         else:
             extractor(source.video_path, paths[0], str(model_path))
@@ -452,6 +486,7 @@ def run_player_stage(
     force: bool = False,
     interpreter: Callable[..., Any] | None = None,
     interpreter_identity: str | None = None,
+    tracking_profile: str | None = None,
 ) -> bool:
     identity = verify_source(source)
     tracks = source.person_tracks_path
@@ -477,6 +512,11 @@ def run_player_stage(
                 f"person tracks differ from the committed receipt at {receipt}; "
                 "rebuild or reimport the tracks"
             )
+        person_profile = committed["inputs"].get("tracking_profile")
+        if tracking_profile is None:
+            tracking_profile = person_profile or BOTSORT_CONTINUOUS
+        elif person_profile is not None and person_profile != tracking_profile:
+            raise ValueError("player assignment profile differs from person tracks")
         validate_person_tracks(tracks, identity)
         if pose_backend == "rtmpose":
             from src.rtmpose import DEFAULT_RTMPOSE_MODEL_PATH, RTMPOSE_CROP_PADDING
@@ -500,6 +540,7 @@ def run_player_stage(
             "calibration_sha256": calibration_fingerprint(source),
             "pose_sha256": sha256_file(pose_model),
             "pose_crop_padding": pose_crop_padding,
+            "tracking_profile": tracking_profile,
             **({"pose_backend": pose_backend, "pose_device": pose_device or "cpu"}
                if pose_backend == "rtmpose" else {}),
             "implementation": implementation_identity("pose"),
@@ -523,6 +564,8 @@ def run_player_stage(
                 "pose_model_asset": pose_model,
                 "pose_crop_padding": pose_crop_padding,
             }
+            if "tracking_profile" in inspect.signature(callback).parameters:
+                kwargs["tracking_profile"] = tracking_profile
             if pose_backend == "rtmpose":
                 kwargs.update(pose_backend=pose_backend, pose_device=pose_device)
             if "pose_work_dir" in inspect.signature(callback).parameters:

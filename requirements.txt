@@ -20,4 +20,5 @@ scipy>=1.11,<2
 tensorboard>=2.14,<3
 torch>=2.2,<3
 tqdm>=4.66,<5
-ultralytics>=8.2,<9
+ultralytics>=8.4.211,<9
+lap>=0.5.12,<1

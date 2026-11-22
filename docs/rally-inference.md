@@ -62,6 +62,11 @@ identity, and output hashes. Completed stages are reused only on an exact match.
 Interrupted/stale stages require `--force`. Video identity changes require a new
 source rather than silently reusing old observations.
 
+The six-source release uses ByteTrack and periodic court-role assignment. The
+seven-source YOLO26 release uses fixed-camera BoT-SORT and continuous assignment.
+New release packages can record `tracking_profile` in their preprocessing JSON
+as `bytetrack-periodic-v1` or `botsort-continuous-v1`.
+
 ## Export the existing production checkpoint
 
 Run this only on a trusted locally trained checkpoint, using the exact person

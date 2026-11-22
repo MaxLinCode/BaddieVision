@@ -12,14 +12,19 @@ import os
 import tempfile
 import textwrap
 from collections import defaultdict, deque
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
 import cv2
 import numpy as np
 
-from InPlay.heuristic.person_tracks import load_person_tracks, raw_artifact_fingerprint
+from InPlay.heuristic.person_tracks import (
+    BOTSORT_CONTINUOUS,
+    BYTETRACK_PERIODIC,
+    PLAYER_TRACKING_PROFILES,
+    load_person_tracks,
+    raw_artifact_fingerprint,
+)
 from src.court_projection import HALF_LENGTH, HALF_WIDTH, CourtHomography
 from src.pose_backends import resolve_crop_pose_backend
 from src.rtmpose import RTMPOSE_BACKEND_TYPE
@@ -28,27 +33,10 @@ from InPlay.heuristic.pose_crops import iter_player_crop_poses
 from src.single_video.video import read_video_info
 from src.workflow.identity import SourceIdentity, sha256_file
 
-COURT_MARGIN_METERS = 0.3
-REASSIGN_INTERVAL_SECONDS = 0.5
-OCCUPANCY_WINDOW_SECONDS = 2.0
-EVIDENCE_WINDOW_SECONDS = 5.0
-MIN_OBSERVATION_SECONDS = 0.5
-CENTER_RADIUS_METERS = 2.0
-CENTER_Y_METERS = 3.35
-CENTER_ACCESS_WEIGHT = 0.65
-OCCUPANCY_WEIGHT = 0.25
-DETECTION_CONFIDENCE_WEIGHT = 0.10
-MIN_CENTER_ACCESS = 0.10
-MIN_TOTAL_SCORE = 0.35
-SCORE_TOLERANCE = 0.08
-HANDOFF_MIN_DETECTION_CONFIDENCE = 0.35
-RELIABLE_ASSIGNMENT_CONFIDENCE = 0.60
-REPLACEMENT_GUARD_MIN_OCCUPANCY = 0.50
-REACQUISITION_MAX_AGE_SECONDS = 0.50
-HANDOFF_MIN_BOX_IOU = 0.10
-HANDOFF_MAX_IMAGE_FOOT_DISPLACEMENT_RATIO = 0.08
-HANDOFF_MAX_COURT_FOOT_DISPLACEMENT_METERS = 1.25
-HANDOFF_SCORE_LEAD = SCORE_TOLERANCE
+PLAYER_COURT_PADDING_METERS = 1.0
+ROLE_RETURN_SECONDS = 0.5
+ROLE_LOOKAHEAD_SECONDS = 0.5
+ROLE_CONFIRMATION_SECONDS = 0.25
 ACTIVITY_WINDOW = 30
 POSE_CACHE_SCHEMA_VERSION = 2
 POSE_CROP_PADDING = 0.20
@@ -59,37 +47,6 @@ TEMPORAL_MAX_BRACKET_MOTION = 0.12
 TEMPORAL_JUMP_THRESHOLD = 0.10
 TORSO_LANDMARKS = (11, 12, 23, 24)
 QUALITY_LANDMARKS = (11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28)
-
-
-@dataclass(frozen=True)
-class Candidate:
-    track_id: int
-    observations: int
-    center_access: float
-    occupancy_ratio: float
-    mean_confidence: float
-    score: float
-
-
-@dataclass(frozen=True)
-class AssignmentPolicy:
-    replacement_guard: bool = True
-    same_id_reacquisition: bool = False
-
-    def metadata(self) -> dict[str, Any]:
-        return {
-            "replacement_guard": {
-                "enabled": self.replacement_guard,
-                "incumbent_min_mean_confidence": RELIABLE_ASSIGNMENT_CONFIDENCE,
-                "incumbent_min_occupancy_ratio": REPLACEMENT_GUARD_MIN_OCCUPANCY,
-                "challenger_min_mean_confidence": HANDOFF_MIN_DETECTION_CONFIDENCE,
-            },
-            "same_id_reacquisition": {
-                "enabled": self.same_id_reacquisition,
-                "min_detection_confidence": RELIABLE_ASSIGNMENT_CONFIDENCE,
-                "max_age_seconds": REACQUISITION_MAX_AGE_SECONDS,
-            },
-        }
 
 
 def load_calibration(path: str | Path, frame_size: tuple[int, int]) -> CourtHomography:
@@ -108,310 +65,127 @@ def load_calibration(path: str | Path, frame_size: tuple[int, int]) -> CourtHomo
     return CourtHomography.load(calibration_path)
 
 
-def _project_observation(observation: dict[str, Any], homography: CourtHomography) -> dict[str, Any]:
+def _inside_court(court_x: float, court_y: float, padding: float) -> bool:
+    return bool(
+        abs(court_x) <= HALF_WIDTH + padding
+        and abs(court_y) <= HALF_LENGTH + padding
+    )
+
+
+def _project_observation(
+    observation: dict[str, Any], homography: CourtHomography,
+    padding: float = PLAYER_COURT_PADDING_METERS,
+) -> dict[str, Any]:
     x1, _y1, x2, y2 = observation["bbox"]
     court_x, court_y = homography.project_to_court([((x1 + x2) / 2.0, y2)])[0]
     result = dict(observation)
     result["court_x"] = float(court_x)
     result["court_y"] = float(court_y)
-    result["in_court"] = bool(
-        -HALF_WIDTH - COURT_MARGIN_METERS <= court_x <= HALF_WIDTH + COURT_MARGIN_METERS
-        and -HALF_LENGTH - COURT_MARGIN_METERS <= court_y <= HALF_LENGTH + COURT_MARGIN_METERS
-    )
+    result["in_court"] = _inside_court(court_x, court_y, padding)
     return result
 
 
-def _rank_candidates(
-    projected: Iterable[dict[str, Any]], evidence_start: int, evidence_end: int,
-    occupancy_start: int, occupancy_end: int, slot: int, excluded: set[int], fps: float,
-) -> list[Candidate]:
-    grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)
-    for item in projected:
-        frame = int(item["frame"])
-        track_id = int(item["track_id"])
-        y = float(item["court_y"])
-        correct_half = y <= 0.0 if slot == 1 else y >= 0.0
-        if (evidence_start <= frame < evidence_end and item["in_court"]
-                and correct_half and track_id not in excluded):
-            grouped[track_id].append(item)
-    candidates = []
-    minimum_observations = max(1, int(np.ceil(MIN_OBSERVATION_SECONDS * fps)))
-    occupancy_frames = max(1, occupancy_end - occupancy_start)
-    center_y = -CENTER_Y_METERS if slot == 1 else CENTER_Y_METERS
-    for track_id, items in grouped.items():
-        if len(items) < minimum_observations:
-            continue
-        center_access = float(np.mean([
-            np.hypot(float(item["court_x"]), float(item["court_y"]) - center_y)
-            <= CENTER_RADIUS_METERS for item in items
-        ]))
-        occupancy = len({int(item["frame"]) for item in items
-                         if occupancy_start <= int(item["frame"]) < occupancy_end})
-        occupancy_ratio = min(1.0, occupancy / occupancy_frames)
-        mean_confidence = float(np.mean([float(item.get("confidence", 0.0)) for item in items]))
-        score = (CENTER_ACCESS_WEIGHT * center_access
-                 + OCCUPANCY_WEIGHT * occupancy_ratio
-                 + DETECTION_CONFIDENCE_WEIGHT * mean_confidence)
-        if center_access >= MIN_CENTER_ACCESS and score >= MIN_TOTAL_SCORE:
-            candidates.append(Candidate(
-                track_id, len(items), center_access, occupancy_ratio, mean_confidence, score,
-            ))
-    return sorted(candidates, key=lambda item: (-item.score, item.track_id))
-
-
-def _choose_candidate(
-    candidates: list[Candidate], incumbent: int | None,
-) -> tuple[int | None, str | None, float, list[dict[str, Any]]]:
-    details = [
-        {"track_id": item.track_id, "observations": item.observations,
-         "center_access": item.center_access, "occupancy_ratio": item.occupancy_ratio,
-         "mean_detection_confidence": item.mean_confidence, "score": item.score}
-        for item in candidates
-    ]
-    if not candidates:
-        return None, "insufficient_observations", 0.0, details
-    leader = candidates[0]
-    incumbent_candidate = next((item for item in candidates if item.track_id == incumbent), None)
-    if (
-        incumbent_candidate is not None
-        and leader.score - incumbent_candidate.score <= SCORE_TOLERANCE
-    ):
-        chosen = incumbent_candidate
-        reason = "incumbent_retained" if chosen.track_id != leader.track_id else None
-    elif (
-        len(candidates) > 1
-        and leader.score - candidates[1].score <= SCORE_TOLERANCE
-        and leader.track_id != incumbent
-        and candidates[1].track_id != incumbent
-    ):
-        return None, "ambiguous_candidates", 0.0, details
-    else:
-        chosen, reason = leader, None
-    return chosen.track_id, reason, chosen.score, details
-
-
-def _bbox_iou(left: Iterable[float], right: Iterable[float]) -> float:
-    left_x1, left_y1, left_x2, left_y2 = map(float, left)
-    right_x1, right_y1, right_x2, right_y2 = map(float, right)
-    intersection_width = max(0.0, min(left_x2, right_x2) - max(left_x1, right_x1))
-    intersection_height = max(0.0, min(left_y2, right_y2) - max(left_y1, right_y1))
-    intersection = intersection_width * intersection_height
-    union = ((left_x2 - left_x1) * (left_y2 - left_y1)
-             + (right_x2 - right_x1) * (right_y2 - right_y1) - intersection)
-    return intersection / union if union > 0 else 0.0
-
-
-def _foot_from_bbox(bbox: Iterable[float]) -> np.ndarray:
-    x1, _y1, x2, y2 = map(float, bbox)
-    return np.asarray([(x1 + x2) / 2.0, y2], dtype=float)
-
-
-def _choose_track_handoff(
-    current_observations: Iterable[dict[str, Any]], previous_assignment: dict[str, Any] | None,
-    slot: int, used: set[int], candidate_details: list[dict[str, Any]], frame_diagonal: float,
-) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    """Choose a clearly better, continuous raw-ID fragment for one missing slot."""
-    if previous_assignment is None:
-        return None, None
-    scores = {int(item["track_id"]): float(item["score"]) for item in candidate_details}
-    previous_bbox = previous_assignment["bbox"]
-    previous_image_foot = _foot_from_bbox(previous_bbox)
-    previous_court_foot = np.asarray(
-        [float(previous_assignment["court_x"]), float(previous_assignment["court_y"])], dtype=float
-    )
-    eligible: list[tuple[float, int, dict[str, Any], dict[str, float]]]=[]
-    for observation in current_observations:
-        track_id = int(observation["track_id"])
-        correct_half = float(observation["court_y"]) <= 0.0 if slot == 1 else float(observation["court_y"]) >= 0.0
-        if (
-            track_id in used
-            or track_id not in scores
-            or not observation["in_court"]
-            or not correct_half
-            or float(observation.get("confidence", 0.0)) < HANDOFF_MIN_DETECTION_CONFIDENCE
-        ):
-            continue
-        overlap = _bbox_iou(previous_bbox, observation["bbox"])
-        image_displacement = float(np.linalg.norm(_foot_from_bbox(observation["bbox"]) - previous_image_foot))
-        court_displacement = float(np.linalg.norm(
-            np.asarray([float(observation["court_x"]), float(observation["court_y"])]) - previous_court_foot
-        ))
-        continuous = (
-            overlap >= HANDOFF_MIN_BOX_IOU
-            or image_displacement <= HANDOFF_MAX_IMAGE_FOOT_DISPLACEMENT_RATIO * frame_diagonal
-            or court_displacement <= HANDOFF_MAX_COURT_FOOT_DISPLACEMENT_METERS
-        )
-        if continuous:
-            eligible.append((scores[track_id], track_id, observation, {
-                "box_iou": overlap,
-                "image_foot_displacement": image_displacement,
-                "court_foot_displacement": court_displacement,
-            }))
-    eligible.sort(key=lambda item: (-item[0], item[1]))
-    if not eligible:
-        return None, None
-    leader = eligible[0]
-    if len(eligible) > 1 and leader[0] - eligible[1][0] <= HANDOFF_SCORE_LEAD:
-        return None, None
-    return leader[2], {
-        "reason": "track_handoff", "prior_track_id": int(previous_assignment["track_id"]),
-        "replacement_track_id": leader[1], "role_score": leader[0], **leader[3],
-    }
+def _court_role(court_y: float) -> str:
+    return "P1" if court_y < 0.0 else "P2"
 
 
 def assign_singles_slots(
     observations: list[dict[str, Any]], homography: CourtHomography, frame_count: int, fps: float,
-    *, frame_size: tuple[int, int] | None = None,
-    policy: AssignmentPolicy = AssignmentPolicy(),
 ) -> list[dict[str, Any]]:
-    """Assign near P1/far P2 periodically while treating raw IDs as fragments."""
-    projected = [_project_observation(item, homography) for item in observations]
-    by_frame: dict[int, dict[int, dict[str, Any]]] = defaultdict(dict)
-    evidence_by_frame: dict[int, list[dict[str, Any]]] = defaultdict(list)
-    for item in projected:
-        frame = int(item["frame"])
-        by_frame[frame][int(item["track_id"])] = item
-        evidence_by_frame[frame].append(item)
-    periods: list[tuple[int, int, dict[int, dict[str, Any]]]] = []
-    incumbents: dict[int, int | None] = {1: None, 2: None}
-    if fps <= 0:
+    """Keep each observed incumbent and use bounded lookahead to fill open roles."""
+    if not np.isfinite(fps) or fps <= 0:
         raise ValueError("fps must be positive")
-    reassign_interval = max(1, int(round(REASSIGN_INTERVAL_SECONDS * fps)))
-    evidence_window = max(1, int(round(EVIDENCE_WINDOW_SECONDS * fps)))
-    occupancy_window = max(1, int(round(OCCUPANCY_WINDOW_SECONDS * fps)))
-    for center in range(0, frame_count, reassign_interval):
-        evidence_start = max(0, center - evidence_window // 2)
-        evidence_end = min(frame_count, center + (evidence_window + 1) // 2)
-        occupancy_start = max(0, center - occupancy_window // 2)
-        occupancy_end = min(frame_count, center + (occupancy_window + 1) // 2)
-        evidence = [
-            item
-            for frame in range(evidence_start, evidence_end)
-            for item in evidence_by_frame.get(frame, ())
-        ]
-        chosen: dict[int, dict[str, Any]] = {}
-        excluded: set[int] = set()
-        for slot in (1, 2):
-            candidates = _rank_candidates(
-                evidence, evidence_start, evidence_end, occupancy_start, occupancy_end,
-                slot, excluded, fps,
-            )
-            track_id, reason, confidence, details = _choose_candidate(candidates, incumbents[slot])
-            incumbent = next((item for item in candidates if item.track_id == incumbents[slot]), None)
-            if (
-                policy.replacement_guard
-                and incumbent is not None
-                and incumbent.mean_confidence >= RELIABLE_ASSIGNMENT_CONFIDENCE
-                and incumbent.occupancy_ratio >= REPLACEMENT_GUARD_MIN_OCCUPANCY
-            ):
-                eligible = [
-                    item for item in candidates
-                    if item.mean_confidence >= HANDOFF_MIN_DETECTION_CONFIDENCE
-                ]
-                guarded_id, _, guarded_score, _ = _choose_candidate(eligible, incumbents[slot])
-                if guarded_id != track_id:
-                    track_id, reason, confidence = guarded_id, "low_confidence_replacement_guard", guarded_score
-            chosen[slot] = {
-                "track_id": track_id, "confidence": confidence, "reason": reason,
-                "candidates": details, "evidence_window": [evidence_start, evidence_end],
-                "occupancy_window": [occupancy_start, occupancy_end],
-            }
-            if track_id is not None:
-                excluded.add(track_id)
-                incumbents[slot] = track_id
-        periods.append((center, min(frame_count, center + reassign_interval), chosen))
+    hold_frames = max(1, int(ROLE_RETURN_SECONDS * fps))
+    lookahead_frames = max(1, int(np.ceil(ROLE_LOOKAHEAD_SECONDS * fps)))
+    minimum_frames = max(1, int(np.ceil(ROLE_CONFIRMATION_SECONDS * fps)))
+    roles = ("P1", "P2")
+    by_role: dict[str, dict[int, dict[int, dict[str, Any]]]] = {
+        role: defaultdict(dict) for role in roles
+    }
+    for item in observations:
+        projected = _project_observation(item, homography)
+        if projected["in_court"]:
+            frame, track_id = int(item["frame"]), int(item["track_id"])
+            if any(track_id in by_role[role].get(frame, {}) for role in roles):
+                raise ValueError(f"duplicate observation for track {track_id} at frame {frame}")
+            role = _court_role(projected["court_y"])
+            by_role[role][frame][track_id] = projected
 
-    frames: list[dict[str, Any]] = []
-    if frame_size is None:
-        image_extent = max((max(map(float, item["bbox"])) for item in projected), default=1.0)
-        frame_diagonal = float(np.hypot(image_extent, image_extent))
-    else:
-        frame_diagonal = float(np.hypot(*frame_size))
-    last_reliable: dict[int, tuple[int, int, float]] = {}
-    for start, end, chosen in periods:
-        active_track_ids = {slot: chosen[slot]["track_id"] for slot in (1, 2)}
-        previous_assignments: dict[int, dict[str, Any] | None] = {1: None, 2: None}
-        prior_period = last_reliable.copy()
-        for frame_index in range(start, end):
-            slots: dict[str, Any] = {}
-            used: set[int] = set()
-            current = by_frame.get(frame_index, {})
-            for slot in (1, 2):
-                decision = chosen[slot]
-                track_id = active_track_ids[slot]
-                observation = current.get(track_id)
-                assignment = None
-                reason = decision["reason"]
-                confidence = decision["confidence"]
-                handoff = None
-                if observation is None and track_id is not None:
-                    reason = "selected_track_absent"
-                    replacement, handoff = _choose_track_handoff(
-                        current.values(), previous_assignments[slot], slot,
-                        used, decision["candidates"], frame_diagonal,
-                    )
-                    if replacement is not None:
-                        observation = replacement
-                        track_id = int(observation["track_id"])
-                        active_track_ids[slot] = track_id
-                        reason = "track_handoff"
-                history = prior_period.get(slot)
-                reacquired = False
-                if observation is None and history is not None:
-                    prior_frame, prior_id, prior_score = history
-                    same = current.get(prior_id)
-                    other_slot = 3 - slot
-                    other_claim = active_track_ids[other_slot] == prior_id and same is not None and (
-                        same["court_y"] <= 0 if other_slot == 1 else same["court_y"] >= 0
-                    )
-                    if (
-                        (frame_index - prior_frame) / fps <= REACQUISITION_MAX_AGE_SECONDS
-                        and same is not None
-                        and same["in_court"]
-                        and (same["court_y"] <= 0 if slot == 1 else same["court_y"] >= 0)
-                        and float(same.get("confidence", 0.0)) >= RELIABLE_ASSIGNMENT_CONFIDENCE
-                        and prior_id not in used
-                        and not other_claim
-                    ):
-                        observation, track_id = same, prior_id
-                        confidence = next(
-                            (item["score"] for item in decision["candidates"] if item["track_id"] == prior_id),
-                            prior_score,
-                        )
-                        reason = "same_id_reacquired"
-                        reacquired = True
+    incumbent: dict[str, tuple[int, int]] = {}
+    frames = []
+    for frame in range(frame_count):
+        slots = {}
+        for role in roles:
+            eligible = by_role[role]
+            current = eligible.get(frame, {})
+            previous = incumbent.get(role)
+            observation = None
+            candidates = []
+            reason = "no_eligible_observation"
+            decision = None
+
+            if previous is not None and frame - previous[1] <= hold_frames:
+                observation = current.get(previous[0])
                 if observation is not None:
-                    correct_half = observation["court_y"] <= 0 if slot == 1 else observation["court_y"] >= 0
-                    if not observation["in_court"]:
-                        reason = "outside_court"
-                    elif not correct_half:
-                        reason = "wrong_half"
-                    elif track_id in used:
-                        reason = "track_already_assigned"
+                    decision = "retained" if frame == previous[1] + 1 else "returned"
+                else:
+                    reason = "waiting_for_incumbent"
+            elif current:
+                horizon = min(frame_count, frame + lookahead_frames)
+                evidence = [eligible.get(index, {}) for index in range(frame, horizon)]
+                for track_id in current:
+                    samples = [items[track_id] for items in evidence if track_id in items]
+                    if len(samples) < minimum_frames:
+                        continue
+                    candidates.append({
+                        "track_id": track_id,
+                        "observations": len(samples),
+                        "inside_court_frames": sum(
+                            _inside_court(item["court_x"], item["court_y"], 0.0)
+                            for item in samples
+                        ),
+                        "mean_detection_confidence": float(np.mean([item["confidence"] for item in samples])),
+                    })
+                candidates.sort(key=lambda item: (
+                    -item["inside_court_frames"], -item["mean_detection_confidence"], item["track_id"],
+                ))
+                reason = "insufficient_observations"
+                if candidates:
+                    leader = candidates[0]
+                    if len(candidates) > 1 and all(
+                        leader[key] == candidates[1][key]
+                        for key in ("inside_court_frames", "mean_detection_confidence")
+                    ):
+                        reason = "ambiguous_candidates"
                     else:
-                        used.add(track_id)
-                        assignment = {
-                            "track_id": track_id,
-                            "bbox": observation["bbox"],
-                            "detection_confidence": float(observation.get("confidence", 0.0)),
-                            "court_x": observation["court_x"], "court_y": observation["court_y"],
-                        }
-                        # A cross-period fallback must satisfy its confidence
-                        # floor on each frame. It cannot seed a fragment handoff.
-                        if not reacquired:
-                            previous_assignments[slot] = assignment
-                        if policy.same_id_reacquisition:
-                            if track_id != (history[1] if history is not None else None):
-                                prior_period.pop(slot, None)
-                            if assignment["detection_confidence"] >= RELIABLE_ASSIGNMENT_CONFIDENCE:
-                                last_reliable[slot] = frame_index, track_id, confidence
-                slots[f"P{slot}"] = {
-                    "assignment": assignment, "confidence": confidence,
-                    "ambiguity_reason": reason, "candidates": decision["candidates"],
+                        observation = current[leader["track_id"]]
+                        if previous is None:
+                            decision = "acquired"
+                        else:
+                            decision = "returned" if leader["track_id"] == previous[0] else "replacement"
+
+            assignment = None
+            confidence = 0.0
+            if observation is not None:
+                track_id = int(observation["track_id"])
+                incumbent[role] = track_id, frame
+                confidence = float(observation["confidence"])
+                assignment = {
+                    "track_id": track_id,
+                    "bbox": observation["bbox"],
+                    "detection_confidence": confidence,
+                    "court_x": observation["court_x"],
+                    "court_y": observation["court_y"],
                 }
-                if handoff is not None:
-                    slots[f"P{slot}"]["handoff"] = handoff
-            frames.append({"type": "frame", "frame": frame_index, "slots": slots})
+            slots[role] = {
+                "assignment": assignment,
+                "confidence": confidence,
+                "ambiguity_reason": reason if assignment is None else None,
+                "candidates": candidates,
+            }
+            if decision is not None:
+                slots[role]["decision"] = decision
+        frames.append({"type": "frame", "frame": frame, "slots": slots})
     return frames
 
 
@@ -819,6 +593,49 @@ def apply_temporal_pose_validation(
         record.update(update)
 
 
+def _record_foot_diagnostics(
+    frames: list[dict[str, Any]],
+    pose_cache: dict[tuple[int, int, tuple[float, ...]], dict[str, Any]],
+    homography: CourtHomography,
+) -> None:
+    """Record original pose evidence before interpolation can change the feet."""
+    for frame in frames:
+        for role, slot in frame["slots"].items():
+            assignment = slot["assignment"]
+            if assignment is None:
+                continue
+            bbox = assignment["bbox"]
+            key = (int(frame["frame"]), int(assignment["track_id"]), _bbox_key(bbox))
+            pose = pose_cache.get(key, {})
+            landmarks = pose.get("pose_landmarks") or []
+            visible_feet = [
+                landmark for landmark in landmarks[29:33]
+                if landmark.get("visibility", 0.0) >= POSE_VISIBILITY_THRESHOLD
+                and np.isfinite([landmark["x"], landmark["y"]]).all()
+            ]
+            diagnostic = {
+                "status": "unavailable",
+                "box_court": [assignment["court_x"], assignment["court_y"]],
+            }
+            slot["foot_diagnostic"] = diagnostic
+            if not visible_feet:
+                continue
+            foot = _landmarks_to_image(visible_feet, pose.get("pose_bbox", bbox)).mean(axis=0)
+            try:
+                court_x, court_y = homography.project_to_court([foot])[0]
+            except ValueError:
+                continue
+            agrees = (
+                _inside_court(court_x, court_y, PLAYER_COURT_PADDING_METERS)
+                and _court_role(court_y) == role
+            )
+            diagnostic.update({
+                "status": "in_bounds" if agrees else "disagrees",
+                "image_foot": foot.tolist(),
+                "pose_court": [float(court_x), float(court_y)],
+            })
+
+
 def derive_activity_and_rows(
     assignments: list[dict[str, Any]],
     pose_cache: dict[tuple[int, int, tuple[float, ...]], dict[str, Any]],
@@ -935,8 +752,10 @@ def interpret_players(
     estimator_factory: Callable[..., Any] | None = None,
     pose_work_dir: str | Path | None = None,
     pose_backend_identity: dict[str, Any] | None = None,
-    assignment_policy: AssignmentPolicy = AssignmentPolicy(),
+    tracking_profile: str = BOTSORT_CONTINUOUS,
 ) -> tuple[list[dict[str, Any]], int]:
+    if tracking_profile not in PLAYER_TRACKING_PROFILES:
+        raise ValueError(f"unsupported player tracking profile: {tracking_profile}")
     raw_metadata, observations = load_person_tracks(person_tracks_path)
     frame_size = tuple(map(int, raw_metadata["frame_size"]))
     info = read_video_info(Path(video_path))
@@ -966,10 +785,15 @@ def interpret_players(
         or (identity.width, identity.height) != frame_size
     ):
         raise ValueError("source identity does not match player-processing video")
-    assignments = assign_singles_slots(
-        observations, homography, frame_count, float(info["fps"]), frame_size=frame_size,
-        policy=assignment_policy,
-    )
+    fps = float(info["fps"])
+    if tracking_profile == BYTETRACK_PERIODIC:
+        from .legacy_player_assignment import assign_singles_slots as assign_periodic_slots
+
+        assignments = assign_periodic_slots(
+            observations, homography, frame_count, fps, frame_size=frame_size,
+        )
+    else:
+        assignments = assign_singles_slots(observations, homography, frame_count, fps)
     cache, computed = enrich_pose_cache(
         video_path, assignments, person_tracks_path, pose_cache_path,
         pose_model_asset=pose_model_asset, pose_crop_padding=pose_crop_padding,
@@ -977,6 +801,8 @@ def interpret_players(
         pose_work_dir=pose_work_dir, pose_backend_identity=pose_backend_identity,
     )
     mask_missing = pose_backend == "rtmpose"
+    if tracking_profile == BOTSORT_CONTINUOUS:
+        _record_foot_diagnostics(assignments, cache, homography)
     apply_temporal_pose_validation(assignments, cache, frame_size, mask_missing_landmarks=mask_missing)
     cache_metadata, cache_records = load_pose_cache(pose_cache_path)
     if cache_metadata is not None:
@@ -1004,28 +830,13 @@ def interpret_players(
         "fps": float(info["fps"]), "frame_count": frame_count,
         "roles": {"P1": "near", "P2": "far"},
         "parameters": {
-            "reassign_interval_seconds": REASSIGN_INTERVAL_SECONDS,
-            "occupancy_window_seconds": OCCUPANCY_WINDOW_SECONDS,
-            "evidence_window_seconds": EVIDENCE_WINDOW_SECONDS,
-            "minimum_observation_seconds": MIN_OBSERVATION_SECONDS,
-            "center": {"P1": [0.0, -CENTER_Y_METERS], "P2": [0.0, CENTER_Y_METERS]},
-            "center_radius_meters": CENTER_RADIUS_METERS,
-            "weights": {"center_access": CENTER_ACCESS_WEIGHT,
-                        "occupancy_ratio": OCCUPANCY_WEIGHT,
-                        "mean_detection_confidence": DETECTION_CONFIDENCE_WEIGHT},
-            "minimum_center_access": MIN_CENTER_ACCESS,
-            "minimum_score": MIN_TOTAL_SCORE,
-            "score_tolerance": SCORE_TOLERANCE,
-            "assignment_policy": assignment_policy.metadata(),
-            "track_handoff": {
-                "enabled_for": "selected_track_absent",
-                "minimum_detection_confidence": HANDOFF_MIN_DETECTION_CONFIDENCE,
-                "minimum_box_iou": HANDOFF_MIN_BOX_IOU,
-                "maximum_image_foot_displacement_ratio": HANDOFF_MAX_IMAGE_FOOT_DISPLACEMENT_RATIO,
-                "maximum_court_foot_displacement_meters": HANDOFF_MAX_COURT_FOOT_DISPLACEMENT_METERS,
-                "minimum_score_lead": HANDOFF_SCORE_LEAD,
-            },
-        },
+            "policy": "continuous",
+            "court_padding_meters": PLAYER_COURT_PADDING_METERS,
+            "incumbent_return_seconds": ROLE_RETURN_SECONDS,
+            "lookahead_seconds": ROLE_LOOKAHEAD_SECONDS,
+            "minimum_observation_seconds": ROLE_CONFIRMATION_SECONDS,
+            "foot_visibility_threshold": POSE_VISIBILITY_THRESHOLD,
+        } if tracking_profile == BOTSORT_CONTINUOUS else {"policy": tracking_profile},
     }
     write_player_assignments(assignments_path, assignment_metadata, assignments)
     write_players_csv(players_csv_path, rows)
@@ -1045,13 +856,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--players-csv", required=True)
     parser.add_argument("--pose-model-asset")
     parser.add_argument("--pose-crop-padding", type=float, choices=(0.15, 0.20, 0.25), default=POSE_CROP_PADDING)
-    parser.add_argument(
-        "--replacement-guard", action=argparse.BooleanOptionalAction,
-        default=AssignmentPolicy().replacement_guard,
-        help="confidence gate for replacing a reliable incumbent (enabled by default)",
-    )
-    parser.add_argument("--same-id-reacquisition", action="store_true",
-                        help="diagnostic cross-period return of a recently seen raw track")
     parser.add_argument("--tracks-csv", help="shuttle tracks used when rendering --preview")
     parser.add_argument("--preview", help="rendered layered MP4 output")
     args = parser.parse_args(argv)
@@ -1061,7 +865,6 @@ def main(argv: list[str] | None = None) -> int:
         args.video, args.person_tracks, args.court_calibration, args.pose_cache,
         args.assignments, args.players_csv, pose_model_asset=args.pose_model_asset,
         pose_crop_padding=args.pose_crop_padding,
-        assignment_policy=AssignmentPolicy(args.replacement_guard, args.same_id_reacquisition),
     )
     if args.preview:
         from src.pose_estimator import pose_connections

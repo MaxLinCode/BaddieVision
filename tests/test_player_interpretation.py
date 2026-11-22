@@ -9,8 +9,6 @@ import pytest
 from InPlay.heuristic.person_tracks import import_legacy_player_poses, raw_artifact_fingerprint
 from InPlay.heuristic import player_interpretation
 from InPlay.heuristic.player_interpretation import (
-    AssignmentPolicy,
-    Candidate,
     apply_temporal_pose_validation,
     assign_singles_slots,
     enrich_pose_cache,
@@ -19,7 +17,7 @@ from InPlay.heuristic.player_interpretation import (
     load_pose_cache,
     pose_model_fingerprint,
 )
-from src.court_projection import CourtHomography
+from src.court_projection import HALF_LENGTH, HALF_WIDTH, CourtHomography
 from src.pose_estimator import PoseEstimate, PoseLandmark
 from src import pose_estimator
 
@@ -37,271 +35,6 @@ def _assignment_ids(frames, slot):
         for frame in frames
         if frame["slots"][slot]["assignment"] is not None
     }
-
-
-def test_fragmented_ids_stay_on_their_court_roles_and_absences_are_not_filled():
-    observations = []
-    for frame in range(120):
-        if frame < 52:
-            observations.append(_observation(frame, 1816, 0, -3))
-        if 60 <= frame < 120:
-            observations.append(_observation(frame, 2794, 0, -3))
-        far_id = 1500 if frame < 40 else 1923 if frame < 80 else 2233
-        observations.append(_observation(frame, far_id, 0, 3))
-        observations.append(_observation(frame, 99, 10, 3))  # spectator outside court
-
-    frames = assign_singles_slots(observations, CourtHomography(np.eye(3)), 120, 30)
-
-    assert _assignment_ids(frames, "P1") <= {1816, 2794}
-    assert _assignment_ids(frames, "P2") <= {1500, 1923, 2233}
-    assert 99 not in _assignment_ids(frames, "P1") | _assignment_ids(frames, "P2")
-    assert all(
-        frame["slots"]["P1"]["assignment"] is None
-        for frame in frames[52:60]
-    )
-    for frame in frames:
-        assignments = [frame["slots"][slot]["assignment"] for slot in ("P1", "P2")]
-        ids = [item["track_id"] for item in assignments if item]
-        assert len(ids) == len(set(ids))
-        if assignments[0]:
-            assert assignments[0]["court_y"] <= 0
-        if assignments[1]:
-            assert assignments[1]["court_y"] >= 0
-
-
-def test_continuous_raw_id_fragment_handoffs_within_reassignment_interval():
-    observations = []
-    for frame in range(180):
-        if frame < 100:
-            observations.append(_observation(frame, 1, 0, -3.35))
-        elif frame < 160:
-            observations.append(_observation(frame, 2, 0.05, -3.35))
-        observations.append(_observation(frame, 10, 0, 3.35))
-    raw_snapshot = json.loads(json.dumps(observations))
-
-    frames = assign_singles_slots(observations, CourtHomography(np.eye(3)), 180, 30)
-
-    handoffs = [frame["slots"]["P1"] for frame in frames if frame["slots"]["P1"].get("handoff")]
-    assert handoffs
-    first = handoffs[0]
-    assert first["assignment"]["track_id"] == 2
-    assert first["ambiguity_reason"] == "track_handoff"
-    assert first["handoff"]["prior_track_id"] == 1
-    assert first["handoff"]["replacement_track_id"] == 2
-    assert all(frame["slots"]["P1"]["assignment"] is not None for frame in frames[100:105])
-    assert observations == raw_snapshot
-
-
-def test_handoff_rejects_tied_or_implausible_current_frame_replacements():
-    observations = []
-    for frame in range(180):
-        if frame < 100:
-            observations.append(_observation(frame, 1, 0, -3.35))
-        elif frame < 160:
-            observations.extend([
-                _observation(frame, 2, -0.05, -3.35),
-                _observation(frame, 3, 0.05, -3.35),  # tied plausible replacement
-                _observation(frame, 4, 10, -3.35),  # outside court spectator
-                _observation(frame, 5, 0, 3.35),  # wrong-half player
-            ])
-        observations.append(_observation(frame, 10, 0, 3.35))
-
-    frames = assign_singles_slots(observations, CourtHomography(np.eye(3)), 180, 30)
-
-    assert all(frame["slots"]["P1"].get("handoff") is None for frame in frames)
-    assert all(frame["slots"]["P1"]["assignment"] is None for frame in frames[100:105])
-    assert _assignment_ids(frames, "P1").isdisjoint({2, 3, 4, 5})
-
-
-def test_center_weighted_incumbent_is_retained_within_score_tolerance():
-    observations = []
-    for frame in range(90):
-        observations.append(_observation(frame, 1, 0, -2, 0.8))
-        if 30 <= frame < 90 and frame % 5 != 0:
-            observations.append(_observation(frame, 2, 0.2, -2, 0.99))
-        observations.append(_observation(frame, 3, 0, 2))
-
-    frames = assign_singles_slots(observations, CourtHomography(np.eye(3)), 90, 30)
-
-    assert _assignment_ids(frames, "P1") == {1}
-
-
-@pytest.mark.parametrize("challenger_confidence", [0.25, 0.85])
-def test_replacement_guard_distinguishes_floor_box_from_reliable_challenger(challenger_confidence):
-    observations = [
-        _observation(frame, 31, 0 if frame < 30 else 2.5, -3.35, 0.85)
-        for frame in range(80)
-    ] + [
-        _observation(frame, 99, 0, -3.35, challenger_confidence)
-        for frame in range(25, 80)
-    ]
-    court = CourtHomography(np.eye(3))
-    baseline = assign_singles_slots(
-        observations, court, 80, 10, policy=AssignmentPolicy(replacement_guard=False),
-    )
-    guarded = assign_singles_slots(observations, court, 80, 10)
-
-    assert baseline[0]["slots"]["P1"]["assignment"]["track_id"] == 31
-    assert baseline[45]["slots"]["P1"]["assignment"]["track_id"] == 99
-    decision = guarded[45]["slots"]["P1"]
-    if challenger_confidence < 0.35:
-        assert decision["assignment"]["track_id"] == 31
-        assert decision["ambiguity_reason"] == "low_confidence_replacement_guard"
-        assert [item["track_id"] for item in decision["candidates"]] == [99, 31]
-    else:
-        assert decision == baseline[45]["slots"]["P1"]
-
-
-@pytest.mark.parametrize(
-    ("selected_track", "return_frame", "position", "confidence", "other_slot_claim", "reacquired"),
-    [
-        (None, 5, (0, -3), 0.60, False, True),
-        (99, 9, (0, -3), 0.90, False, True),
-        (None, 10, (0, -3), 0.90, False, False),
-        (None, 5, (0, 3), 0.90, False, False),
-        (None, 5, (10, -3), 0.90, False, False),
-        (None, 5, (0, -3), 0.59, False, False),
-        (None, 5, (0, 0), 0.90, True, False),
-        (None, None, (0, -3), 0.90, False, False),
-    ],
-)
-def test_same_id_reacquisition_requires_recent_eligible_current_observation(
-    monkeypatch, selected_track, return_frame, position, confidence, other_slot_claim, reacquired,
-):
-    def rank(_items, _start, end, _occupancy_start, _occupancy_end, slot, _excluded, _fps):
-        if slot == 1:
-            choice = 31 if end == 25 else selected_track
-        else:
-            choice = 31 if end > 25 and other_slot_claim else None
-        return [] if choice is None else [Candidate(choice, 5, 1.0, 1.0, 0.9, 0.99)]
-
-    monkeypatch.setattr(player_interpretation, "_rank_candidates", rank)
-    observations = [_observation(4, 31, 0, -3)]
-    if return_frame is not None:
-        observations.append(_observation(return_frame, 31, *position, confidence))
-    court = CourtHomography(np.eye(3))
-    baseline = assign_singles_slots(
-        observations, court, 40, 10, policy=AssignmentPolicy(replacement_guard=False),
-    )
-    frames = assign_singles_slots(
-        observations, court, 40, 10,
-        policy=AssignmentPolicy(replacement_guard=False, same_id_reacquisition=True),
-    )
-
-    assert baseline[4]["slots"]["P1"]["assignment"]["track_id"] == 31
-    index = return_frame if return_frame is not None else 5
-    assert baseline[index]["slots"]["P1"]["assignment"] is None
-    decision = frames[index]["slots"]["P1"]
-    if reacquired:
-        assert decision["assignment"]["track_id"] == 31
-        assert decision["ambiguity_reason"] == "same_id_reacquired"
-        assert decision["confidence"] == 0.99
-        assert frames[index + 1]["slots"]["P1"]["assignment"] is None
-    else:
-        assert decision["assignment"] is None
-    if other_slot_claim:
-        assert frames[index]["slots"]["P2"]["assignment"]["track_id"] == 31
-
-
-def test_reacquisition_cannot_bypass_confidence_or_replace_the_period_track(monkeypatch):
-    def rank(_items, _start, end, _occupancy_start, _occupancy_end, slot, _excluded, _fps):
-        if slot == 2:
-            return []
-        incumbent = Candidate(31, 5, 1.0, 0.5, 0.85, 0.86)
-        selected = Candidate(99, 5, 1.0, 1.0, 0.9, 0.99)
-        return [incumbent] if end == 25 else [selected, incumbent]
-
-    monkeypatch.setattr(player_interpretation, "_rank_candidates", rank)
-    observations = [
-        _observation(4, 31, 0, -3),
-        _observation(5, 31, 0, -3),
-        _observation(6, 31, 0, -3, 0.50),
-        _observation(7, 31, 0, -3),
-        _observation(7, 99, 0, -3),
-    ]
-    frames = assign_singles_slots(
-        observations, CourtHomography(np.eye(3)), 40, 10,
-        policy=AssignmentPolicy(replacement_guard=False, same_id_reacquisition=True),
-    )
-
-    assert frames[5]["slots"]["P1"]["ambiguity_reason"] == "same_id_reacquired"
-    assert frames[6]["slots"]["P1"]["assignment"] is None
-    assert frames[7]["slots"]["P1"]["assignment"]["track_id"] == 99
-
-
-def test_equal_new_same_half_candidates_are_ambiguous():
-    observations = []
-    for frame in range(60):
-        observations.extend([
-            _observation(frame, 10, -0.5, -2),
-            _observation(frame, 11, 0.5, -2),
-            _observation(frame, 20, 0, 2),
-        ])
-
-    frames = assign_singles_slots(observations, CourtHomography(np.eye(3)), 60, 30)
-
-    assert all(frame["slots"]["P1"]["assignment"] is None for frame in frames)
-    assert {frame["slots"]["P1"]["ambiguity_reason"] for frame in frames} == {"ambiguous_candidates"}
-
-
-def test_center_access_beats_persistent_edge_spectator():
-    observations = []
-    for frame in range(180):
-        observations.append(_observation(frame, 91, 3.0, -3.35, 0.99))
-        if frame % 3 != 0:
-            observations.append(_observation(frame, 7, 0.0, -3.35, 0.8))
-    frames = assign_singles_slots(observations, CourtHomography(np.eye(3)), 180, 30)
-    assert _assignment_ids(frames, "P1") == {7}
-
-
-def test_sideline_incumbent_expires_without_switching_to_edge_spectator():
-    observations = []
-    for frame in range(300):
-        observations.append(_observation(frame, 91, 3.0, -3.35))
-        if frame < 75:
-            observations.append(_observation(frame, 7, 0.0, -3.35))
-        elif frame < 210:
-            observations.append(_observation(frame, 7, 3.0, -3.35))
-    frames = assign_singles_slots(observations, CourtHomography(np.eye(3)), 300, 30)
-    assert any(frame["slots"]["P1"]["assignment"] is not None for frame in frames[75:120])
-    assert all(frame["slots"]["P1"]["assignment"] is None for frame in frames[180:])
-    assert 91 not in _assignment_ids(frames, "P1")
-
-
-@pytest.mark.parametrize("fps", [20, 50])
-def test_assignment_timing_is_fps_aware(fps: int):
-    frame_count = 8 * fps
-    observations = [
-        _observation(frame, 1, 0.0 if frame < 2 * fps else 3.0, -3.35)
-        for frame in range(frame_count)
-    ]
-    frames = assign_singles_slots(observations, CourtHomography(np.eye(3)), frame_count, fps)
-    assigned_seconds = sum(
-        frame["slots"]["P1"]["assignment"] is not None for frame in frames
-    ) / fps
-    assert assigned_seconds == pytest.approx(4.5, abs=0.51)
-
-
-def test_wrong_half_and_missing_observations_are_not_assigned_and_scores_are_exposed():
-    observations = []
-    for frame in range(60):
-        observations.append(_observation(frame, 1, 0.0, -3.35))
-        observations.append(_observation(frame, 2, 0.0, 3.35))
-    frames = assign_singles_slots(observations, CourtHomography(np.eye(3)), 75, 30)
-
-    assert _assignment_ids(frames, "P1") == {1}
-    assert _assignment_ids(frames, "P2") == {2}
-    assert all(frame["slots"]["P1"]["assignment"] is None for frame in frames[60:])
-    candidate = frames[0]["slots"]["P1"]["candidates"][0]
-    assert set(candidate) == {
-        "track_id", "observations", "center_access", "occupancy_ratio",
-        "mean_detection_confidence", "score",
-    }
-
-
-def test_assignment_rejects_nonpositive_fps():
-    with pytest.raises(ValueError, match="fps must be positive"):
-        assign_singles_slots([], CourtHomography(np.eye(3)), 30, 0)
 
 
 def test_calibration_must_exist_contain_image_size_and_match(tmp_path: Path):
@@ -710,7 +443,7 @@ def test_pose_recovery_tracks_inference_code_without_invalidating_for_consumers(
     elif component == "temporal":
         monkeypatch.setattr(player_interpretation, "TEMPORAL_JUMP_THRESHOLD", 0.05)
     elif component == "assignment":
-        monkeypatch.setattr(player_interpretation, "COURT_MARGIN_METERS", 0.5)
+        monkeypatch.setattr(player_interpretation, "PLAYER_COURT_PADDING_METERS", 0.5)
     else:
         monkeypatch.setattr(pose_estimator, "POSE_CONNECTIONS", ((0, 1),))
 
@@ -766,3 +499,93 @@ def test_legacy_import_preserves_video_shape_and_seeds_attempted_poses(tmp_path:
     cache_lines = [json.loads(line) for line in cache.read_text().splitlines()]
     assert [item["status"] for item in cache_lines[1:]] == ["no_pose", "detected"]
     assert cache_lines[0]["raw_artifact_fingerprint"] == raw_artifact_fingerprint(raw)
+
+
+@pytest.mark.parametrize("fps", [30, 60])
+def test_continuous_slots_hold_then_recover_with_strongest_interior_track(fps):
+    observations = [
+        _observation(frame, 1, 0.0, -2.0, 0.4)
+        for frame in range(2 * fps)
+        if not fps // 3 <= frame < fps // 2 and frame < fps
+    ]
+    observations += [
+        _observation(frame, 2, HALF_WIDTH + 0.8, -2.0)
+        for frame in range(fps // 4, 2 * fps)
+    ]
+    observations += [
+        _observation(frame, 3, 0.0, -2.0, 0.6)
+        for frame in range(fps, 2 * fps)
+    ]
+    frames = assign_singles_slots(observations, CourtHomography(np.eye(3)), 2 * fps, fps)
+    near = [frame["slots"]["P1"] for frame in frames]
+    assert near[fps // 4]["assignment"]["track_id"] == 1
+    assert all(slot["assignment"] is None for slot in near[fps // 3:fps // 2])
+    assert near[fps // 2]["decision"] == "returned"
+    assert all(slot["assignment"] is None for slot in near[fps:fps + fps // 2])
+    assert near[fps + fps // 2]["assignment"]["track_id"] == 3
+    assert near[fps + fps // 2]["decision"] == "replacement"
+    assert near[fps + fps // 2]["ambiguity_reason"] is None
+
+
+def test_continuous_slots_allow_lunges_inside_one_meter_and_reject_beyond_it():
+    observations = [
+        item for frame in range(30)
+        for item in (
+            _observation(frame, 1, HALF_WIDTH + 0.8, -HALF_LENGTH - 0.9),
+            _observation(frame, 2, HALF_WIDTH + 1.01, 2.0),
+            _observation(frame, 3, 0.0, HALF_LENGTH + 1.01),
+            _observation(frame, 4, 0.0, 2.0),
+        )
+    ]
+    frames = assign_singles_slots(observations, CourtHomography(np.eye(3)), 30, 30)
+    assert _assignment_ids(frames, "P1") == {1}
+    assert _assignment_ids(frames, "P2") == {4}
+
+
+def test_foot_disagreement_uses_original_pose_crop_and_does_not_clear_assignment():
+    observations = [_observation(frame, 1, 0.0, -2.0) for frame in range(12)]
+    court = CourtHomography(np.eye(3))
+    frames = assign_singles_slots(observations, court, 12, 30)
+    landmarks = [{"x": 0.5, "y": 0.75, "visibility": 0.95} for _ in range(33)]
+    pose = {
+        "pose_landmarks": landmarks,
+        "pose_bbox": [-1.0, -3.0, 1.0, 1.0],
+    }
+    outside = {**pose, "pose_bbox": [5.0, -6.0, 7.0, -2.0]}
+    bbox = tuple(observations[0]["bbox"])
+    player_interpretation._record_foot_diagnostics(
+        frames, {(0, 1, bbox): pose, (1, 1, bbox): outside}, court,
+    )
+    near = [frame["slots"]["P1"] for frame in frames]
+    assert near[0]["foot_diagnostic"]["status"] == "disagrees"
+    assert near[1]["foot_diagnostic"]["status"] == "disagrees"
+    assert near[1]["foot_diagnostic"]["pose_court"] == pytest.approx([6.0, -3.0])
+    assert near[2]["foot_diagnostic"]["status"] == "unavailable"
+    assert _assignment_ids(frames, "P1") == {1}
+
+
+def test_open_role_requires_enough_observations_and_rejects_exact_ties():
+    observations = [
+        item for frame in range(30)
+        for item in (
+            _observation(frame, 1, HALF_WIDTH + 0.5 if frame == 0 else 0.0, -2.0, 0.9),
+            _observation(frame, 2, HALF_WIDTH + 0.5 if frame == 14 else 1.0, -2.0, 0.9),
+        )
+        if item["track_id"] == 1 or frame <= 14
+    ]
+    observations += [_observation(frame, 3, 0.0, 2.0) for frame in range(7)]
+    frames = assign_singles_slots(observations, CourtHomography(np.eye(3)), 30, 30)
+    assert frames[0]["slots"]["P1"]["ambiguity_reason"] == "ambiguous_candidates"
+    assert frames[1]["slots"]["P1"]["assignment"]["track_id"] == 1
+    assert not _assignment_ids(frames, "P2")
+
+
+def test_duplicate_raw_id_cannot_be_assigned_to_both_halves():
+    observations = [_observation(0, 1, 0.0, y) for y in (-2.0, 2.0)]
+    with pytest.raises(ValueError, match="duplicate observation"):
+        assign_singles_slots(observations, CourtHomography(np.eye(3)), 30, 30)
+
+
+def test_assignment_rejects_nonpositive_fps():
+    with pytest.raises(ValueError, match="fps must be positive"):
+        assign_singles_slots([], CourtHomography(np.eye(3)), 30, 0)

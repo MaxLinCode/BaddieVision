@@ -1,4 +1,4 @@
-"""Immutable YOLO/ByteTrack person observations and legacy import tools."""
+"""Immutable YOLO person observations and legacy import tools."""
 
 from __future__ import annotations
 
@@ -12,6 +12,19 @@ from src.single_video.video import read_video_info
 
 PERSON_CLASS_ID = 0
 PERSON_CLASS_NAME = "person"
+PERSON_IMAGE_SIZE = 960
+PERSON_DETECTION_CONFIDENCE = 0.10
+PERSON_TENSORRT_MODEL = Path("models/yolo26l.engine")
+FIXED_CAMERA_TRACKER = Path(__file__).resolve().parents[2] / "config/botsort-fixed-camera.yaml"
+BYTETRACK_PERIODIC = "bytetrack-periodic-v1"
+BOTSORT_CONTINUOUS = "botsort-continuous-v1"
+PLAYER_TRACKING_PROFILES = (BYTETRACK_PERIODIC, BOTSORT_CONTINUOUS)
+
+
+def default_person_model(device: str) -> Path:
+    if device.startswith("cuda") and PERSON_TENSORRT_MODEL.is_file():
+        return PERSON_TENSORRT_MODEL
+    return Path("yolo26l.pt")
 
 
 def _write_jsonl(path: str | Path, records: Iterable[dict[str, Any]]) -> None:
@@ -50,19 +63,34 @@ def load_person_tracks(path: str | Path) -> tuple[dict[str, Any], list[dict[str,
 def extract_person_tracks(
     video: str | Path,
     output: str | Path,
-    model: str = "yolov8n.pt",
+    model: str | None = None,
     *,
     device: str | None = None,
+    tracking_profile: str = BOTSORT_CONTINUOUS,
 ) -> None:
-    """Run YOLO/ByteTrack only; no court or pose interpretation occurs here."""
+    """Track people without using court calibration or pose estimates."""
     from tqdm import tqdm
     from ultralytics import YOLO
 
     from InPlay.heuristic.players import ensure_person_detector
 
+    if tracking_profile not in PLAYER_TRACKING_PROFILES:
+        raise ValueError(f"unsupported player tracking profile: {tracking_profile}")
+    legacy = tracking_profile == BYTETRACK_PERIODIC
+    if model is None:
+        from src.workflow.source import select_device
+
+        device = select_device(device or "auto")
+        model = "yolov8n.pt" if legacy else str(default_person_model(device))
+    engine = Path(model).suffix.lower() == ".engine"
+    if legacy and engine:
+        raise ValueError("the ByteTrack release profile requires PyTorch detector weights")
+    if engine and device in {"cpu", "mps"}:
+        raise ValueError("TensorRT person detection requires CUDA; use yolo26l.pt")
     info = read_video_info(Path(video))
     detector = YOLO(model)
-    ensure_person_detector(detector, model)
+    if not engine:
+        ensure_person_detector(detector, model)
     metadata = {
         "type": "metadata",
         "schema": "person_tracks",
@@ -78,16 +106,27 @@ def extract_person_tracks(
         },
         "tracker": "bytetrack.yaml",
     }
+    track_options = {}
+    if not legacy:
+        track_options = {
+            "imgsz": PERSON_IMAGE_SIZE,
+            "conf": PERSON_DETECTION_CONFIDENCE,
+            "half": engine or str(device).startswith("cuda"),
+        }
+        metadata["detector"].update(imgsz=PERSON_IMAGE_SIZE, conf=PERSON_DETECTION_CONFIDENCE)
+        metadata["tracker"] = FIXED_CAMERA_TRACKER.name
+        metadata["tracker_config_fingerprint"] = raw_artifact_fingerprint(FIXED_CAMERA_TRACKER)
     with Path(output).open("w", encoding="utf-8") as handle:
         handle.write(json.dumps(metadata, separators=(",", ":")) + "\n")
         results = detector.track(
             source=str(video),
             classes=[PERSON_CLASS_ID],
-            tracker="bytetrack.yaml",
+            tracker="bytetrack.yaml" if legacy else str(FIXED_CAMERA_TRACKER),
             stream=True,
             persist=True,
             verbose=False,
             device=device,
+            **track_options,
         )
         processed_frames = 0
         for frame_index, result in enumerate(
@@ -97,6 +136,8 @@ def extract_person_tracks(
                 desc="YOLO person tracking",
             )
         ):
+            if engine and frame_index == 0:
+                ensure_person_detector(result, model)
             processed_frames = frame_index + 1
             if result.boxes.id is None:
                 continue
@@ -152,7 +193,7 @@ def import_legacy_player_poses(
         "fps": fps,
         "frame_count": frame_count,
         "detector": legacy_metadata.get("detector", {}),
-        "tracker": "bytetrack.yaml",
+        "tracker": legacy_metadata.get("tracker"),
         "imported_from": str(legacy_path),
     }
     raw_records: list[dict[str, Any]] = [raw_metadata]
@@ -226,11 +267,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
     extract = subparsers.add_parser(
-        "extract", help="run immutable YOLO/ByteTrack extraction"
+        "extract", help="run immutable YOLO person tracking"
     )
     extract.add_argument("--video", required=True)
     extract.add_argument("--output", required=True)
-    extract.add_argument("--model", default="yolov8n.pt")
+    extract.add_argument("--model", help="person detector weights or TensorRT engine")
+    extract.add_argument("--device")
     legacy = subparsers.add_parser(
         "import-legacy", help="import player_poses.jsonl without YOLO"
     )
@@ -240,7 +282,9 @@ def main(argv: list[str] | None = None) -> int:
     legacy.add_argument("--video")
     args = parser.parse_args(argv)
     if args.command == "extract":
-        extract_person_tracks(args.video, args.output, args.model)
+        extract_person_tracks(
+            args.video, args.output, args.model, device=args.device
+        )
     else:
         import_legacy_player_poses(
             args.legacy, args.person_tracks, args.pose_cache, video_path=args.video

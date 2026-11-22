@@ -260,8 +260,13 @@ def test_rtmpose_release_converts_fps_before_extraction_and_reuses_source(
 
 
 def test_complete_pipeline_and_verified_cached_rerun(pipeline, monkeypatch):
+    from InPlay.heuristic.person_tracks import BYTETRACK_PERIODIC
+
     kwargs, calls = pipeline
     outputs = run_pipeline(**kwargs)
+    for filename in ("person-tracks.manifest.json", "players.manifest.json"):
+        receipt = json.loads((kwargs["output_dir"] / "players" / filename).read_text())
+        assert receipt["inputs"]["tracking_profile"] == BYTETRACK_PERIODIC
     assert set(outputs) == {"manifest", "predictions", "rallies", "overlay"}
     with outputs["rallies"].open() as handle:
         assert list(csv.DictReader(handle)) == [
@@ -547,6 +552,7 @@ def test_new_catalog_cannot_overwrite_another_source_identity(pipeline):
 
 
 def test_manual_and_pipeline_stages_share_completion_policy(pipeline):
+    from src.rally_release import release_tracking_profile
     from src.workflow.extraction import resolve_source
     from src.workflow.rally_pipeline import _calibrate
     from src.workflow.stages import run_person_stage, run_player_stage
@@ -569,6 +575,7 @@ def test_manual_and_pipeline_stages_share_completion_policy(pipeline):
         model=assets["person_detector"],
         device="cpu",
         extractor=kwargs["person_extractor"],
+        tracking_profile=release_tracking_profile(manifest),
     )
     run_player_stage(
         source,

@@ -20,11 +20,11 @@ without rescaling and receive a warning plus `non_30_fps` output flag.
 Optional inputs:
 
 ```bash
-python -m InPlay.heuristic.players \
-  --video INPUT.mp4 --output players.csv
+python -m src.workflow extract --profile rally \
+  --video INPUT.mp4 --output-dir outputs/SOURCE --calibration calibration.json
 
 python -m InPlay.heuristic.segment ... \
-  --players players.csv --court-calibration calibration.json
+  --players outputs/SOURCE/players/features.csv --court-calibration calibration.json
 ```
 
 Player activity can delay an end decision but cannot start a rally. The court

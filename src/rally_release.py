@@ -22,6 +22,11 @@ from urllib.request import urlopen
 
 import torch
 
+from InPlay.heuristic.person_tracks import (
+    BOTSORT_CONTINUOUS,
+    BYTETRACK_PERIODIC,
+    PLAYER_TRACKING_PROFILES,
+)
 from src.rtmpose import (
     DEFAULT_RTMPOSE_MODEL_NAME, RTMPOSE_BACKEND_TYPE, RTMPOSE_CROP_PADDING,
     open_session, validate_fp16_halpe26_model,
@@ -79,6 +84,15 @@ CONTRACT_FIELDS = (
     "preprocessing",
     "runtime_versions",
 )
+
+
+def release_tracking_profile(manifest: Mapping[str, Any]) -> str:
+    """Resolve the profile for new manifests and the two published recipes."""
+    if "tracking_profile" in manifest["preprocessing"]:
+        return manifest["preprocessing"]["tracking_profile"]
+    if manifest["model_id"] == "rally-seven-source-yolo26-v1":
+        return BOTSORT_CONTINUOUS
+    return BYTETRACK_PERIODIC
 
 
 def sha256_file(path: Path) -> str:
@@ -173,8 +187,10 @@ def validate_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
     expected_preprocessing = set(defaults)
     if not legacy:
         expected_preprocessing.add("pose_model_sha256")
-    if set(preprocessing) != expected_preprocessing:
+    if set(preprocessing) - {"tracking_profile"} != expected_preprocessing:
         raise ValueError("release preprocessing fields are incompatible")
+    if release_tracking_profile(value) not in PLAYER_TRACKING_PROFILES:
+        raise ValueError("unsupported release tracking profile")
     for name in (
         "pose_coordinate_mode",
         "pose_backend",

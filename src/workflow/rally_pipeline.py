@@ -58,7 +58,11 @@ def run_pipeline(
         raise ValueError("--checkpoint and --model-manifest must be supplied together")
     resolved_device = select_device(device)
 
-    from src.rally_release import LEGACY_RELEASE_VERSION, resolve_release
+    from src.rally_release import (
+        LEGACY_RELEASE_VERSION,
+        release_tracking_profile,
+        resolve_release,
+    )
     from src.temporal_selector.rally_audio import rally_audio_runtime
     from src.temporal_selector.rally_dataset import RallySourceConfig
     from src.temporal_selector.rally_features import rally_feature_view
@@ -70,6 +74,7 @@ def run_pipeline(
     model, manifest, assets = resolve_release(
         model_id, checkpoint=checkpoint, manifest=model_manifest, cache_dir=cache_dir
     )
+    tracking_profile = release_tracking_profile(manifest)
     rtmpose = manifest["schema_version"] != LEGACY_RELEASE_VERSION
     source_resolver = resolve_rally_30fps_source if rtmpose else resolve_source
     source = source_resolver(
@@ -109,6 +114,7 @@ def run_pipeline(
         force=force or "person" in rebuild,
         extractor=person_extractor,
         extractor_identity=person_backend_identity,
+        tracking_profile=tracking_profile,
     )
     pose_asset = assets["pose_model" if rtmpose else "pose_landmarker"]
     players_changed = run_player_stage(
@@ -120,6 +126,7 @@ def run_pipeline(
         force=force or person_changed or "pose" in rebuild,
         interpreter=player_interpreter,
         interpreter_identity=pose_backend_identity,
+        tracking_profile=tracking_profile,
     )
     prediction_inputs = {
         "identity": identity.fingerprint,

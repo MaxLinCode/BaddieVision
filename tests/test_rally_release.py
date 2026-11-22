@@ -71,6 +71,19 @@ def exported(tmp_path, request):
     return model, manifest, json.loads(manifest.read_text())
 
 
+def test_existing_and_explicit_release_tracking_profiles(exported):
+    from InPlay.heuristic.person_tracks import BOTSORT_CONTINUOUS, BYTETRACK_PERIODIC
+    from src.rally_release import release_tracking_profile
+
+    manifest = {"model_id": "rally-six-source-v1", "preprocessing": {}}
+    assert release_tracking_profile(manifest) == BYTETRACK_PERIODIC
+    manifest["model_id"] = "rally-seven-source-yolo26-v1"
+    assert release_tracking_profile(manifest) == BOTSORT_CONTINUOUS
+    manifest["model_id"] = "new-release"
+    manifest["preprocessing"]["tracking_profile"] = BOTSORT_CONTINUOUS
+    assert release_tracking_profile(manifest) == BOTSORT_CONTINUOUS
+
+
 @pytest.mark.parametrize("exported", ("full", "full_audio", "full_audio_zscore"), indirect=True)
 def test_export_retains_predictions_without_private_metadata(exported):
     original, manifest_path, manifest = exported

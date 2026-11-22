@@ -8,6 +8,8 @@ import sys
 import subprocess
 from pathlib import Path
 
+from InPlay.heuristic.person_tracks import BOTSORT_CONTINUOUS, PLAYER_TRACKING_PROFILES
+
 from .registry import SourceCatalog
 
 
@@ -62,7 +64,10 @@ def _parser() -> argparse.ArgumentParser:
     calibrate.add_argument("--preview", type=Path)
     people = stage_commands.add_parser("person-tracks")
     people.add_argument("--source", required=True)
-    people.add_argument("--model", default="yolov8n.pt")
+    people.add_argument("--model", help="person detector weights or TensorRT engine")
+    people.add_argument(
+        "--tracking-profile", choices=PLAYER_TRACKING_PROFILES, default=BOTSORT_CONTINUOUS
+    )
     people.add_argument("--force", action="store_true")
     people.add_argument(
         "--device", choices=("auto", "cpu", "mps", "cuda"), default="auto"
@@ -74,6 +79,7 @@ def _parser() -> argparse.ArgumentParser:
     players.add_argument("--pose-crop-padding", type=float)
     players.add_argument("--pose-backend", choices=("mediapipe", "rtmpose"), default="mediapipe")
     players.add_argument("--pose-device", choices=("cpu", "cuda"))
+    players.add_argument("--tracking-profile", choices=PLAYER_TRACKING_PROFILES)
     check = stage_commands.add_parser("check")
     check.add_argument("--source", required=True)
     check.add_argument(
@@ -100,7 +106,7 @@ def _parser() -> argparse.ArgumentParser:
     extract.add_argument(
         "--profile", choices=("observations", "rally"), default="observations"
     )
-    extract.add_argument("--person-model", default="yolov8n.pt")
+    extract.add_argument("--person-model", help="person detector weights or TensorRT engine")
     extract.add_argument("--pose-model", type=Path)
     extract.add_argument("--model-root", type=Path)
     extract.add_argument(
@@ -394,6 +400,7 @@ def main(argv: list[str] | None = None) -> int:
                 model=args.model,
                 device=select_device(args.device),
                 force=args.force,
+                tracking_profile=args.tracking_profile,
             )
             print(source.person_tracks_path)
             return 0
@@ -407,6 +414,7 @@ def main(argv: list[str] | None = None) -> int:
                 pose_backend=args.pose_backend,
                 pose_device=args.pose_device,
                 force=args.force,
+                tracking_profile=args.tracking_profile,
             )
             print(source.assignments_path)
             return 0
