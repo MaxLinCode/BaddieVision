@@ -333,3 +333,37 @@ def test_mps_loss_is_finite_when_host_exposes_mps() -> None:
     model = RallySegmenter(_config()).to(device)
     losses = model.losses(_batch().to(device))
     assert bool(torch.isfinite(losses.total))
+
+
+def test_mixed_fps_camera_split_keeps_guard_in_seconds() -> None:
+    windows = [
+        *(_window("slow", frame, fps=10) for frame in range(100)),
+        *(_window("fast", frame, fps=20) for frame in range(100)),
+    ]
+    train, validation, split = chronological_camera_train_validation_split(
+        windows, {"camera": ("slow", "fast")}, guard_seconds=1.0,
+    )
+
+    assert len(train) == 120
+    assert train[-1].window_id == "fast-19"
+    assert len(validation) == 40
+    assert validation[0].window_id == "fast-60"
+    assert split["cameras"]["camera"]["cut_seconds"] == 12
+
+
+def test_mixed_fps_camera_split_includes_exact_fractional_boundary() -> None:
+    windows = [
+        *(_window("early", frame, fps=24, frame_count=120) for frame in range(120)),
+        *(_window("late", frame, fps=25, frame_count=175) for frame in range(175)),
+    ]
+    train, validation, _ = chronological_camera_train_validation_split(
+        windows, {"camera": ("early", "late")}, guard_seconds=1.0,
+    )
+
+    assert [window.window_id for window in train] == [
+        *(f"early-{frame}" for frame in range(120)),
+        *(f"late-{frame}" for frame in range(90)),
+    ]
+    assert [window.window_id for window in validation] == [
+        f"late-{frame}" for frame in range(140, 175)
+    ]
