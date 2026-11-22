@@ -195,7 +195,9 @@ class RallySegmenterConfig:
             raise ValueError("dropout must be in [0, 1)")
         if self.layer_norm_eps <= 0:
             raise ValueError("layer_norm_eps must be positive")
-        if self.audio_attention and self.frame_feature_dim != RALLY_FEATURE_VIEWS["full_audio"].dimension:
+        if self.audio_attention and self.frame_feature_dim not in {
+            view.dimension for view in RALLY_FEATURE_VIEWS.values() if view.uses_audio
+        }:
             raise ValueError("audio attention requires the full visual and audio features")
 
 

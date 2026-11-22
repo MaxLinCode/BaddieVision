@@ -440,6 +440,7 @@ def test_pipeline_uses_manifest_feature_view(pipeline, view):
     kwargs, _ = pipeline
     config = RallySegmenterConfig(
         frame_feature_dim=RALLY_FEATURE_VIEWS[view].dimension,
+        audio_attention=RALLY_FEATURE_VIEWS[view].uses_audio,
         token_size=8,
         num_layers=1,
         num_attention_heads=2,
