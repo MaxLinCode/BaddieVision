@@ -5,7 +5,7 @@ The maintained candidate-free experiment accepts ordinary training settings:
 ```bash
 python -m src.temporal_selector.rally_experiment \
   --config config/rally-experiment.example.json \
-  --output-dir outputs/rally-cpu-smoke --clean-only \
+  --output-dir outputs/rally-cpu-smoke --clean-only --feature-view full_audio_zscore \
   --device cpu --epochs 1 --batch-size 2 --learning-rate 0.001
 ```
 
@@ -42,3 +42,44 @@ Epoch recovery applies to the maintained clean-only fold and production
 trainers. The comparative historical study arms accept recipe overrides but
 do not support `--resume`. Recovery does not claim identical results across
 different accelerator/runtime versions or nondeterministic device kernels.
+
+## Compare vision and audio
+
+The `full_audio_zscore` view appends seven normalized audio features to the
+`full` visual view. It reads the first audio stream with FFmpeg and FFprobe and uses
+video presentation timestamps to align the audio, including when frame spacing
+varies. The features capture RMS, peak level, power in four frequency bands,
+and positive spectral flux. A 48 ms window centered on each video frame's
+display interval captures short transients such as shuttle hits and shoe
+squeaks. The model's feature-validity mask marks windows as invalid when they
+overlap gaps or fall outside the recorded audio. Recorded silence remains
+valid. Spectral flux requires coverage in both analysis windows. The
+transformer masks missing audio tokens in attention while retaining the
+corresponding video tokens.
+The run records audio coverage per source.
+
+Run both views with the same source config, device, seed, and training settings.
+Supply a local config that points to source recordings with their original
+audio and to the matching annotations and player observations.
+
+```bash
+for view in full full_audio_zscore; do
+  python -m src.temporal_selector.rally_experiment \
+    --config config/rally-experiment.local.json --clean-only \
+    --feature-view "$view" --output-dir "outputs/rally-${view}"
+done
+```
+
+Compare `macro.interval_f1`, `macro.boundary_mae`, false splits, and false merges
+in each run's `metrics.json`. Check `by_camera` for performance on each held-out
+camera and `dataset_manifest.audio_coverage` for the number of observed frames
+per source. The checkpoint and release manifest identify the feature view
+automatically. Export the trained checkpoint with
+[the existing inference exporter](rally-inference.md#export-the-existing-production-checkpoint)
+and use its manifest for prediction.
+
+The z-score view uses the trailing ten seconds of observed values for each
+channel and emits zero when there is insufficient history or variance.
+Validation starts a fresh audio history at its first context frame.
+Use `full_audio` to compare against raw features with the same attention
+architecture and camera splits.

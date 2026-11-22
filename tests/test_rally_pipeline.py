@@ -351,9 +351,9 @@ def test_explicit_device_failure_and_auto_fallback(pipeline, monkeypatch):
     assert calls == {"person": 0, "players": 0}
 
 
-def test_pipeline_uses_manifest_feature_view(pipeline):
+@pytest.mark.parametrize("view", ["no_position", "full_audio"])
+def test_pipeline_uses_manifest_feature_view(pipeline, view):
     kwargs, _ = pipeline
-    view = "no_position"
     config = RallySegmenterConfig(
         frame_feature_dim=RALLY_FEATURE_VIEWS[view].dimension,
         token_size=8,

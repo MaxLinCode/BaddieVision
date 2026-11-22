@@ -25,13 +25,17 @@ from src.temporal_selector.rally import (
     RallyTrainingRecipe,
     rally_checkpoint,
 )
+from src.temporal_selector.rally_features import rally_feature_view
 
 
 @pytest.fixture
-def exported(tmp_path):
+def exported(tmp_path, request):
+    feature_view = getattr(request, "param", "full")
     torch.manual_seed(17)
     model = RallySegmenter(
         RallySegmenterConfig(
+            frame_feature_dim=rally_feature_view(feature_view).dimension,
+            audio_attention=rally_feature_view(feature_view).uses_audio,
             token_size=8,
             num_layers=1,
             num_attention_heads=2,
@@ -41,6 +45,7 @@ def exported(tmp_path):
     ).eval()
     checkpoint = rally_checkpoint(
         model,
+        feature_view=feature_view,
         dataset_fingerprint="private-dataset-id",
         annotation_fingerprint="private-labels-id",
         split_manifest={"private-recording": ["/private/video.mp4"]},
@@ -66,13 +71,15 @@ def exported(tmp_path):
     return model, manifest, json.loads(manifest.read_text())
 
 
+@pytest.mark.parametrize("exported", ("full", "full_audio", "full_audio_zscore"), indirect=True)
 def test_export_retains_predictions_without_private_metadata(exported):
     original, manifest_path, manifest = exported
     checkpoint = manifest_path.parent / "rally-segmenter.pt"
     restored, value = load_release(checkpoint, manifest_path)
+    dim = original.config.frame_feature_dim
     batch = RallyBatch(
-        frame_values=torch.randn(1, 3, 154),
-        frame_validity=torch.ones((1, 3, 154), dtype=torch.bool),
+        frame_values=torch.randn(1, 3, dim),
+        frame_validity=torch.ones((1, 3, dim), dtype=torch.bool),
         relative_time_seconds=torch.tensor([[-0.1, 0.0, 0.1]]),
         frame_mask=torch.ones((1, 3), dtype=torch.bool),
         inplay_targets=torch.full((1, 3), -100, dtype=torch.long),

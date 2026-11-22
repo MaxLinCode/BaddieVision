@@ -48,6 +48,11 @@ Model and performance options:
 - `--no-overlay`: produce predictions and CSV without an MP4.
 - `--force`: regenerate stages whose inputs or outputs no longer match receipts.
 
+Local checkpoints trained with `full_audio_zscore` or `full_audio`
+use the first audio stream and require both FFmpeg
+and FFprobe. The manifest selects audio extraction automatically. For
+audio-model evaluation, keep the recording's synchronized audio track.
+
 The full video retains its source-local frame numbering. CSV endpoints are
 inclusive and start at zero. No rallies is a successful header-only CSV. Inference
 never reads canonical training labels or writes reviewed annotations.
