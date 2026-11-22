@@ -5,7 +5,7 @@ The maintained candidate-free experiment accepts ordinary training settings:
 ```bash
 python -m src.temporal_selector.rally_experiment \
   --config config/rally-experiment.example.json \
-  --output-dir outputs/rally-cpu-smoke --clean-only \
+  --output-dir outputs/rally-cpu-smoke --clean-only --feature-view full_audio_zscore \
   --device cpu --epochs 1 --batch-size 2 --learning-rate 0.001
 ```
 
@@ -45,21 +45,25 @@ different accelerator/runtime versions or nondeterministic device kernels.
 
 ## Compare vision and audio
 
-The opt-in `full_audio` view appends seven features to the default `full`
-visual view. It reads the first audio stream with FFmpeg and FFprobe and uses
+The `full_audio_zscore` view appends seven normalized audio features to the
+`full` visual view. It reads the first audio stream with FFmpeg and FFprobe and uses
 video presentation timestamps to align the audio, including when frame spacing
 varies. The features capture RMS, peak level, power in four frequency bands,
 and positive spectral flux. A 48 ms window centered on each video frame's
 display interval captures short transients such as shuttle hits and shoe
-squeaks. Clips with no audio and windows outside audio coverage use the model's
-existing feature-validity mask. The run records audio coverage per source.
+squeaks. The model's feature-validity mask marks windows as invalid when they
+overlap gaps or fall outside the recorded audio. Recorded silence remains
+valid. Spectral flux requires coverage in both analysis windows. The
+transformer masks missing audio tokens in attention while retaining the
+corresponding video tokens.
+The run records audio coverage per source.
 
 Run both views with the same source config, device, seed, and training settings.
 Supply a local config that points to source recordings with their original
 audio and to the matching annotations and player observations.
 
 ```bash
-for view in full full_audio; do
+for view in full full_audio_zscore; do
   python -m src.temporal_selector.rally_experiment \
     --config config/rally-experiment.local.json --clean-only \
     --feature-view "$view" --output-dir "outputs/rally-${view}"
@@ -74,36 +78,8 @@ automatically. Export the trained checkpoint with
 [the existing inference exporter](rally-inference.md#export-the-existing-production-checkpoint)
 and use its manifest for prediction.
 
-### Rolling normalization and audio dropout
-
-Use `full_audio_zscore` to standardize all seven audio channels over the trailing
-10 seconds of the source recording. Each channel uses only its observed samples,
-with windows shortened at the start of a recording. Invalid entries stay masked.
-Constant or single-observation histories emit zero. Validation and inference use
-the same timestamp-based normalization.
-
-```bash
-python -m src.temporal_selector.rally_experiment \
-  --config config/rally-experiment.local.json --clean-only \
-  --feature-view full_audio_zscore --audio-dropout 0.4 \
-  --output-dir outputs/rally-audio-zscore
-```
-
-The dropout probability applies independently each time a training window is
-sampled. A dropped window has zero values and false validity for all audio
-channels across all its frames. Validation, held-out scoring, and inference use
-the available audio. The resolved recipe and recovery checkpoints record the
-dropout probability.
-
-### Centered spectral-flux baseline
-
-The `full_audio_centered_flux` view keeps log RMS, log peak, and the four
-spectral power bands at their original scales. It replaces spectral flux with
-its positive excess above the median of observed flux in a centered 1.5-second
-window. The scale is 1.4826 times the median absolute deviation, with a floor
-of 0.05 in the original log-flux units. The result is capped at 8. The same
-normalization applies during training and offline inference.
-
-Run this view with `--clean-only --feature-view full_audio_centered_flux
---audio-dropout 0` to compare the centered baseline directly with the raw
-`full_audio` view under the same training recipe.
+The z-score view uses the trailing ten seconds of observed values for each
+channel and emits zero when there is insufficient history or variance.
+Validation starts a fresh audio history at its first context frame.
+Use `full_audio` to compare against raw features with the same attention
+architecture and camera splits.

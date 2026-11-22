@@ -36,13 +36,11 @@ from .training import (
 )
 from .model import JointRallyShuttleModel
 from .rally import (
-    RallyBatch,
     RallySegmenter,
     RallySegmenterConfig,
     RallyTrainingRecipe,
     rally_checkpoint,
 )
-from .rally_audio import RALLY_AUDIO_FEATURE_NAMES
 from .rally_dataset import (
     RallyDataConfig,
     RallyWindow,
@@ -62,7 +60,7 @@ from .rally_evaluation import (
     rally_metrics,
     tune_rally_decoder,
 )
-from .rally_features import FULL_RALLY_FEATURE_NAMES, RALLY_FEATURE_VIEWS, rally_feature_view
+from .rally_features import RALLY_FEATURE_VIEWS, rally_feature_view
 
 
 class _RallyBatchSampler(Sampler[list[int]]):
@@ -307,17 +305,6 @@ def _window_identity(windows: Sequence[RallyWindow]) -> str:
     return digest.hexdigest()
 
 
-def _drop_rally_audio(
-    batch: RallyBatch, probability: float, generator: torch.Generator
-) -> None:
-    """Drop the entire audio modality for independently selected training windows."""
-    dropped = torch.rand(batch.frame_values.shape[0], generator=generator) < probability
-    audio_start = len(FULL_RALLY_FEATURE_NAMES)
-    # The model consumes feature values and validity as separate inputs.
-    batch.frame_values[dropped, :, audio_start:] = 0
-    batch.frame_validity[dropped, :, audio_start:] = False
-
-
 def train_rally_segmenter(
     model: RallySegmenter,
     train_windows: Sequence[RallyWindow],
@@ -331,7 +318,6 @@ def train_rally_segmenter(
     learning_rate: float = 3e-4,
     gradient_clip_norm: float = 1.0,
     sampling: str = "boundary_balanced",
-    audio_dropout: float = 0.0,
     recovery_path: Path | None = None,
     resume: bool = False,
     recovery_identity: Mapping[str, Any] | None = None,
@@ -351,12 +337,7 @@ def train_rally_segmenter(
         gradient_clip_norm=gradient_clip_norm,
         sampling=sampling,
         device=device.type,
-        audio_dropout=audio_dropout,
     )
-    if audio_dropout and model.config.frame_feature_dim != (
-        len(FULL_RALLY_FEATURE_NAMES) + len(RALLY_AUDIO_FEATURE_NAMES)
-    ):
-        raise ValueError("audio dropout requires an audio feature view")
     if not train_windows or (validation_windows is not None and not validation_windows):
         raise ValueError(
             "rally training requires nonempty training and designated validation partitions"
@@ -408,7 +389,7 @@ def train_rally_segmenter(
         ):
             raise ValueError("not a compatible rally recovery checkpoint")
         saved_identity = checkpoint["identity"]
-        saved_identity["recipe"].setdefault("audio_dropout", 0.0)
+        saved_identity["model_config"].setdefault("audio_attention", False)
         if saved_identity != identity:
             raise ValueError(
                 "recovery configuration, data or split identity has changed"
@@ -428,13 +409,7 @@ def train_rally_segmenter(
         model.train()
         sums = [0.0, 0.0, 0.0, 0.0]
         batch_count = 0
-        # Seed separately from model randomness and the window sampler.
-        generator = (
-            torch.Generator().manual_seed(seed + epochs + epoch) if audio_dropout else None
-        )
         for batch in loader:
-            if generator is not None:
-                _drop_rally_audio(batch, audio_dropout, generator)
             batch = batch.to(device)
             optimizer.zero_grad(set_to_none=True)
             losses = model.losses(
@@ -668,8 +643,6 @@ def _prepare_rally_run(
                 "resume cannot verify the original camera order from a version 1 run; "
                 "start a new run in a different output directory"
             )
-        if isinstance(previous.get("training_recipe"), dict):
-            previous["training_recipe"].setdefault("audio_dropout", 0.0)
         if previous != configuration:
             raise ValueError("resume configuration or dataset identity has changed")
     else:
@@ -1018,9 +991,6 @@ def run_clean_rally_experiment(
     recipe = recipe or RallyTrainingRecipe()
     device = device or torch.device(recipe.device)
     recipe = replace(recipe, device=device.type)
-    feature_view = rally_dataset.feature_view
-    if recipe.audio_dropout and not feature_view.uses_audio:
-        raise ValueError("audio dropout requires an audio feature view")
     output_dir, camera_sources = _prepare_rally_run(
         output_dir, rally_dataset, recipe, camera_sources, resume=resume
     )
@@ -1029,7 +999,10 @@ def run_clean_rally_experiment(
     test_rows: list[dict[str, Any]] = []
     selected_epochs: list[int] = []
     fold_artifacts = []
-    model_config = RallySegmenterConfig(frame_feature_dim=feature_view.dimension)
+    feature_view = rally_dataset.feature_view
+    model_config = RallySegmenterConfig(
+        frame_feature_dim=feature_view.dimension, audio_attention=feature_view.uses_audio
+    )
     calibration_fingerprints = {
         source: str(value["calibration_sha256"])
         for source, value in rally_dataset.manifest["sources"].items()
@@ -1042,6 +1015,8 @@ def run_clean_rally_experiment(
         train, validation, split = chronological_camera_train_validation_split(
             eligible, _training_camera_groups(fold, camera_sources), guard_seconds=1.0
         )
+        if feature_view.audio_zscore:
+            validation = rally_dataset.reset_validation_audio_history(validation)
         test = [window for window in rally_dataset.windows
                 if window.source_id in fold.test_source_ids]
         if not validation or not test:
@@ -1071,7 +1046,6 @@ def run_clean_rally_experiment(
             learning_rate=recipe.learning_rate,
             gradient_clip_norm=recipe.gradient_clip_norm,
             sampling=recipe.sampling,
-            audio_dropout=recipe.audio_dropout,
             recovery_path=fold_dir / "training-recovery.pt",
             resume=resume,
             recovery_identity={
@@ -1128,7 +1102,6 @@ def run_clean_rally_experiment(
         learning_rate=recipe.learning_rate,
         gradient_clip_norm=recipe.gradient_clip_norm,
         sampling=recipe.sampling,
-        audio_dropout=recipe.audio_dropout,
         recovery_path=output_dir / "production-training-recovery.pt",
         resume=resume,
         recovery_identity={
@@ -1293,7 +1266,6 @@ def train_rally_segmenter_fixed_epochs(
     learning_rate: float = 3e-4,
     gradient_clip_norm: float = 1.0,
     sampling: str = "boundary_balanced",
-    audio_dropout: float = 0.0,
     recovery_path: Path | None = None,
     resume: bool = False,
     recovery_identity: Mapping[str, Any] | None = None,
@@ -1311,7 +1283,6 @@ def train_rally_segmenter_fixed_epochs(
         learning_rate=learning_rate,
         gradient_clip_norm=gradient_clip_norm,
         sampling=sampling,
-        audio_dropout=audio_dropout,
         recovery_path=recovery_path,
         resume=resume,
         recovery_identity=recovery_identity,
@@ -1388,10 +1359,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--gradient-clip-norm", type=float)
     parser.add_argument("--boundary-aux-weight", type=float)
     parser.add_argument("--seed", type=int)
-    parser.add_argument(
-        "--audio-dropout", type=float,
-        help="Probability of masking all audio for each training window (default: 0)",
-    )
     parser.add_argument("--sampling", choices=("boundary_balanced", "uniform"))
     parser.add_argument(
         "--resume",
@@ -1432,8 +1399,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     if args.clean_only and args.candidate_inclusive_only:
         raise ValueError("choose only one rally experiment arm")
-    if recipe.audio_dropout and not args.clean_only:
-        raise ValueError("audio dropout requires --clean-only")
     if args.feature_view is not None and not args.clean_only:
         raise ValueError("--feature-view requires --clean-only")
     if args.clean_only:

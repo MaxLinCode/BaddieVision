@@ -11,6 +11,7 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 from .batch import MASKED_TARGET
+from .rally_audio import RALLY_AUDIO_FEATURE_NAMES
 from .rally_features import (
     RALLY_FEATURE_SCHEMA,
     RALLY_FEATURE_VERSION,
@@ -29,7 +30,7 @@ class RallyBatch:
 
     This contract deliberately has no shuttle-candidate fields. ``frame_mask``
     distinguishes real frames from batch padding while ``frame_validity``
-    describes missing individual player/pose measurements.
+    describes missing individual visual and audio measurements.
     """
 
     frame_values: Tensor
@@ -173,6 +174,7 @@ class RallySegmenterConfig:
     norm_first: bool = True
     final_norm: bool = True
     layer_norm_eps: float = 1e-5
+    audio_attention: bool = False
 
     def __post_init__(self) -> None:
         if self.frame_feature_dim <= 0:
@@ -193,6 +195,8 @@ class RallySegmenterConfig:
             raise ValueError("dropout must be in [0, 1)")
         if self.layer_norm_eps <= 0:
             raise ValueError("layer_norm_eps must be positive")
+        if self.audio_attention and self.frame_feature_dim != RALLY_FEATURE_VIEWS["full_audio"].dimension:
+            raise ValueError("audio attention requires the full visual and audio features")
 
 
 @dataclass
@@ -241,8 +245,12 @@ class RallySegmenter(nn.Module):
     def __init__(self, config: RallySegmenterConfig | None = None) -> None:
         super().__init__()
         self.config = config or RallySegmenterConfig()
+        audio_dim = len(RALLY_AUDIO_FEATURE_NAMES) if self.config.audio_attention else 0
         self.frame_projection = _FrameProjection(
-            self.config.frame_feature_dim * 2, self.config.token_size
+            (self.config.frame_feature_dim - audio_dim) * 2, self.config.token_size
+        )
+        self.audio_projection = (
+            _FrameProjection(audio_dim * 2, self.config.token_size) if audio_dim else None
         )
         self.continuous_time_embedding = nn.Sequential(
             nn.Linear(1, self.config.token_size),
@@ -284,10 +292,13 @@ class RallySegmenter(nn.Module):
     def forward(self, batch: RallyBatch) -> RallySegmenterOutput:
         if not batch.validated:
             batch.validate(frame_feature_dim=self.config.frame_feature_dim)
+        visual_dim = self.config.frame_feature_dim
+        if self.audio_projection is not None:
+            visual_dim -= len(RALLY_AUDIO_FEATURE_NAMES)
         frame_inputs = torch.cat(
             (
-                batch.frame_values,
-                batch.frame_validity.to(batch.frame_values.dtype),
+                batch.frame_values[..., :visual_dim],
+                batch.frame_validity[..., :visual_dim].to(batch.frame_values.dtype),
             ),
             dim=-1,
         )
@@ -296,10 +307,16 @@ class RallySegmenter(nn.Module):
             batch.relative_time_seconds.unsqueeze(-1)
         )
         frames = frames + self.residual_fusion(torch.cat((frames, time), dim=-1))
-        encoded = self.transformer(
-            frames, src_key_padding_mask=~batch.frame_mask
-        )
         padding = ~batch.frame_mask
+        tokens, token_padding = frames, padding
+        if self.audio_projection is not None:
+            audio_validity = batch.frame_validity[..., visual_dim:] & batch.frame_mask.unsqueeze(-1)
+            audio_values = batch.frame_values[..., visual_dim:].masked_fill(~audio_validity, 0)
+            audio_inputs = torch.cat((audio_values, audio_validity.to(audio_values.dtype)), dim=-1)
+            audio_tokens = self.audio_projection(audio_inputs) + time
+            tokens = torch.cat((frames, audio_tokens), dim=1)
+            token_padding = torch.cat((padding, ~audio_validity.any(dim=-1)), dim=1)
+        encoded = self.transformer(tokens, src_key_padding_mask=token_padding)[:, :frames.shape[1]]
         return RallySegmenterOutput(
             self.inplay_head(encoded).masked_fill(padding, float("-inf")),
             self.rally_start_head(encoded).masked_fill(
@@ -454,7 +471,6 @@ class RallyTrainingRecipe:
     learning_rate: float = 3e-4
     gradient_clip_norm: float = 1.0
     device: str = "mps"
-    audio_dropout: float = 0.0
 
     def __post_init__(self) -> None:
         for name in ("epochs", "batch_size"):
@@ -467,8 +483,6 @@ class RallyTrainingRecipe:
             or self.seed < 0
         ):
             raise ValueError("seed must be a nonnegative integer")
-        if not 0.0 <= self.audio_dropout <= 1.0:
-            raise ValueError("audio_dropout must be between zero and one")
         if self.optimizer != "AdamW":
             raise ValueError("supported rally optimizer is AdamW")
         if self.sampling not in ("boundary_balanced", "uniform"):

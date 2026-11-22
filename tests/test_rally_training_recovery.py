@@ -13,8 +13,7 @@ from src.temporal_selector.rally import (
     RallySegmenterConfig,
     RallyTrainingRecipe,
 )
-from src.temporal_selector.rally_dataset import RallyWindow, collate_rally_windows
-from src.temporal_selector.rally_features import FULL_RALLY_FEATURE_NAMES, rally_feature_view
+from src.temporal_selector.rally_dataset import RallyWindow
 from src.temporal_selector import rally_experiment as training
 
 
@@ -34,7 +33,7 @@ def _isolate_training_randomness():
         torch.set_num_threads(thread_count)
 
 
-def _windows(dim=2):
+def _windows():
     return [
         RallyWindow(
             source_id="camera",
@@ -43,8 +42,8 @@ def _windows(dim=2):
             frame_indices=(0, 1, 2),
             owned_frames=frozenset((0, 1, 2)),
             relative_time_seconds=torch.tensor([-1.0, 0.0, 1.0]),
-            frame_values=torch.linspace(0, 1, 3 * dim).reshape(3, dim) + i,
-            frame_validity=torch.ones((3, dim), dtype=torch.bool),
+            frame_values=torch.tensor([[0.0, 1.0], [1.0, 0.0], [0.5, 0.5]]) + i,
+            frame_validity=torch.ones((3, 2), dtype=torch.bool),
             inplay_targets=torch.tensor([0, 1, 0]),
             rally_start_targets=torch.tensor([0.0, 1.0, 0.0]),
             rally_end_targets=torch.tensor([0.0, 1.0, 0.0]),
@@ -53,10 +52,10 @@ def _windows(dim=2):
     ]
 
 
-def _model(dim=2):
+def _model():
     return RallySegmenter(
         RallySegmenterConfig(
-            frame_feature_dim=dim,
+            frame_feature_dim=2,
             token_size=8,
             num_layers=1,
             num_attention_heads=2,
@@ -93,10 +92,8 @@ def test_cpu_configuration_and_historical_preset():
 
 
 @pytest.mark.parametrize("validation", [True, False])
-@pytest.mark.parametrize("audio_dropout", [0, 0.4])
-def test_epoch_resume_matches_uninterrupted_training(tmp_path, monkeypatch, validation, audio_dropout):
-    dim = rally_feature_view("full_audio_zscore").dimension if audio_dropout else 2
-    windows = _windows(dim)
+def test_epoch_resume_matches_uninterrupted_training(tmp_path, monkeypatch, validation):
+    windows = _windows()
     options = dict(
         device=torch.device("cpu"),
         epochs=3,
@@ -104,16 +101,15 @@ def test_epoch_resume_matches_uninterrupted_training(tmp_path, monkeypatch, vali
         seed=17,
         learning_rate=0.002,
         gradient_clip_norm=0.3,
-        audio_dropout=audio_dropout,
         recovery_identity={"dataset": "v1", "split": "camera-held-out"},
     )
     _seed()
-    uninterrupted = _model(dim)
+    uninterrupted = _model()
     expected = training.train_rally_segmenter(
         uninterrupted, windows, windows[:1] if validation else None, **options
     )
     _seed()
-    interrupted = _model(dim)
+    interrupted = _model()
     path = tmp_path / "recovery.pt"
     save = training._atomic_torch_save
 
@@ -134,12 +130,9 @@ def test_epoch_resume_matches_uninterrupted_training(tmp_path, monkeypatch, vali
     saved = torch.load(path, weights_only=True)
     assert saved["completed_epoch"] == saved["sampler_epoch"] == 1
     assert saved["optimizer_state_dict"]["param_groups"][0]["lr"] == 0.002
-    if not audio_dropout:
-        del saved["identity"]["recipe"]["audio_dropout"]
-        save(saved, path)
     monkeypatch.setattr(training, "_atomic_torch_save", save)
     # A fresh process/model can consume arbitrary RNG before restoring a checkpoint.
-    resumed = _model(dim)
+    resumed = _model()
     torch.rand(13)
     actual = training.train_rally_segmenter(
         resumed,
@@ -307,23 +300,3 @@ def test_camera_key_order_preserves_fold_paths_on_resume(tmp_path):
     ):
         with pytest.raises(ValueError, match="identity has changed"):
             training._prepare_rally_run(output, dataset, recipe, changed, resume=True)
-
-
-def test_audio_dropout_masks_values_and_validity_for_entire_training_window():
-    dim = rally_feature_view("full_audio_zscore").dimension
-    windows = _windows(dim) * 3
-    batch = collate_rally_windows(windows)
-    before = copy.deepcopy(batch)
-    generator = torch.Generator().manual_seed(0)
-    training._drop_rally_audio(batch, 0.4, generator)
-    audio_start = len(FULL_RALLY_FEATURE_NAMES)
-    dropped = [2, 3, 4]
-    kept = [0, 1, 5]
-    assert not batch.frame_validity[dropped, :, audio_start:].any()
-    assert not batch.frame_values[dropped, :, audio_start:].any()
-    torch.testing.assert_close(batch.frame_values[kept], before.frame_values[kept])
-    torch.testing.assert_close(batch.frame_validity[kept], before.frame_validity[kept])
-    torch.testing.assert_close(batch.frame_values[..., :audio_start], before.frame_values[..., :audio_start])
-    torch.testing.assert_close(batch.frame_validity[..., :audio_start], before.frame_validity[..., :audio_start])
-    torch.testing.assert_close(batch.inplay_targets, before.inplay_targets)
-    torch.testing.assert_close(collate_rally_windows(windows).frame_values, before.frame_values)
