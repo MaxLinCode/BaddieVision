@@ -1,11 +1,12 @@
 # Independent cross-camera rally segmenter
 
-`RallySegmenter` is the offline, centered InPlay model. It consumes only the
-154-value player/pose frame representation and its validity mask. Its batch and
-model contracts contain no shuttle candidates, candidate presence, candidate
+`RallySegmenter` is the offline, centered InPlay model. The canonical
+`full_audio_zscore_motion` view consumes a 297-value player, pose, motion, and
+audio frame representation with its validity mask. Its batch and model
+contracts contain no shuttle candidates, candidate presence, candidate
 coordinates, selector logits, or selector modules.
 
-The fixed frame schema is:
+The base 154-value visual schema is:
 
 1. P1 and P2 bounding boxes, feet, normalized court position, detector
    confidence, assignment confidence, and activity (22 values);
@@ -13,6 +14,9 @@ The fixed frame schema is:
    shoulder/torso scale with bounding-box fallbacks (132 values).
 
 Missing players and landmarks remain zero-valued with explicit false validity.
+The canonical motion view appends 136 signed velocity values for the player
+court positions and pose landmarks, followed by the seven normalized audio
+values.
 The dataset reads player assignments, pose caches, court calibration, video
 provenance, and strict rally annotations directly. It does not load a shuttle
 candidate artifact. This schema is separate from the shot-classifier schema.

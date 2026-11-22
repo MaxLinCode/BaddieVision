@@ -15,6 +15,10 @@ from src.temporal_selector.rally import (
 )
 from src.temporal_selector.rally_dataset import RallyWindow
 from src.temporal_selector import rally_experiment as training
+from src.temporal_selector.rally_features import (
+    CANONICAL_RALLY_FEATURE_VIEW,
+    RALLY_FEATURE_VIEWS,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -248,9 +252,15 @@ def test_cli_resolves_config_and_command_line_overrides(tmp_path, monkeypatch):
     assert called["resume"]
 
 
-@pytest.mark.parametrize(("dataset_overrides", "expected_seconds"), [({}, 2.0), ({"rally_context_seconds": 3.0}, 3.0)])
-def test_rtmpose_preset_uses_zscore_audio_and_defaults_to_four_second_context(
-    tmp_path, monkeypatch, dataset_overrides, expected_seconds,
+@pytest.mark.parametrize(
+    ("dataset_overrides", "expected_seconds"), [({}, 2.0), ({"rally_context_seconds": 3.0}, 3.0)]
+)
+@pytest.mark.parametrize(
+    ("cli_view", "expected_view"),
+    [(None, CANONICAL_RALLY_FEATURE_VIEW), ("full_audio_zscore", "full_audio_zscore")],
+)
+def test_rtmpose_preset_defaults_to_canonical_motion_and_allows_audio_baseline(
+    tmp_path, monkeypatch, dataset_overrides, expected_seconds, cli_view, expected_view,
 ):
     import json
 
@@ -273,14 +283,29 @@ def test_rtmpose_preset_uses_zscore_audio_and_defaults_to_four_second_context(
         smoothing_weight=k["recipe"].temporal_smoothing_weight,
         require_rtmpose=k["require_rtmpose"],
     ))
-    assert training.main([
+    arguments = [
         "--config", str(config), "--output-dir", str(tmp_path / "output"),
         "--clean-only", "--preset", "rtmpose-audio", "--device", "cpu",
-    ]) == 0
+    ]
+    if cli_view is not None:
+        arguments.extend(("--feature-view", cli_view))
+    assert training.main(arguments) == 0
     assert called == {
-        "context": expected_seconds, "feature_view": "full_audio_zscore", "smoothing_weight": 0.1,
+        "context": expected_seconds, "feature_view": expected_view, "smoothing_weight": 0.1,
         "require_rtmpose": True,
     }
+
+
+def test_example_experiment_uses_canonical_motion_view():
+    import json
+    from pathlib import Path
+
+    config = json.loads(
+        (Path(__file__).parents[1] / "config/rally-experiment.example.json").read_text()
+    )
+    assert config["dataset"]["rally_feature_view"] == CANONICAL_RALLY_FEATURE_VIEW
+    canonical = RALLY_FEATURE_VIEWS[CANONICAL_RALLY_FEATURE_VIEW]
+    assert canonical.uses_audio and canonical.audio_zscore and canonical.uses_motion
 
 
 def test_run_records_config_and_rejects_changed_resume_identity(tmp_path):

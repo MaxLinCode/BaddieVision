@@ -13,6 +13,7 @@ from .rally_audio import RALLY_AUDIO_FEATURE_NAMES
 
 RALLY_FEATURE_SCHEMA: Final = "baddievision.rally.feature_views"
 RALLY_FEATURE_VERSION: Final = 2
+CANONICAL_RALLY_FEATURE_VIEW: Final = "full_audio_zscore_motion"
 
 PLAYER_CONTEXT_FIELDS: Final = (
     "bbox_x1",
@@ -282,6 +283,7 @@ def rally_feature_indices(names: Sequence[str]) -> tuple[int, ...]:
 
 
 assert len(FULL_RALLY_FEATURE_NAMES) == 154
+assert CANONICAL_RALLY_FEATURE_VIEW in RALLY_FEATURE_VIEWS
 assert {name: view.dimension for name, view in RALLY_FEATURE_VIEWS.items()} == {
     "full": 154,
     "full_motion": 290,
