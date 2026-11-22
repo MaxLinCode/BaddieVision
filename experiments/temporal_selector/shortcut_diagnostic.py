@@ -369,8 +369,8 @@ def project_rally_windows(
     view = RALLY_FEATURE_VIEWS.get(feature_view)
     if view is None:
         raise ValueError(f"unknown rally feature view: {feature_view}")
-    if view.uses_audio:
-        raise ValueError("audio features must be compiled from the source recording")
+    if view.uses_audio or view.uses_motion:
+        raise ValueError("audio and motion features must be compiled from the source recording")
     output: list[RallyWindow] = []
     for window in windows:
         if window.frame_values.shape[-1] != len(FULL_RALLY_FEATURE_NAMES):
@@ -659,7 +659,7 @@ def run_rally_feature_ablations(
     view_results: dict[str, Any] = {}
     predictions: dict[str, list[dict[str, Any]]] = {}
     for view_name, view in RALLY_FEATURE_VIEWS.items():
-        if view.uses_audio:
+        if view.uses_audio or view.uses_motion:
             continue
         view_dir = output_dir / view_name
         view_dir.mkdir()

@@ -367,3 +367,132 @@ def test_mixed_fps_camera_split_includes_exact_fractional_boundary() -> None:
     assert [window.window_id for window in validation] == [
         f"late-{frame}" for frame in range(140, 175)
     ]
+
+
+@pytest.mark.parametrize("fps", [25.0, 30.0, 60.0])
+def test_rally_motion_uses_elapsed_time_and_masks_gaps_and_track_changes(fps) -> None:
+    from src.temporal_selector.rally_features import (
+        FULL_RALLY_FEATURE_NAMES,
+        MOTION_FEATURE_NAMES,
+        rally_feature_view,
+        rally_motion_features,
+    )
+
+    positions = torch.zeros(9, len(FULL_RALLY_FEATURE_NAMES))
+    observed = torch.ones_like(positions, dtype=torch.bool)
+    tracks = torch.ones(9, 2, dtype=torch.long)
+    tracks[4:, 0] = 2
+    time = torch.arange(9) / fps
+    positions[:, FULL_RALLY_FEATURE_NAMES.index("p1_court_x")] = -2 * time
+    joint = FULL_RALLY_FEATURE_NAMES.index("p2_pose_0_y")
+    positions[:, joint] = 3 * time
+    observed[4, joint] = False
+
+    velocity, valid = rally_motion_features(positions, observed, tracks, fps)
+    court_x = MOTION_FEATURE_NAMES.index("p1_court_velocity_x")
+    joint_y = MOTION_FEATURE_NAMES.index("p2_pose_0_velocity_y")
+    expected_valid = [False, False, False, True, False, False, False, True, True]
+    assert valid[:, court_x].tolist() == expected_valid
+    assert valid[:, joint_y].tolist() == [False, False, True, True, False, False, False, True, True]
+    assert torch.allclose(velocity[valid[:, court_x], court_x], torch.full((3,), -2.0))
+    assert torch.allclose(velocity[valid[:, joint_y], joint_y], torch.full((4,), 3.0))
+    assert torch.count_nonzero(velocity[~valid]) == 0
+
+    view = rally_feature_view("full_motion")
+    values, mask = view.select(
+        torch.cat((positions, velocity), dim=-1),
+        torch.cat((observed, valid), dim=-1),
+    )
+    assert values.shape == mask.shape == (9, 290)
+    assert torch.equal(values[:, :positions.shape[1]], positions)
+
+
+def test_rally_motion_pose_uses_crop_geometry_and_track_median_torso() -> None:
+    from src.temporal_selector.observations import frame_context
+    from src.temporal_selector.rally_features import (
+        FULL_RALLY_FEATURE_NAMES,
+        normalize_rally_motion_pose,
+    )
+
+    image_size = (640, 480)
+    crop = [85, 70, 215, 330]
+    assignment = {"slots": {"P1": {"confidence": 1, "assignment": {
+        "track_id": 1, "bbox": [100, 100, 200, 300], "foot": [150, 300],
+        "court_x": 0, "court_y": 0, "detection_confidence": 1, "activity": 0,
+    }}}}
+    observations = []
+    for frame, torso in enumerate((20, 20, 100, 40, 40)):
+        pixels = [(160, 200)] * 33
+        for left, right, y in ((11, 12, 200 - torso), (23, 24, 200)):
+            pixels[left], pixels[right] = (140, y), (160, y)
+        landmarks = [
+            {"x": (x - crop[0]) / (crop[2] - crop[0]),
+             "y": (y - crop[1]) / (crop[3] - crop[1]),
+             "visibility": 0 if (frame, index) == (4, 24) else 1}
+            for index, (x, y) in enumerate(pixels)
+        ]
+        track = 1 if frame < 3 else 2
+        assignment["slots"]["P1"]["assignment"]["track_id"] = track
+        poses = {(frame, track): {
+            "status": "detected", "pose_bbox": crop, "pose_landmarks": landmarks,
+        }}
+        observations.append(frame_context(assignment, poses, frame, image_size, "full_context", 0.5, "image"))
+    values, valid = map(torch.tensor, zip(*observations))
+    track_ids = torch.tensor([[1, -1], [1, -1], [1, -1], [2, -1], [2, -1]])
+    normalize_rally_motion_pose(values, valid, track_ids, image_size)
+    wrist_x = FULL_RALLY_FEATURE_NAMES.index("p1_pose_15_x")
+    assert values[:, wrist_x].tolist() == pytest.approx([0.5, 0.5, 0.5, 0.25, 0.0])
+    assert valid[:, wrist_x].tolist() == [True, True, True, True, False]
+
+
+def test_court_median_gates_low_quality_frames_without_filtering_velocity() -> None:
+    from src.temporal_selector.rally_features import (
+        FULL_RALLY_FEATURE_NAMES,
+        MOTION_FEATURE_NAMES,
+        rally_motion_features,
+        smooth_rally_court_positions,
+    )
+
+    values = torch.zeros(9, len(FULL_RALLY_FEATURE_NAMES))
+    valid = torch.ones_like(values, dtype=torch.bool)
+    tracks = torch.ones(9, 2, dtype=torch.long)
+    tracks[7:, 0] = 2
+    court_x = FULL_RALLY_FEATURE_NAMES.index("p1_court_x")
+    other_x = FULL_RALLY_FEATURE_NAMES.index("p2_court_x")
+    values[:, court_x] = torch.tensor([0., 0., 10., 0., 0., 8., 0., 7., 0.])
+    valid[6, court_x] = False
+    values[:, other_x] = torch.arange(len(values))
+    original_mask = valid.clone()
+
+    reliable = torch.ones_like(tracks, dtype=torch.bool)
+    reliable[2, 0] = False
+    velocity, mask = rally_motion_features(values, valid, tracks, fps=30)
+    smooth_rally_court_positions(values, valid, tracks, reliable)
+    assert values[2, court_x] == 10
+
+    reliable[2, 0] = True
+    smooth_rally_court_positions(values, valid, tracks, reliable)
+    assert values[:, court_x].tolist() == [0., 0., 0., 0., 0., 8., 0., 7., 0.]
+    assert torch.equal(values[:, other_x], torch.arange(len(values)))
+    assert torch.equal(valid, original_mask)
+
+    court_vx = MOTION_FEATURE_NAMES.index("p1_court_velocity_x")
+    assert mask[3, court_vx]
+    assert velocity[3, court_vx] == 30
+    assert not mask[6:, court_vx].any()
+
+
+
+def test_court_foot_reliability_requires_two_visible_feet_and_accepted_pose() -> None:
+    from src.temporal_selector.rally_dataset import _reliable_court_foot
+
+    landmarks = [{"visibility": 0.0, "x": 0.4, "y": 0.8} for _ in range(33)]
+    pose = {"status": "detected", "pose_landmarks": landmarks}
+    landmarks[31]["visibility"] = 0.8
+    assert not _reliable_court_foot({}, pose, 0.5)
+    landmarks[32]["visibility"] = 0.8
+    assert _reliable_court_foot({}, pose, 0.5)
+    assert not _reliable_court_foot({}, pose, 0.9)
+    assert not _reliable_court_foot({"foot_diagnostic": {"status": "disagrees"}}, pose, 0.5)
+    assert _reliable_court_foot({}, dict(pose, temporal_status="validated"), 0.5)
+    assert not _reliable_court_foot({}, dict(pose, temporal_status="interpolated_single_gap"), 0.5)

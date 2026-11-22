@@ -152,3 +152,36 @@ Each fold tunes a higher rally entry threshold and a lower continuation
 threshold on its validation frames.
 The production checkpoint freezes both thresholds using out-of-fold
 predictions, along with the gap and minimum-duration settings.
+
+## Joint and court velocity experiment
+
+Use `--clean-only --feature-view full_motion` to add signed x/y velocity for
+each pose landmark and each player's court position. Use
+`full_audio_zscore_motion` for the corresponding normalized-audio recipe.
+Both views use the existing court-centered coordinate convention, with the
+court center at zero and the outer lines at ±1 along each axis. Coordinates
+can extend beyond the lines. A centered three-frame median on each court
+axis suppresses isolated spikes in the position channels. It uses one frame
+of lookahead within the offline source or split clip. All three samples must
+be valid, belong to the same track, and have an accepted, unrepaired pose with
+visible landmarks on both feet. An available foot diagnostic must not
+disagree with the assigned side and court bounds. Other positions retain
+their original values and masks.
+
+The motion views map crop landmarks back to image pixels using the exact
+stored crop box. They center pose on the midpoint of the hips and normalize
+by the median visible shoulder-midpoint to hip-midpoint distance for that
+player track within the source or split clip. Frames with either hip missing
+or no usable track torso scale have masked pose features.
+
+Joint velocity uses a trailing three-frame slope and court velocity uses
+four raw projected positions before the median. Slopes are per second, in torso-length units for joints and
+court half-width or half-length units for court position. A velocity requires
+all samples in its window to be valid and on the same track. Motion is computed
+before slicing overlapping model windows.
+
+Compare motion views on the same camera folds and source artifacts, with the
+training recipe fixed. Report interval F1 and signed start/end errors by
+camera. The motion views change both pose normalization and velocity
+channels, so comparisons against the original views measure their combined
+effect. The filter windows span less time at higher FPS.
