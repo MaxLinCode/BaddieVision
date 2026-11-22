@@ -6,9 +6,38 @@ import argparse
 import json
 from pathlib import Path
 
-from InPlay.heuristic.person_tracks import extract_person_tracks
-from InPlay.heuristic.player_interpretation import interpret_players
+from src.workflow.artifacts import atomic_write_json, calibration_fingerprint
+from src.workflow.registry import SourceEntry
 from src.workflow.source import select_device
+from src.workflow.stages import run_person_stage, run_player_stage
+
+
+def _prepare_source(
+    source_id: str,
+    video: Path,
+    calibration: Path,
+    artifact_root: Path,
+) -> SourceEntry:
+    if calibration.name != "calibration.json" or calibration.parent.name != "court":
+        raise ValueError("retracking requires canonical court/calibration.json inputs")
+    original = SourceEntry(source_id, video, calibration.parent.parent)
+    if artifact_root == original.artifact_root:
+        raise ValueError("retracking output must use a separate artifact root")
+    calibration_fingerprint(original)
+
+    source = SourceEntry(source_id, video, artifact_root)
+    for original_path, snapshot in (
+        (original.identity_path, source.identity_path),
+        (original.calibration_path, source.calibration_path),
+    ):
+        value = json.loads(original_path.read_text(encoding="utf-8"))
+        if not snapshot.exists():
+            atomic_write_json(snapshot, value)
+        elif json.loads(snapshot.read_text(encoding="utf-8")) != value:
+            raise ValueError(
+                f"source inputs changed for {source_id}; use a new output directory"
+            )
+    return source
 
 
 def main() -> int:
@@ -26,7 +55,7 @@ def main() -> int:
     args = parser.parse_args()
 
     config_path = args.config.resolve()
-    config = json.loads(config_path.read_text())
+    config = json.loads(config_path.read_text(encoding="utf-8"))
     dataset = config["dataset"]
     source_ids = [source["source_id"] for source in dataset["sources"]]
     if (
@@ -46,41 +75,30 @@ def main() -> int:
     output.mkdir(parents=True, exist_ok=True)
     device = select_device(args.device)
     for key in ("rally_intervals_path", "rally_manifest_path"):
-        dataset[key] = str((config_path.parent / dataset[key]).resolve())
-    for source in dataset["sources"]:
-        source_id = source["source_id"]
-        for key in ("video_path", "calibration_path"):
-            source[key] = str((config_path.parent / source[key]).resolve(strict=True))
-        root = output / "sources" / source_id
-        root.mkdir(parents=True, exist_ok=True)
-        tracks = root / "person_tracks.jsonl"
-        poses = root / "poses.jsonl"
-        assignments = root / "assignments.jsonl"
-        players_csv = root / "players.csv"
-        if not tracks.is_file():
-            print(f"{source_id}: tracking", flush=True)
-            partial = tracks.with_suffix(".partial.jsonl")
-            extract_person_tracks(
-                source["video_path"], partial, args.model, device=device
-            )
-            partial.replace(tracks)
-        if not all(path.is_file() for path in (assignments, poses, players_csv)):
-            print(f"{source_id}: assigning players and extracting pose", flush=True)
-            interpret_players(
-                source["video_path"],
-                tracks,
-                source["calibration_path"],
-                poses,
-                assignments,
-                players_csv,
-                pose_model_asset=args.pose_model,
-            )
-        source["assignments_path"] = str(assignments)
-        source["pose_cache_path"] = str(poses)
+        dataset[key] = str((config_path.parent / Path(dataset[key]).expanduser()).resolve())
+    for entry in dataset["sources"]:
+        source_id = entry["source_id"]
+        video = (
+            config_path.parent / Path(entry["video_path"]).expanduser()
+        ).resolve(strict=True)
+        calibration = (
+            config_path.parent / Path(entry["calibration_path"]).expanduser()
+        ).resolve(strict=True)
+        source = _prepare_source(
+            source_id, video, calibration, output / "sources" / source_id
+        )
+        print(f"{source_id}: checking person tracks", flush=True)
+        run_person_stage(source, model=args.model, device=device)
+        print(f"{source_id}: checking player assignments and poses", flush=True)
+        run_player_stage(source, pose_model=args.pose_model)
+        entry.update(
+            video_path=str(source.video_path),
+            calibration_path=str(source.calibration_path),
+            assignments_path=str(source.assignments_path),
+            pose_cache_path=str(source.pose_cache_path),
+        )
         print(f"{source_id}: complete", flush=True)
-    pending_config = output / "experiment.partial.json"
-    pending_config.write_text(json.dumps(config, indent=2) + "\n")
-    pending_config.replace(output / "experiment.json")
+    atomic_write_json(output / "experiment.json", config)
     return 0
 
 

@@ -942,3 +942,71 @@ def test_status_reports_committed_pose_work_after_interruption(pipeline, capsys)
     assert stage["committed_work"]["retained_unit_count"] == 1
     assert stage["committed_work"]["last_committed_unit"]["frame"] == 3
     assert stage["committed_work"]["last_committed_unit"]["track_id"] == 7
+
+
+def test_retracking_resume_verifies_inputs_and_committed_outputs(pipeline, monkeypatch):
+    from InPlay.heuristic import person_tracks, player_interpretation
+    from src.workflow.source import calibrate_source, resolve_source
+    from tools import retrack_rally_experiment
+
+    kwargs, calls = pipeline
+    original = resolve_source(
+        kwargs["catalog"], source_id=kwargs["source_id"],
+        video=kwargs["video"], output_dir=kwargs["output_dir"],
+    )
+    calibrate_source(original, kwargs["calibration"], force=False)
+    config = original.artifact_root.parent / "experiment-input.json"
+    config.write_text(json.dumps({"dataset": {
+        "rally_intervals_path": "labels.json",
+        "rally_manifest_path": "labels.manifest.json",
+        "sources": [{
+            "source_id": original.source_id,
+            "video_path": str(original.video_path),
+            "calibration_path": str(original.calibration_path),
+        }],
+    }}))
+    release = kwargs["model_manifest"].parent
+    detector = release / "person-detector.pt"
+    pose_model = release / "pose-landmarker.task"
+    output = original.artifact_root.parent / "retracked"
+    command = [
+        "retrack", "--config", str(config), "--output-dir", str(output),
+        "--model", str(detector), "--pose-model", str(pose_model), "--device", "cpu",
+    ]
+
+    def extract(video, path, model, **_options):
+        kwargs["person_extractor"](video, path, model)
+
+    def interrupt(*args, **options):
+        kwargs["player_interpreter"](*args, **options)
+        args[-1].write_text("Frame\n0\n")
+        raise RuntimeError("interrupted writing features")
+
+    monkeypatch.setattr(person_tracks, "extract_person_tracks", extract)
+    monkeypatch.setattr(player_interpretation, "interpret_players", interrupt)
+    monkeypatch.setattr(sys, "argv", command)
+    with pytest.raises(RuntimeError, match="interrupted writing features"):
+        retrack_rally_experiment.main()
+    assert not (output / "experiment.json").exists()
+
+    monkeypatch.setattr(player_interpretation, "interpret_players", kwargs["player_interpreter"])
+    monkeypatch.setattr(sys, "argv", [*command, "--resume"])
+    assert retrack_rally_experiment.main() == 0
+    assert calls == {"person": 1, "players": 2}
+    assert retrack_rally_experiment.main() == 0
+    assert calls == {"person": 1, "players": 2}
+
+    player_root = output / "sources" / original.source_id / "players"
+    experiment = json.loads((output / "experiment.json").read_text())
+    assert experiment["dataset"]["sources"][0]["assignments_path"] == str(
+        player_root / "assignments.jsonl"
+    )
+    for model in (detector, pose_model):
+        original_bytes = model.read_bytes()
+        model.write_bytes(b"changed model")
+        with pytest.raises(ValueError, match="stale or incomplete artifacts"):
+            retrack_rally_experiment.main()
+        model.write_bytes(original_bytes)
+    (player_root / "features.csv").write_text("Frame\n0\n")
+    with pytest.raises(ValueError, match="stale or incomplete artifacts"):
+        retrack_rally_experiment.main()

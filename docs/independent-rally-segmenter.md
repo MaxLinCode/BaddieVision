@@ -89,9 +89,9 @@ candidate tokens are not part of the maintained rally segmenter.
 ## Seven-source YOLO26L and BoT-SORT run
 
 The seven-source run refreshed tracks, player assignments, and MediaPipe pose
-for all four camera groups. Sources within a camera group can have different
-frame rates. For those groups the 80% cut and one-second guards use elapsed
-time, with whole-window containment and source-local frame indices.
+for all four camera groups. Constant-frame-rate sources within a camera group
+can have different rates. For those groups the 80% cut and one-second guards
+use elapsed time, with whole-window containment and source-local frame indices.
 
 Regenerate the features into a fresh directory using a local experiment config,
 then train from the generated config:
@@ -107,8 +107,10 @@ python -m src.temporal_selector.rally_experiment \
 ```
 
 For interrupted preprocessing, run the same command against the same inputs
-and output directory with `--resume`. Completed tracks are reused and pose
-inference resumes from matching saved crops. For interrupted training, pass
+and output directory with `--resume`. The workflow verifies the source, model,
+and output hashes before reusing a completed stage. Pose inference resumes
+from matching saved crops. Use a fresh output directory when inputs change or
+committed outputs fail verification. For interrupted training, pass
 `--resume` once the training directory has a `resolved-config.json`.
 
 | Camera-held-out macro metric | Prior seven-source run | YOLO26L and BoT-SORT |

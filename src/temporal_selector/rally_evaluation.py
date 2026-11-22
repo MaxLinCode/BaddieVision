@@ -147,13 +147,19 @@ def chronological_camera_train_validation_split(
             cut_seconds = duration * train_fraction
             train_end = cut_seconds - guard_seconds
             validation_start = cut_seconds + guard_seconds
+            # The cutoff and window times are calculated separately. Allow for
+            # roundoff at inclusive boundaries without rounding to a frame.
+            time_tolerance = max(1e-9, 4 * math.ulp(duration))
             for source in sources:
                 for window in by_source[source]:
                     first = time_offsets[source] + min(window.frame_indices) / fps[source]
                     end = time_offsets[source] + (max(window.frame_indices) + 1) / fps[source]
-                    if first >= 0 and end <= train_end:
+                    if first >= 0 and end <= train_end + time_tolerance:
                         camera_train.append(window)
-                    elif first >= validation_start and end <= duration + 1e-9:
+                    elif (
+                        first >= validation_start - time_tolerance
+                        and end <= duration + time_tolerance
+                    ):
                         camera_validation.append(window)
             split_metadata = {
                 "source_fps": fps,

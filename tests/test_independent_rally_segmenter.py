@@ -296,3 +296,21 @@ def test_mixed_fps_camera_split_keeps_guard_in_seconds() -> None:
     assert len(validation) == 40
     assert validation[0].window_id == "fast-60"
     assert split["cameras"]["camera"]["cut_seconds"] == 12
+
+
+def test_mixed_fps_camera_split_includes_exact_fractional_boundary() -> None:
+    windows = [
+        *(_window("early", frame, fps=24, frame_count=120) for frame in range(120)),
+        *(_window("late", frame, fps=25, frame_count=175) for frame in range(175)),
+    ]
+    train, validation, _ = chronological_camera_train_validation_split(
+        windows, {"camera": ("early", "late")}, guard_seconds=1.0,
+    )
+
+    assert [window.window_id for window in train] == [
+        *(f"early-{frame}" for frame in range(120)),
+        *(f"late-{frame}" for frame in range(90)),
+    ]
+    assert [window.window_id for window in validation] == [
+        f"late-{frame}" for frame in range(140, 175)
+    ]
