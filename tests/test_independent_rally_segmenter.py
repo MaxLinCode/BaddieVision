@@ -445,7 +445,7 @@ def test_rally_motion_pose_uses_crop_geometry_and_track_median_torso() -> None:
     assert valid[:, wrist_x].tolist() == [True, True, True, True, False]
 
 
-def test_court_median_suppresses_spikes_before_velocity_and_preserves_track_edges() -> None:
+def test_court_median_gates_low_quality_frames_without_filtering_velocity() -> None:
     from src.temporal_selector.rally_features import (
         FULL_RALLY_FEATURE_NAMES,
         MOTION_FEATURE_NAMES,
@@ -464,13 +464,35 @@ def test_court_median_suppresses_spikes_before_velocity_and_preserves_track_edge
     values[:, other_x] = torch.arange(len(values))
     original_mask = valid.clone()
 
-    smooth_rally_court_positions(values, valid, tracks)
+    reliable = torch.ones_like(tracks, dtype=torch.bool)
+    reliable[2, 0] = False
+    velocity, mask = rally_motion_features(values, valid, tracks, fps=30)
+    smooth_rally_court_positions(values, valid, tracks, reliable)
+    assert values[2, court_x] == 10
+
+    reliable[2, 0] = True
+    smooth_rally_court_positions(values, valid, tracks, reliable)
     assert values[:, court_x].tolist() == [0., 0., 0., 0., 0., 8., 0., 7., 0.]
     assert torch.equal(values[:, other_x], torch.arange(len(values)))
     assert torch.equal(valid, original_mask)
 
-    velocity, mask = rally_motion_features(values, valid, tracks, fps=30)
     court_vx = MOTION_FEATURE_NAMES.index("p1_court_velocity_x")
     assert mask[3, court_vx]
-    assert velocity[3, court_vx] == 0
+    assert velocity[3, court_vx] == 30
     assert not mask[6:, court_vx].any()
+
+
+
+def test_court_foot_reliability_requires_two_visible_feet_and_accepted_pose() -> None:
+    from src.temporal_selector.rally_dataset import _reliable_court_foot
+
+    landmarks = [{"visibility": 0.0, "x": 0.4, "y": 0.8} for _ in range(33)]
+    pose = {"status": "detected", "pose_landmarks": landmarks}
+    landmarks[31]["visibility"] = 0.8
+    assert not _reliable_court_foot({}, pose, 0.5)
+    landmarks[32]["visibility"] = 0.8
+    assert _reliable_court_foot({}, pose, 0.5)
+    assert not _reliable_court_foot({}, pose, 0.9)
+    assert not _reliable_court_foot({"foot_diagnostic": {"status": "disagrees"}}, pose, 0.5)
+    assert _reliable_court_foot({}, dict(pose, temporal_status="validated"), 0.5)
+    assert not _reliable_court_foot({}, dict(pose, temporal_status="interpolated_single_gap"), 0.5)

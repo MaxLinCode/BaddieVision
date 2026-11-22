@@ -40,7 +40,7 @@ FULL_RALLY_FEATURE_NAMES: Final = tuple(
 
 
 MOTION_BASE_FEATURE_NAMES: Final = tuple(
-    name.replace("_pose_", "_median_torso_pose_").replace("_court_", "_smoothed_court_")
+    name.replace("_pose_", "_median_torso_pose_").replace("_court_", "_reliable_median_court_")
     for name in FULL_RALLY_FEATURE_NAMES
 )
 _POSE_START: Final = len(PLAYER_CONTEXT_FIELDS) * 2
@@ -89,7 +89,9 @@ def normalize_rally_motion_pose(
         poses[:, player] = torch.where(valid[:, player], relative, 0.0)
 
 
-def smooth_rally_court_positions(values: Tensor, validity: Tensor, track_ids: Tensor) -> None:
+def smooth_rally_court_positions(
+    values: Tensor, validity: Tensor, track_ids: Tensor, reliable_feet: Tensor,
+) -> None:
     """Apply a centered three-sample median within a continuously observed track."""
     if len(values) < 3:
         return
@@ -99,7 +101,8 @@ def smooth_rally_court_positions(values: Tensor, validity: Tensor, track_ids: Te
     observed = validity[:, _COURT_POSITION_INDICES].unfold(0, 3, 1).all(dim=-1)
     tracks = track_ids.unfold(0, 3, 1)
     same_track = (tracks == tracks[..., :1]).all(dim=-1) & (tracks[..., 0] >= 0)
-    usable = observed & same_track.repeat_interleave(2, dim=-1)
+    reliable_window = reliable_feet.unfold(0, 3, 1).all(dim=-1)
+    usable = observed & (same_track & reliable_window).repeat_interleave(2, dim=-1)
     values[1:-1, _COURT_POSITION_INDICES] = torch.where(
         usable, samples.median(dim=-1).values, court[1:-1]
     )

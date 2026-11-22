@@ -130,6 +130,32 @@ class RallyWindow:
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
+def _reliable_court_foot(
+    slot: Mapping, pose: Mapping, visibility_threshold: float,
+) -> bool:
+    """Require an accepted, unrepaired pose with visible evidence from both feet."""
+    if (
+        pose.get("status") != "detected"
+        or pose.get("temporal_status") not in (None, "original", "validated")
+    ):
+        return False
+    if slot.get("foot_diagnostic", {}).get("status") == "disagrees":
+        return False
+    landmarks = pose.get("pose_landmarks") or []
+    if len(landmarks) != 33:
+        return False
+    threshold = max(0.5, visibility_threshold)
+    return all(
+        any(
+            float(landmarks[index].get("visibility", 0)) >= threshold
+            and math.isfinite(float(landmarks[index]["x"]))
+            and math.isfinite(float(landmarks[index]["y"]))
+            for index in foot
+        )
+        for foot in ((29, 31), (30, 32))
+    )
+
+
 class RallyWindowDataset(Dataset[RallyWindow]):
     """Compile dense source-local windows without loading shuttle artifacts."""
 
@@ -390,6 +416,7 @@ class RallyWindowDataset(Dataset[RallyWindow]):
         source_values: list[list[float]] = []
         source_validity: list[list[bool]] = []
         track_ids: list[list[int]] = []
+        reliable_feet: list[list[bool]] = []
         for frame in range(frame_count):
             frame_values, frame_validity = frame_context(
                 assignments[frame],
@@ -421,19 +448,28 @@ class RallyWindowDataset(Dataset[RallyWindow]):
             source_values.append(frame_values)
             source_validity.append(frame_validity)
             if self.feature_view.uses_motion:
-                slots = assignments[frame]["slots"]
-                track_ids.append([
-                    int(item["track_id"]) if isinstance(item, Mapping) else -1
-                    for item in (slots.get(role, {}).get("assignment") for role in ("P1", "P2"))
-                ])
+                frame_tracks = []
+                frame_reliability = []
+                for role in ("P1", "P2"):
+                    slot = assignments[frame]["slots"].get(role, {})
+                    item = slot.get("assignment")
+                    track = int(item["track_id"]) if isinstance(item, Mapping) else -1
+                    frame_tracks.append(track)
+                    frame_reliability.append(_reliable_court_foot(
+                        slot, poses.get((frame, track), {}), self.config.pose_visibility_threshold,
+                    ))
+                track_ids.append(frame_tracks)
+                reliable_feet.append(frame_reliability)
         value_tensor = torch.tensor(source_values, dtype=torch.float32)
         validity_tensor = torch.tensor(source_validity, dtype=torch.bool)
         if self.feature_view.uses_motion:
             track_tensor = torch.tensor(track_ids)
             normalize_rally_motion_pose(value_tensor, validity_tensor, track_tensor, image_size)
-            smooth_rally_court_positions(value_tensor, validity_tensor, track_tensor)
             velocity, velocity_valid = rally_motion_features(
                 value_tensor, validity_tensor, track_tensor, fps
+            )
+            smooth_rally_court_positions(
+                value_tensor, validity_tensor, track_tensor, torch.tensor(reliable_feet)
             )
             value_tensor = torch.cat((value_tensor, velocity), dim=-1)
             validity_tensor = torch.cat((validity_tensor, velocity_valid), dim=-1)
