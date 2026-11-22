@@ -9,7 +9,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable
 
-from .identity import SourceIdentity, inspect_source, sha256_file
+from .identity import ParentVideoProvenance, SourceIdentity, inspect_source, sha256_file
 
 CATALOG_SCHEMA = "baddievision_source_catalog"
 CATALOG_VERSION = 1
@@ -206,6 +206,7 @@ class SourceCatalog:
         *,
         source_id: str | None = None,
         output_dir: str | Path | None = None,
+        parent_video: ParentVideoProvenance | None = None,
     ) -> SourceEntry:
         video = Path(video_path).expanduser().resolve()
         if not video.is_file():
@@ -252,7 +253,7 @@ class SourceCatalog:
             if replace(previous, parent_video=None) != identity:
                 raise ValueError("artifact root belongs to a different source identity")
         else:
-            identity.write(entry.identity_path)
+            replace(identity, parent_video=parent_video).write(entry.identity_path)
         self.sources[source_id] = entry
         self.write()
         return entry

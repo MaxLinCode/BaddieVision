@@ -18,7 +18,8 @@ import cv2
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.court_projection import CourtHomography
-from src.rally_release import load_release, sha256_file, validate_manifest, verify_asset
+from src.rally_release import LEGACY_RELEASE_VERSION, load_release, sha256_file, validate_manifest, verify_asset
+from src.rtmpose import DEFAULT_RTMPOSE_MODEL_NAME
 from src.single_video.video import probe_video, read_video_info
 from src.workflow.identity import SourceIdentity, inspect_source
 
@@ -27,7 +28,6 @@ REQUIRED_FILES = frozenset(
         "manifest.json",
         "rally-segmenter.pt",
         "person-detector.pt",
-        "pose-landmarker.task",
         "MODEL_CARD.md",
         "requirements-inference.txt",
         "sample.mp4",
@@ -108,12 +108,15 @@ def validate_bundle(bundle: Path) -> list[Path]:
             "public release directory may contain only regular allowlisted files"
         )
     names = {path.name for path in paths}
-    if names - REQUIRED_FILES - OPTIONAL_FILES:
-        raise ValueError(
-            f"unexpected release files: {sorted(names - REQUIRED_FILES - OPTIONAL_FILES)}"
-        )
-    if REQUIRED_FILES - names:
-        raise ValueError(f"missing release files: {sorted(REQUIRED_FILES - names)}")
+    if "manifest.json" not in names:
+        raise ValueError("missing release files: ['manifest.json']")
+    manifest = validate_manifest(json.loads((bundle / "manifest.json").read_text()))
+    pose_filename = "pose-landmarker.task" if manifest["schema_version"] == LEGACY_RELEASE_VERSION else DEFAULT_RTMPOSE_MODEL_NAME
+    required_files = REQUIRED_FILES | {pose_filename}
+    if names - required_files - OPTIONAL_FILES:
+        raise ValueError(f"unexpected release files: {sorted(names - required_files - OPTIONAL_FILES)}")
+    if required_files - names:
+        raise ValueError(f"missing release files: {sorted(required_files - names)}")
     for path in paths:
         if path.suffix in {".json", ".md", ".txt", ".csv"}:
             text = path.read_text(encoding="utf-8")
@@ -121,9 +124,8 @@ def validate_bundle(bundle: Path) -> list[Path]:
                 raise ValueError(f"empty or private text asset: {path.name}")
             if path.suffix == ".json":
                 _check_json(json.loads(text))
-    manifest = validate_manifest(json.loads((bundle / "manifest.json").read_text()))
     for asset in manifest["assets"].values():
-        if asset["filename"] not in REQUIRED_FILES:
+        if asset["filename"] not in required_files:
             raise ValueError("manifest points outside the release allowlist")
         verify_asset(bundle / asset["filename"], asset)
         if not asset["url"].startswith("https://"):

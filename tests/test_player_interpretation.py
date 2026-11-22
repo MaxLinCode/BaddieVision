@@ -105,23 +105,43 @@ def test_low_quality_pose_retries_and_retains_better_padded_crop(tmp_path: Path)
     assert record["bbox"] == bbox
 
 
-def test_temporal_validation_interpolates_one_frame_but_not_long_gap():
+@pytest.mark.parametrize("mask_missing_landmarks", [False, True])
+def test_temporal_validation_repairs_only_gaps_bracketed_by_usable_poses(mask_missing_landmarks):
     bbox = [0, 0, 100, 100]
+
     def assignment(frame):
         return {"type": "frame", "frame": frame, "slots": {
             "P1": {"assignment": {"track_id": 1, "bbox": bbox}}, "P2": {"assignment": None}}}
-    frames = [assignment(i) for i in range(4)]
-    def record(frame, x, landmarks=True):
-        points = [{"x": x, "y": 0.5, "z": 0, "visibility": 1}] * 33 if landmarks else None
+
+    def record(frame, x, quality):
+        points = [{"x": x, "y": 0.5, "z": 0, "visibility": 1} for _ in range(33)] if x is not None else None
         return {"frame": frame, "track_id": 1, "bbox": bbox, "pose_bbox": bbox,
-                "pose_landmarks": points, "pose_quality": 1 if landmarks else 0,
-                "status": "detected" if landmarks else "no_pose", "temporal_status": "original"}
-    cache = {(0, 1, tuple(bbox)): record(0, .40), (1, 1, tuple(bbox)): record(1, .95),
-             (2, 1, tuple(bbox)): record(2, .42), (3, 1, tuple(bbox)): record(3, .43, False)}
-    apply_temporal_pose_validation(frames, cache, (100, 100))
-    assert cache[(1, 1, tuple(bbox))]["temporal_status"] == "rejected_jump_interpolated"
-    assert cache[(1, 1, tuple(bbox))]["pose_landmarks"][0]["x"] == pytest.approx(.41)
-    assert cache[(3, 1, tuple(bbox))]["pose_landmarks"] is None
+                "pose_landmarks": points, "pose_quality": quality,
+                "status": "detected" if quality == 1 else "low_quality" if points else "no_pose",
+                "temporal_status": "original"}
+
+    records = [
+        record(0, .40, 1), record(1, .95, 1), record(2, .42, 1),
+        record(3, .43, .2), record(4, .44, .2), record(5, .45, 1),
+        record(6, None, 0), record(7, .47, 1), record(8, None, 0),
+    ]
+    records[7]["pose_landmarks"][0]["visibility"] = 0
+    frames = [assignment(item["frame"]) for item in records]
+    cache = {(item["frame"], 1, tuple(bbox)): item for item in records}
+    apply_temporal_pose_validation(frames, cache, (100, 100), mask_missing_landmarks=mask_missing_landmarks)
+
+    assert records[1]["temporal_status"] == "rejected_jump_interpolated"
+    assert records[1]["pose_landmarks"][0]["x"] == pytest.approx(.41)
+    for item, x in zip(records[3:5], (.43, .44), strict=True):
+        assert item["temporal_status"] == "original"
+        assert item["status"] == "low_quality"
+        assert item["pose_quality"] == .2
+        assert item["pose_landmarks"][0]["x"] == x
+    assert records[6]["temporal_status"] == "interpolated_single_gap"
+    assert records[6]["pose_landmarks"][1]["x"] == pytest.approx(.46)
+    assert records[6]["pose_landmarks"][0]["visibility"] == (0 if mask_missing_landmarks else 1)
+    assert records[6]["pose_landmarks"][0]["x"] == pytest.approx(0 if mask_missing_landmarks else .46)
+    assert records[8]["pose_landmarks"] is None
 
 
 def test_pose_cache_is_idempotent_and_selection_changes_compute_only_missing(tmp_path: Path):

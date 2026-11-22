@@ -16,12 +16,16 @@ class InPlayDecoderConfig:
     max_gap_seconds: float = 0.2
     minimum_duration_seconds: float = 0.5
     preserve_edge_runs: bool = False
+    continuation_threshold: float | None = None
 
     def __post_init__(self) -> None:
         if not 0 <= self.threshold <= 1:
             raise ValueError("InPlay threshold must be between zero and one")
-        if self.max_gap_seconds < 0 or self.minimum_duration_seconds < 0:
-            raise ValueError("decoder durations cannot be negative")
+        if self.continuation_threshold is not None and not 0 <= self.continuation_threshold <= self.threshold:
+            raise ValueError("continuation threshold must be between zero and the entry threshold")
+        durations = (self.max_gap_seconds, self.minimum_duration_seconds)
+        if any(not math.isfinite(value) or value < 0 for value in durations):
+            raise ValueError("decoder durations must be finite and nonnegative")
 
 
 def _runs(values: Sequence[bool]) -> list[tuple[int, int]]:
@@ -48,7 +52,14 @@ def decode_inplay_probabilities(
         raise ValueError("fps must be positive")
     if any(not math.isfinite(float(value)) or not 0 <= float(value) <= 1 for value in probabilities):
         raise ValueError("InPlay probabilities must be finite values in [0, 1]")
-    decoded = [float(value) >= config.threshold for value in probabilities]
+    continuation = config.continuation_threshold
+    if continuation is None:
+        continuation = config.threshold
+    decoded = []
+    active = False
+    for value in probabilities:
+        active = float(value) >= (continuation if active else config.threshold)
+        decoded.append(active)
     max_gap = round(config.max_gap_seconds * fps)
     if max_gap:
         for left, right in zip(_runs(decoded), _runs(decoded)[1:]):

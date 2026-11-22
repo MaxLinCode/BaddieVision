@@ -108,10 +108,12 @@ never replace the v1 artifacts. Build and freeze the audit report with:
 
 ```bash
 python3 -m src.annotation_platform --config config/pilot-sources.local.json \
-  pilot-report --labels .annotation-pilot/exports/audit.jsonl \
-  --output .annotation-pilot/reports/thresholds.json
+  pilot-report \
+  --labels .local-data/original-checkout/legacy-annotations/.annotation-pilot/exports/audit.jsonl \
+  --output .local-data/original-checkout/legacy-annotations/.annotation-pilot/reports/thresholds.json
 python3 -m src.annotation_platform --config config/pilot-sources.local.json \
-  freeze-pilot --report .annotation-pilot/reports/thresholds.json \
+  freeze-pilot \
+  --report .local-data/original-checkout/legacy-annotations/.annotation-pilot/reports/thresholds.json \
   --output-dir outputs/frozen --target-recall 0.99
 ```
 
@@ -126,8 +128,8 @@ Create a pilot runtime without modifying the v1 runtime:
 
 ```bash
 python3 -m src.annotation_platform --config config/pilot-sources.local.json \
-  --runtime .annotation-pilot migrate-v1 \
-  --v1-runtime .annotation-two-folders \
+  --runtime .local-data/original-checkout/legacy-annotations/.annotation-pilot migrate-v1 \
+  --v1-runtime .local-data/original-checkout/legacy-annotations/.annotation-two-folders \
   --v1-config config/annotation-sources.example.json
 ```
 
