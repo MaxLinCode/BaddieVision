@@ -8,6 +8,8 @@ import sys
 import subprocess
 from pathlib import Path
 
+from InPlay.heuristic.person_tracks import BOTSORT_CONTINUOUS, PLAYER_TRACKING_PROFILES
+
 from .registry import SourceCatalog
 
 
@@ -62,6 +64,9 @@ def _parser() -> argparse.ArgumentParser:
     people = stage_commands.add_parser("person-tracks")
     people.add_argument("--source", required=True)
     people.add_argument("--model", help="person detector weights or TensorRT engine")
+    people.add_argument(
+        "--tracking-profile", choices=PLAYER_TRACKING_PROFILES, default=BOTSORT_CONTINUOUS
+    )
     people.add_argument("--force", action="store_true")
     people.add_argument(
         "--device", choices=("auto", "cpu", "mps", "cuda"), default="auto"
@@ -71,6 +76,7 @@ def _parser() -> argparse.ArgumentParser:
     players.add_argument("--pose-model", type=Path)
     players.add_argument("--force", action="store_true")
     players.add_argument("--pose-crop-padding", type=float, default=0.20)
+    players.add_argument("--tracking-profile", choices=PLAYER_TRACKING_PROFILES)
     check = stage_commands.add_parser("check")
     check.add_argument("--source", required=True)
     check.add_argument(
@@ -383,6 +389,7 @@ def main(argv: list[str] | None = None) -> int:
                 model=args.model,
                 device=select_device(args.device),
                 force=args.force,
+                tracking_profile=args.tracking_profile,
             )
             print(source.person_tracks_path)
             return 0
@@ -394,6 +401,7 @@ def main(argv: list[str] | None = None) -> int:
                 pose_model=args.pose_model,
                 pose_crop_padding=args.pose_crop_padding,
                 force=args.force,
+                tracking_profile=args.tracking_profile,
             )
             print(source.assignments_path)
             return 0

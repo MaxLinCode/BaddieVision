@@ -16,6 +16,9 @@ PERSON_IMAGE_SIZE = 960
 PERSON_DETECTION_CONFIDENCE = 0.10
 PERSON_TENSORRT_MODEL = Path("models/yolo26l.engine")
 FIXED_CAMERA_TRACKER = Path(__file__).resolve().parents[2] / "config/botsort-fixed-camera.yaml"
+BYTETRACK_PERIODIC = "bytetrack-periodic-v1"
+BOTSORT_CONTINUOUS = "botsort-continuous-v1"
+PLAYER_TRACKING_PROFILES = (BYTETRACK_PERIODIC, BOTSORT_CONTINUOUS)
 
 
 def default_person_model(device: str) -> Path:
@@ -63,6 +66,7 @@ def extract_person_tracks(
     model: str | None = None,
     *,
     device: str | None = None,
+    tracking_profile: str = BOTSORT_CONTINUOUS,
 ) -> None:
     """Track people without using court calibration or pose estimates."""
     from tqdm import tqdm
@@ -70,12 +74,17 @@ def extract_person_tracks(
 
     from InPlay.heuristic.players import ensure_person_detector
 
+    if tracking_profile not in PLAYER_TRACKING_PROFILES:
+        raise ValueError(f"unsupported player tracking profile: {tracking_profile}")
+    legacy = tracking_profile == BYTETRACK_PERIODIC
     if model is None:
         from src.workflow.source import select_device
 
         device = select_device(device or "auto")
-        model = str(default_person_model(device))
+        model = "yolov8n.pt" if legacy else str(default_person_model(device))
     engine = Path(model).suffix.lower() == ".engine"
+    if legacy and engine:
+        raise ValueError("the ByteTrack release profile requires PyTorch detector weights")
     if engine and device in {"cpu", "mps"}:
         raise ValueError("TensorRT person detection requires CUDA; use yolo26l.pt")
     info = read_video_info(Path(video))
@@ -92,27 +101,32 @@ def extract_person_tracks(
         "frame_count": int(info["frame_count"]),
         "detector": {
             "model": str(model),
-            "imgsz": PERSON_IMAGE_SIZE,
-            "conf": PERSON_DETECTION_CONFIDENCE,
             "class_id": PERSON_CLASS_ID,
             "class_name": PERSON_CLASS_NAME,
         },
-        "tracker": FIXED_CAMERA_TRACKER.name,
-        "tracker_config_fingerprint": raw_artifact_fingerprint(FIXED_CAMERA_TRACKER),
+        "tracker": "bytetrack.yaml",
     }
+    track_options = {}
+    if not legacy:
+        track_options = {
+            "imgsz": PERSON_IMAGE_SIZE,
+            "conf": PERSON_DETECTION_CONFIDENCE,
+            "half": engine or str(device).startswith("cuda"),
+        }
+        metadata["detector"].update(imgsz=PERSON_IMAGE_SIZE, conf=PERSON_DETECTION_CONFIDENCE)
+        metadata["tracker"] = FIXED_CAMERA_TRACKER.name
+        metadata["tracker_config_fingerprint"] = raw_artifact_fingerprint(FIXED_CAMERA_TRACKER)
     with Path(output).open("w", encoding="utf-8") as handle:
         handle.write(json.dumps(metadata, separators=(",", ":")) + "\n")
         results = detector.track(
             source=str(video),
             classes=[PERSON_CLASS_ID],
-            imgsz=PERSON_IMAGE_SIZE,
-            conf=PERSON_DETECTION_CONFIDENCE,
-            tracker=str(FIXED_CAMERA_TRACKER),
+            tracker="bytetrack.yaml" if legacy else str(FIXED_CAMERA_TRACKER),
             stream=True,
             persist=True,
             verbose=False,
             device=device,
-            half=engine or str(device).startswith("cuda"),
+            **track_options,
         )
         processed_frames = 0
         for frame_index, result in enumerate(

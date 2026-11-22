@@ -63,7 +63,7 @@ def run_pipeline(
     identity = SourceIdentity.read(source.identity_path)
     _calibrate(source, calibration, force=force or "pose" in rebuild)
 
-    from src.rally_release import resolve_release
+    from src.rally_release import release_tracking_profile, resolve_release
     from src.temporal_selector.rally_dataset import RallySourceConfig
     from src.temporal_selector.rally_inference import (
         predict_source,
@@ -73,6 +73,7 @@ def run_pipeline(
     model, manifest, assets = resolve_release(
         model_id, checkpoint=checkpoint, manifest=model_manifest, cache_dir=cache_dir
     )
+    tracking_profile = release_tracking_profile(manifest)
     print(
         f"{source.source_id}: verified model assets; using {resolved_device}",
         flush=True,
@@ -100,6 +101,7 @@ def run_pipeline(
         force=force or "person" in rebuild,
         extractor=person_extractor,
         extractor_identity=person_backend_identity,
+        tracking_profile=tracking_profile,
     )
     players_changed = run_player_stage(
         source,
@@ -108,6 +110,7 @@ def run_pipeline(
         force=force or person_changed or "pose" in rebuild,
         interpreter=player_interpreter,
         interpreter_identity=pose_backend_identity,
+        tracking_profile=tracking_profile,
     )
     prediction_inputs = {
         "identity": identity.fingerprint,
