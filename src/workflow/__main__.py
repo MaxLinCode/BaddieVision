@@ -188,6 +188,22 @@ def _parser() -> argparse.ArgumentParser:
     review.add_argument("--source", required=True)
     review.add_argument("--runtime", type=Path, default=DEFAULT_RUNTIME)
     review.add_argument("--annotator", required=True)
+
+    augment = commands.add_parser(
+        "augment", help="create isolated augmented footage sources"
+    )
+    augment_commands = augment.add_subparsers(
+        dest="augment_command", required=True
+    )
+    augment_list = augment_commands.add_parser("list")
+    augment_list.add_argument("--json", action="store_true")
+    augment_create = augment_commands.add_parser("create")
+    augment_create.add_argument("--parent-source-id", required=True)
+    augment_create.add_argument("--parent-video", type=Path, required=True)
+    augment_create.add_argument("--parent-calibration", type=Path, required=True)
+    augment_create.add_argument("--transform", required=True)
+    augment_create.add_argument("--output-root", type=Path, required=True)
+    augment_create.add_argument("--source-id")
     return parser
 
 
@@ -355,6 +371,55 @@ def main(argv: list[str] | None = None) -> int:
                             )
                 for problem in row["problems"]:
                     print(f"  problem: {problem}")
+        return 0
+    if args.command == "augment":
+        from .augmentation import (
+            AUGMENTATION_TRANSFORMS,
+            augmentation_provenance,
+            create_augmented_source,
+        )
+
+        if args.augment_command == "list":
+            rows = [
+                {
+                    "name": spec.name,
+                    "category": spec.category,
+                    "calibration": spec.calibration,
+                    "codec": spec.codec,
+                    "preset": spec.preset,
+                    "crf": spec.crf,
+                    "video_filter": spec.video_filter,
+                    "description": spec.description,
+                }
+                for spec in AUGMENTATION_TRANSFORMS.values()
+            ]
+            if args.json:
+                print(json.dumps(rows, indent=2))
+            else:
+                for row in rows:
+                    print(
+                        f"{row['name']}: {row['category']}, {row['codec']} "
+                        f"crf={row['crf']}, calibration={row['calibration']}"
+                    )
+            return 0
+        try:
+            entry = create_augmented_source(
+                catalog,
+                parent_source_id=args.parent_source_id,
+                parent_video=args.parent_video,
+                parent_calibration=args.parent_calibration,
+                transform=args.transform,
+                output_root=args.output_root,
+                source_id=args.source_id,
+            )
+        except (OSError, ValueError, RuntimeError) as exc:
+            print(f"augmentation failed: {exc}", file=sys.stderr)
+            return 2
+        provenance = augmentation_provenance(entry)
+        print(f"registered {entry.source_id}")
+        print(f"transform: {provenance['transform']}")
+        print(f"artifact root: {entry.artifact_root}")
+        print(f"catalog: {catalog.path}")
         return 0
     if args.command == "stage":
         source = catalog.select([args.source])[0]
