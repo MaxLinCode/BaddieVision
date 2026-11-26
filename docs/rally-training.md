@@ -11,11 +11,34 @@ python -m src.temporal_selector.rally_experiment \
 
 A config's optional `training` object accepts `seed`, `epochs`, `batch_size`,
 `sampling` (`boundary_balanced` or `uniform`), `boundary_aux_weight`, `optimizer`
-(`AdamW`), `learning_rate`, `gradient_clip_norm`, and `device`. CLI values take
-precedence. Every run writes `resolved-config.json` before training, and final
-metrics and inference exports record the resolved recipe. The historical
-25-epoch MPS configuration remains available as `--preset benchmark`; overrides
-that would change that recipe are rejected.
+(`AdamW`), `learning_rate`, `gradient_clip_norm`, `ema_decay`, and `device`.
+CLI values take precedence. Every run writes `resolved-config.json` before
+training, and final metrics and inference exports record the resolved recipe.
+The historical 25-epoch MPS configuration remains available as `--preset
+benchmark`; overrides that would change that recipe are rejected.
+
+## Epoch selection
+
+Training maintains an exponential moving average (EMA) of the full model state
+and validates those averaged weights after every epoch. The default
+`ema_decay` is 0.999 with a warm-up that keeps early averaged weights close to
+the live model. Per-fold checkpoints still select their own best EMA validation
+BCE epoch and evaluate the held-out camera once.
+
+Production epoch selection pools the problem instead of taking a median of
+independently selected per-fold minima:
+
+1. Every camera fold logs its EMA validation BCE at every epoch.
+2. The trainer averages the fold curves epoch by epoch into one pooled curve.
+3. It applies a centered three-epoch moving average to that curve and chooses
+   the argmin epoch, breaking ties toward the earlier epoch.
+4. The all-sources production checkpoint trains for that epoch and exports its
+   final EMA state.
+
+The pooled curve, smoothed curve, per-fold curves, and selected epoch are
+recorded in the production checkpoint's split manifest and in `metrics.json`.
+Padding at the curve edges averages the epochs that exist rather than treating
+missing neighbors as zero.
 
 For a clean-only run, each completed training epoch atomically commits a
 `training-recovery.pt` file inside its fold directory. Production training uses
@@ -30,18 +53,21 @@ reordering its source list changes the split and requires a new run. Resolved
 configs from the earlier draft (version 1) lack the original fold order and
 cannot be resumed with this version.
 
-Recovery files contain the latest model and optimizer states, epoch, sampler
-position, Python/NumPy/Torch/device RNG states, epoch metrics, and a separate
-copy of the best validation model. They validate configuration, ordered window
-observations/labels/ownership, dataset and annotation fingerprints, and split
-identity before restoring. Changing those inputs requires a new output
-directory. Final `rally-segmenter.pt` and `production-rally-segmenter.pt` files
-remain inference exports; they are not accepted as recovery checkpoints.
+Recovery files contain the latest model and optimizer states, the EMA state and
+update count, epoch, sampler position, Python/NumPy/Torch/device RNG states,
+epoch metrics, and a separate copy of the best validation model. They validate
+configuration, ordered window observations/labels/ownership, dataset and
+annotation fingerprints, and split identity before restoring. Changing those
+inputs requires a new output directory. Final `rally-segmenter.pt` and
+`production-rally-segmenter.pt` files remain inference exports; they are not
+accepted as recovery checkpoints.
 
 Epoch recovery applies to the maintained clean-only fold and production
 trainers. The comparative historical study arms accept recipe overrides but
 do not support `--resume`. Recovery does not claim identical results across
 different accelerator/runtime versions or nondeterministic device kernels.
+Recovery checkpoints written before EMA tracking (version 1) lack the averaged
+state and are rejected; start a new output directory.
 
 ## Canonical motion, vision, and audio
 

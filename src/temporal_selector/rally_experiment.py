@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import copy
 import hashlib
 import os
 import random
@@ -11,7 +10,8 @@ import tempfile
 import json
 import math
 import statistics
-from dataclasses import asdict, replace
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -319,6 +319,179 @@ def _window_identity(windows: Sequence[RallyWindow]) -> str:
     return digest.hexdigest()
 
 
+EMA_CHECKPOINT_SELECTION = "ema_validation_raw_bce_only"
+POOLED_PRODUCTION_EPOCH_SELECTION = (
+    "pooled_fold_ema_validation_bce_3epoch_moving_average_argmin"
+)
+POOLED_VALIDATION_MOVING_AVERAGE_WINDOW = 3
+
+
+class _ModelEMA:
+    """Track a full-model exponential moving average on the model's device."""
+
+    def __init__(self, model: torch.nn.Module, decay: float) -> None:
+        if not math.isfinite(decay) or not 0.0 < decay < 1.0:
+            raise ValueError("EMA decay must be finite and in (0, 1)")
+        self.decay = float(decay)
+        # Integer buffers (for example BatchNorm counters) are copied rather
+        # than averaged, so the shadow state is always loadable as a model.
+        self.shadow = {
+            name: value.detach().clone()
+            for name, value in model.state_dict().items()
+        }
+        self.updates = 0
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module) -> None:
+        state = model.state_dict()
+        if set(state) != set(self.shadow):
+            raise ValueError("EMA state does not match the model")
+        self.updates += 1
+        # Standard warm-up: early updates track the model closely before the
+        # configured asymptote takes over.
+        decay = min(self.decay, (1.0 + self.updates) / (10.0 + self.updates))
+        for name, shadow in self.shadow.items():
+            value = state[name].detach()
+            if shadow.is_floating_point():
+                shadow.mul_(decay).add_(value, alpha=1.0 - decay)
+            else:
+                shadow.copy_(value)
+
+    def state_dict(self) -> dict[str, torch.Tensor]:
+        return {name: value.detach().clone() for name, value in self.shadow.items()}
+
+    def load_state_dict(
+        self, state: Mapping[str, torch.Tensor], *, updates: int
+    ) -> None:
+        if set(state) != set(self.shadow):
+            raise ValueError("EMA checkpoint does not match the model state")
+        if updates < 0:
+            raise ValueError("EMA update count must be nonnegative")
+        device = next(iter(self.shadow.values())).device
+        self.shadow = {
+            name: value.detach().to(device=device).clone()
+            for name, value in state.items()
+        }
+        self.updates = int(updates)
+
+
+@contextmanager
+def _ema_model_weights(model: torch.nn.Module, ema: _ModelEMA):
+    """Temporarily expose the EMA weights through ``model``."""
+    live = {
+        name: value.detach().clone()
+        for name, value in model.state_dict().items()
+    }
+    model.load_state_dict(ema.shadow)
+    try:
+        yield model
+    finally:
+        model.load_state_dict(live)
+
+
+@dataclass(frozen=True)
+class PooledEpochSelection:
+    """Production epoch selected from the pooled out-of-fold validation curve."""
+
+    epoch: int
+    moving_average_window: int
+    pooled_validation_raw_bce: tuple[float, ...]
+    smoothed_validation_raw_bce: tuple[float, ...]
+    fold_validation_raw_bce: Mapping[str, tuple[float, ...]]
+
+    def metadata(self) -> dict[str, Any]:
+        return {
+            "epoch_selection": POOLED_PRODUCTION_EPOCH_SELECTION,
+            "selected_epoch": self.epoch,
+            "moving_average_window_epochs": self.moving_average_window,
+            "pooled_validation_raw_bce": list(self.pooled_validation_raw_bce),
+            "smoothed_validation_raw_bce": list(self.smoothed_validation_raw_bce),
+            "fold_validation_raw_bce": {
+                fold_id: list(curve)
+                for fold_id, curve in self.fold_validation_raw_bce.items()
+            },
+        }
+
+
+def _validation_curve(history: Sequence[Mapping[str, Any]]) -> tuple[float, ...]:
+    """Extract one fold's contiguous per-epoch validation BCE curve."""
+    if not history:
+        raise ValueError("pooled epoch selection requires nonempty validation history")
+    curve: list[float] = []
+    for expected_epoch, entry in enumerate(history, start=1):
+        epoch = int(entry.get("epoch", expected_epoch))
+        if epoch != expected_epoch:
+            raise ValueError(
+                "validation history epochs must be contiguous and one-based"
+            )
+        value = entry.get("validation_raw_bce")
+        if value is None:
+            raise ValueError(
+                "pooled epoch selection requires validation BCE for every epoch"
+            )
+        value = float(value)
+        if not math.isfinite(value):
+            raise ValueError("validation BCE must be finite")
+        curve.append(value)
+    return tuple(curve)
+
+
+def _centered_moving_average(
+    values: Sequence[float], window: int
+) -> tuple[float, ...]:
+    """Smooth with a centered window, shrinking at the curve edges."""
+    if window <= 0 or window % 2 == 0:
+        raise ValueError("moving-average window must be a positive odd integer")
+    half = window // 2
+    return tuple(
+        statistics.fmean(values[max(0, index - half) : index + half + 1])
+        for index in range(len(values))
+    )
+
+
+def select_production_epoch(
+    histories: Sequence[Sequence[Mapping[str, Any]]],
+    *,
+    fold_ids: Sequence[str] | None = None,
+    moving_average_window: int = POOLED_VALIDATION_MOVING_AVERAGE_WINDOW,
+) -> PooledEpochSelection:
+    """Pool fold validation curves, smooth them, and pick the global argmin.
+
+    Every fold contributes its validation BCE at every epoch. Averaging the
+    curves before selecting one epoch avoids the bias introduced by taking a
+    median of independently selected per-fold minima. Ties choose the earliest
+    epoch.
+    """
+    if not histories:
+        raise ValueError("pooled epoch selection requires at least one fold history")
+    if fold_ids is None:
+        fold_ids = [f"fold-{index + 1}" for index in range(len(histories))]
+    if len(fold_ids) != len(histories):
+        raise ValueError("fold identifiers must match validation histories")
+    if len(set(fold_ids)) != len(fold_ids):
+        raise ValueError("fold identifiers must be unique")
+    curves = tuple(_validation_curve(history) for history in histories)
+    if len({len(curve) for curve in curves}) != 1:
+        raise ValueError("all folds must log the same number of validation epochs")
+    pooled = tuple(
+        statistics.fmean(values) for values in zip(*curves, strict=True)
+    )
+    smoothed = _centered_moving_average(pooled, moving_average_window)
+    epoch = min(
+        range(len(smoothed)), key=lambda index: (smoothed[index], index)
+    ) + 1
+    return PooledEpochSelection(
+        epoch=epoch,
+        moving_average_window=moving_average_window,
+        pooled_validation_raw_bce=pooled,
+        smoothed_validation_raw_bce=smoothed,
+        fold_validation_raw_bce={
+            fold_id: curve
+            for fold_id, curve in zip(fold_ids, curves, strict=True)
+        },
+    )
+
+
 def train_rally_segmenter(
     model: RallySegmenter,
     train_windows: Sequence[RallyWindow],
@@ -333,15 +506,19 @@ def train_rally_segmenter(
     learning_rate: float = 3e-4,
     gradient_clip_norm: float = 1.0,
     sampling: str = "boundary_balanced",
+    ema_decay: float = 0.999,
     recovery_path: Path | None = None,
     resume: bool = False,
     recovery_identity: Mapping[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
-    """Commit each epoch durably; validation chooses the best inference state.
+    """Commit each epoch durably; EMA validation chooses the best inference state.
 
-    Recovery checkpoints contain the *latest* optimizer/model state and the
-    independently retained best state. They are never inference exports.
-    With no validation partition this fits production data for exactly epochs.
+    Every epoch updates an exponential moving average of the model state and
+    validates the averaged weights. Recovery checkpoints contain the *latest*
+    optimizer/model state, the EMA state, and the independently retained best
+    averaged state. They are never inference exports. With no validation
+    partition this fits production data for exactly epochs and exports the
+    final EMA state.
     """
     recipe = RallyTrainingRecipe(
         seed=seed,
@@ -353,6 +530,7 @@ def train_rally_segmenter(
         gradient_clip_norm=gradient_clip_norm,
         sampling=sampling,
         device=device.type,
+        ema_decay=ema_decay,
     )
     if not train_windows or (validation_windows is not None and not validation_windows):
         raise ValueError(
@@ -385,6 +563,7 @@ def train_rally_segmenter(
         list(train_windows), batch_sampler=sampler, collate_fn=collate_rally_windows
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    ema = _ModelEMA(model, ema_decay)
     weights = {
         field: _positive_weight(
             train_windows,
@@ -401,7 +580,7 @@ def train_rally_segmenter(
         checkpoint = torch.load(recovery_path, map_location="cpu", weights_only=True)
         if (
             checkpoint.get("schema") != "rally_training_recovery"
-            or checkpoint.get("version") != 1
+            or checkpoint.get("version") != 2
         ):
             raise ValueError("not a compatible rally recovery checkpoint")
         saved_identity = checkpoint["identity"]
@@ -416,6 +595,10 @@ def train_rally_segmenter(
             raise ValueError("recovery checkpoint has inconsistent epoch progress")
         model.load_state_dict(checkpoint["model_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        ema.load_state_dict(
+            checkpoint["ema"]["state_dict"],
+            updates=int(checkpoint["ema"]["updates"]),
+        )
         sampler.epoch = int(checkpoint["sampler_epoch"])
         if sampler.epoch != start_epoch:
             raise ValueError("recovery checkpoint sampler epoch is inconsistent")
@@ -442,6 +625,7 @@ def train_rally_segmenter(
             losses.total.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
             optimizer.step()
+            ema.update(model)
             for index, value in enumerate(
                 (losses.total, losses.inplay, losses.rally_start, losses.rally_end)
             ):
@@ -451,13 +635,14 @@ def train_rally_segmenter(
             raise ValueError("rally training partition has no batches")
         validation_bce = None
         if validation_windows is not None:
-            validation_rows = predict_rally_windows(
-                model,
-                validation_windows,
-                device=device,
-                batch_size=batch_size,
-                partition="validation",
-            )
+            with _ema_model_weights(model, ema):
+                validation_rows = predict_rally_windows(
+                    model,
+                    validation_windows,
+                    device=device,
+                    batch_size=batch_size,
+                    partition="validation",
+                )
             validation_bce = float(rally_metrics(validation_rows)["raw_bce"])
             if not math.isfinite(validation_bce):
                 raise RuntimeError("rally validation produced a non-finite BCE")
@@ -469,13 +654,15 @@ def train_rally_segmenter(
                 "rally_start": sums[2] / batch_count,
                 "rally_end": sums[3] / batch_count,
                 "validation_raw_bce": validation_bce,
+                "validation_weights": "ema" if validation_bce is not None else None,
+                "ema_updates": ema.updates,
                 "sampling": sampler.last_sampling_stats,
             }
         )
         candidate = (
             validation_bce if validation_bce is not None else 0.0,
             epoch + 1,
-            copy.deepcopy(model.state_dict()),
+            ema.state_dict(),
         )
         if validation_windows is None or best is None or candidate[:2] < best[:2]:
             best = candidate
@@ -483,7 +670,7 @@ def train_rally_segmenter(
             _atomic_torch_save(
                 {
                     "schema": "rally_training_recovery",
-                    "version": 1,
+                    "version": 2,
                     "identity": identity,
                     "completed_epoch": epoch + 1,
                     "model_state_dict": model.state_dict(),
@@ -492,12 +679,16 @@ def train_rally_segmenter(
                     "rng_state": _rng_state(device),
                     "history": history,
                     "best": best,
+                    "ema": {
+                        "state_dict": ema.state_dict(),
+                        "updates": ema.updates,
+                    },
                 },
                 recovery_path,
             )
         print(
             f"epoch {epoch + 1}/{epochs}: train={sums[0] / batch_count:.6f} "
-            f"validation_bce={validation_bce}",
+            f"validation_bce={validation_bce} (ema)",
             flush=True,
         )
     assert best is not None
@@ -695,6 +886,7 @@ def run_independent_rally_experiment(
     clean_test_rows: list[dict[str, Any]] = []
     legacy_test_rows: list[dict[str, Any]] = []
     clean_selected_epochs: list[int] = []
+    clean_validation_histories: list[tuple[str, list[dict[str, Any]]]] = []
     fold_artifacts: list[dict[str, Any]] = []
 
     for fold in folds:
@@ -729,6 +921,7 @@ def run_independent_rally_experiment(
             "train_validation": split,
             "test_window_ids": [window.window_id for window in test],
             "selection_label_partitions": ["train", "validation"],
+            "checkpoint_selection": EMA_CHECKPOINT_SELECTION,
             "decoder_label_partition": "validation",
             "test_evaluations": 1,
         }
@@ -750,8 +943,10 @@ def run_independent_rally_experiment(
             learning_rate=recipe.learning_rate,
             gradient_clip_norm=recipe.gradient_clip_norm,
             sampling=recipe.sampling,
+            ema_decay=recipe.ema_decay,
         )
         clean_selected_epochs.append(clean_epoch)
+        clean_validation_histories.append((fold.fold_id, clean_history))
         clean_validation = predict_rally_windows(
             clean,
             validation,
@@ -941,7 +1136,11 @@ def run_independent_rally_experiment(
         "production": None,
     }
     if acceptance["accepted"]:
-        production_epoch = round(statistics.median(clean_selected_epochs))
+        selection = select_production_epoch(
+            [history for _, history in clean_validation_histories],
+            fold_ids=[fold_id for fold_id, _ in clean_validation_histories],
+        )
+        production_epoch = selection.epoch
         production = RallySegmenter(RallySegmenterConfig()).to(device)
         # Production has no validation selection; fit the preselected epoch.
         train_rally_segmenter_fixed_epochs(
@@ -955,6 +1154,7 @@ def run_independent_rally_experiment(
             learning_rate=recipe.learning_rate,
             gradient_clip_norm=recipe.gradient_clip_norm,
             sampling=recipe.sampling,
+            ema_decay=recipe.ema_decay,
         )
         oof_decoder, oof_search = tune_rally_decoder(
             clean_test_rows,
@@ -968,10 +1168,10 @@ def run_independent_rally_experiment(
             "source_ids": [
                 source.source_id for source in rally_dataset.config.sources
             ],
-            "epoch_selection": "median_fold_best_epoch",
             "fold_best_epochs": clean_selected_epochs,
             "decoder_calibration": "out_of_fold_predictions",
             "in_sample_decoder_labels_used": False,
+            **selection.metadata(),
         }
         production_checkpoint = rally_checkpoint(
             production,
@@ -996,6 +1196,7 @@ def run_independent_rally_experiment(
             "chosen_epoch": production_epoch,
             "decoder_configuration": asdict(oof_decoder),
             "decoder_calibration": "out_of_fold_predictions",
+            **selection.metadata(),
         }
     _write_json(output_dir / "metrics.json", result)
     return result
@@ -1064,6 +1265,7 @@ def run_clean_rally_experiment(
     camera_metrics: dict[str, Any] = {}
     test_rows: list[dict[str, Any]] = []
     selected_epochs: list[int] = []
+    fold_validation_histories: list[tuple[str, list[dict[str, Any]]]] = []
     fold_artifacts = []
     model_config = RallySegmenterConfig(
         frame_feature_dim=feature_view.dimension, audio_attention=feature_view.uses_audio
@@ -1114,7 +1316,7 @@ def run_clean_rally_experiment(
             "train_window_ids": [window.window_id for window in train],
             "validation_window_ids": [window.window_id for window in validation],
             "test_window_ids": [window.window_id for window in test],
-            "checkpoint_selection": "validation_raw_bce_only",
+            "checkpoint_selection": EMA_CHECKPOINT_SELECTION,
             "decoder_selection": "validation_labels_only",
             "test_labels_used_for_selection": False, "test_evaluations": 1,
         }
@@ -1132,6 +1334,7 @@ def run_clean_rally_experiment(
             learning_rate=recipe.learning_rate,
             gradient_clip_norm=recipe.gradient_clip_norm,
             sampling=recipe.sampling,
+            ema_decay=recipe.ema_decay,
             recovery_path=fold_dir / "training-recovery.pt",
             resume=resume,
             recovery_identity={
@@ -1141,6 +1344,7 @@ def run_clean_rally_experiment(
             },
         )
         selected_epochs.append(epoch)
+        fold_validation_histories.append((fold.fold_id, history))
         validation_rows = predict_rally_windows(
             model, validation, device=device, batch_size=recipe.batch_size,
             partition="validation", include_unlabeled=True,
@@ -1177,7 +1381,11 @@ def run_clean_rally_experiment(
         }
         _write_json(fold_dir / "metrics.json", fold_result)
         fold_artifacts.append(fold_result)
-    production_epoch = round(statistics.median(selected_epochs))
+    selection = select_production_epoch(
+        [history for _, history in fold_validation_histories],
+        fold_ids=[fold_id for fold_id, _ in fold_validation_histories],
+    )
+    production_epoch = selection.epoch
     production = RallySegmenter(model_config).to(device)
     production_history = train_rally_segmenter_fixed_epochs(
         production,
@@ -1191,13 +1399,13 @@ def run_clean_rally_experiment(
         learning_rate=recipe.learning_rate,
         gradient_clip_norm=recipe.gradient_clip_norm,
         sampling=recipe.sampling,
+        ema_decay=recipe.ema_decay,
         recovery_path=output_dir / "production-training-recovery.pt",
         resume=resume,
         recovery_identity={
             "dataset_fingerprint": rally_dataset.manifest["dataset_fingerprint"],
             "annotation_fingerprint": rally_dataset.annotation_fingerprint,
-            "epoch_selection": "median_fold_best_epoch",
-            "fold_best_epochs": selected_epochs,
+            **selection.metadata(),
         },
     )
     oof_decoder, oof_search = tune_rally_decoder(
@@ -1208,8 +1416,9 @@ def run_clean_rally_experiment(
     production_split = {
         "strategy": "all-sources", "source_ids": list(sources),
         "camera_groups": {camera: list(sources) for camera, sources in camera_sources.items()},
-        "epoch_selection": "median_fold_best_epoch", "fold_best_epochs": selected_epochs,
+        "fold_best_epochs": selected_epochs,
         "decoder_calibration": "out_of_fold_predictions", "in_sample_decoder_labels_used": False,
+        **selection.metadata(),
     }
     production_checkpoint = rally_checkpoint(
         production, dataset_fingerprint=rally_dataset.manifest["dataset_fingerprint"],
@@ -1224,14 +1433,15 @@ def run_clean_rally_experiment(
     )
     torch.save(production_checkpoint, output_dir / "production-rally-segmenter.pt")
     result = {
-        "schema": "clean_cross_camera_rally_segmenter", "schema_version": 1,
+        "schema": "clean_cross_camera_rally_segmenter", "schema_version": 2,
         "dataset_manifest": rally_dataset.manifest,
         "training_recipe": asdict(recipe), "camera_sources": {key: list(value) for key, value in camera_sources.items()},
         "folds": fold_artifacts, "by_camera": camera_metrics,
         "macro": _macro_metrics(camera_metrics),
         "production": {"checkpoint": "production-rally-segmenter.pt",
                        "chosen_epoch": production_epoch,
-                       "decoder_configuration": asdict(oof_decoder)},
+                       "decoder_configuration": asdict(oof_decoder),
+                       **selection.metadata()},
     }
     _write_json(output_dir / "metrics.json", result)
     return result
@@ -1358,6 +1568,7 @@ def train_rally_segmenter_fixed_epochs(
     learning_rate: float = 3e-4,
     gradient_clip_norm: float = 1.0,
     sampling: str = "boundary_balanced",
+    ema_decay: float = 0.999,
     recovery_path: Path | None = None,
     resume: bool = False,
     recovery_identity: Mapping[str, Any] | None = None,
@@ -1376,6 +1587,7 @@ def train_rally_segmenter_fixed_epochs(
         learning_rate=learning_rate,
         gradient_clip_norm=gradient_clip_norm,
         sampling=sampling,
+        ema_decay=ema_decay,
         recovery_path=recovery_path,
         resume=resume,
         recovery_identity=recovery_identity,
@@ -1454,6 +1666,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--gradient-clip-norm", type=float)
     parser.add_argument("--boundary-aux-weight", type=float)
     parser.add_argument("--temporal-smoothing-weight", type=float)
+    parser.add_argument("--ema-decay", type=float)
     parser.add_argument("--seed", type=int)
     parser.add_argument("--sampling", choices=("boundary_balanced", "uniform"))
     parser.add_argument(

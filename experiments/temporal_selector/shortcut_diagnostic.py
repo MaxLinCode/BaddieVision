@@ -691,7 +691,7 @@ def run_rally_feature_ablations(
                 "train_window_ids": [window.window_id for window in train],
                 "validation_window_ids": [window.window_id for window in validation],
                 "test_window_ids": [window.window_id for window in test],
-                "checkpoint_selection": "validation_raw_bce_only",
+                "checkpoint_selection": "ema_validation_raw_bce_only",
                 "decoder_selection": "validation_labels_only",
                 "test_labels_used_for_selection": False,
             }
@@ -707,6 +707,7 @@ def run_rally_feature_ablations(
                 batch_size=recipe.batch_size,
                 seed=recipe.seed,
                 boundary_aux_weight=recipe.boundary_aux_weight,
+                ema_decay=recipe.ema_decay,
             )
             validation_rows = predict_rally_windows(
                 model,
