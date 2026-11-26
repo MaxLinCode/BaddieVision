@@ -485,6 +485,7 @@ class RallyTrainingRecipe:
     gradient_clip_norm: float = 1.0
     device: str = "mps"
     temporal_smoothing_weight: float = 0.0
+    ema_decay: float = 0.999
 
     def __post_init__(self) -> None:
         for name in ("epochs", "batch_size"):
@@ -516,6 +517,8 @@ class RallyTrainingRecipe:
 
         if not math.isfinite(self.temporal_smoothing_weight) or self.temporal_smoothing_weight < 0:
             raise ValueError("temporal smoothing weight must be finite and nonnegative")
+        if not math.isfinite(self.ema_decay) or not 0.0 < self.ema_decay < 1.0:
+            raise ValueError("ema_decay must be finite and in (0, 1)")
 
     def recovery_settings(self) -> dict[str, Any]:
         settings = asdict(self)

@@ -75,6 +75,160 @@ def _seed():
     torch.random.default_generator.manual_seed(17)
 
 
+def test_ema_update_and_validation_weight_swap():
+    model = torch.nn.Linear(2, 2)
+    with torch.no_grad():
+        model.weight.fill_(2.0)
+        model.bias.fill_(2.0)
+    ema = training._ModelEMA(model, 0.9)
+    with torch.no_grad():
+        model.weight.fill_(4.0)
+        model.bias.fill_(4.0)
+    ema.update(model)
+    assert ema.updates == 1
+    # The first update keeps only 2/11 of the previous average so the EMA
+    # follows the newly trained weights closely during warm-up.
+    expected = 2.0 * (2.0 / 11.0) + 4.0 * (9.0 / 11.0)
+    torch.testing.assert_close(
+        ema.shadow["weight"], torch.full((2, 2), expected)
+    )
+    live = {
+        name: value.detach().clone()
+        for name, value in model.state_dict().items()
+    }
+    with training._ema_model_weights(model, ema):
+        for name, value in ema.shadow.items():
+            assert torch.equal(model.state_dict()[name], value), name
+    for name, value in live.items():
+        assert torch.equal(model.state_dict()[name], value), name
+
+
+def test_validation_runs_on_ema_weights_and_exports_the_selected_average(monkeypatch):
+    windows = _windows()
+    model = _model()
+    raw_states = []
+    ema_states = []
+    original_update = training._ModelEMA.update
+
+    def recording_update(ema, target):
+        original_update(ema, target)
+        raw_states.append(
+            {
+                name: value.detach().clone()
+                for name, value in target.state_dict().items()
+            }
+        )
+        ema_states.append(ema.state_dict())
+
+    seen = []
+
+    def fake_predict(target, windows, **kwargs):
+        seen.append(
+            {
+                name: value.detach().clone()
+                for name, value in target.state_dict().items()
+            }
+        )
+        return [
+            {
+                "source_id": "camera",
+                "frame": 0,
+                "inplay_target": 0,
+                "inplay_probability": 0.1,
+            }
+        ]
+
+    monkeypatch.setattr(training._ModelEMA, "update", recording_update)
+    monkeypatch.setattr(training, "predict_rally_windows", fake_predict)
+    monkeypatch.setattr(training, "rally_metrics", lambda rows: {"raw_bce": 0.5})
+    history, epoch = training.train_rally_segmenter(
+        model,
+        windows,
+        windows[:1],
+        device=torch.device("cpu"),
+        epochs=2,
+        batch_size=1,
+        seed=3,
+        learning_rate=0.01,
+    )
+    assert len(seen) == len(history) == 2
+    assert len(ema_states) == len(raw_states) == history[-1]["ema_updates"]
+    selected_update = history[0]["ema_updates"] - 1
+    for snapshot, entry in zip(seen, history, strict=True):
+        ema_snapshot = ema_states[entry["ema_updates"] - 1]
+        raw_snapshot = raw_states[entry["ema_updates"] - 1]
+        for name, value in snapshot.items():
+            assert torch.equal(value, ema_snapshot[name]), name
+        assert any(
+            not torch.equal(value, raw_snapshot[name])
+            for name, value in snapshot.items()
+            if value.is_floating_point()
+        )
+    assert [entry["validation_weights"] for entry in history] == ["ema", "ema"]
+    assert [entry["ema_updates"] for entry in history] == [2, 4]
+    # Constant validation BCE keeps the first epoch as the selected state.
+    assert epoch == 1
+    for name, value in model.state_dict().items():
+        assert torch.equal(value, ema_states[selected_update][name]), name
+
+
+def test_pooled_validation_selection_pools_then_smooths():
+    fold_a = [
+        {"epoch": epoch, "validation_raw_bce": value}
+        for epoch, value in enumerate((0.58, 0.66, 0.48, 0.66, 0.58), start=1)
+    ]
+    fold_b = [
+        {"epoch": epoch, "validation_raw_bce": value}
+        for epoch, value in enumerate((0.62, 0.64, 0.52, 0.64, 0.62), start=1)
+    ]
+    selection = training.select_production_epoch(
+        [fold_a, fold_b], fold_ids=["A", "B"]
+    )
+    assert selection.pooled_validation_raw_bce == pytest.approx(
+        (0.60, 0.65, 0.50, 0.65, 0.60)
+    )
+    assert selection.smoothed_validation_raw_bce == pytest.approx(
+        (0.625, 1.75 / 3.0, 0.60, 1.75 / 3.0, 0.625)
+    )
+    # The raw pooled minimum is epoch 3, but smoothing removes that spike.
+    assert selection.epoch == 2
+    assert selection.fold_validation_raw_bce["A"] == pytest.approx(
+        (0.58, 0.66, 0.48, 0.66, 0.58)
+    )
+    metadata = selection.metadata()
+    assert metadata["epoch_selection"] == training.POOLED_PRODUCTION_EPOCH_SELECTION
+    assert metadata["selected_epoch"] == 2
+    assert metadata["moving_average_window_epochs"] == 3
+    assert metadata["pooled_validation_raw_bce"] == pytest.approx(
+        [0.60, 0.65, 0.50, 0.65, 0.60]
+    )
+
+
+def test_pooled_validation_selection_rejects_incomplete_or_mismatched_curves():
+    with pytest.raises(ValueError, match="every epoch"):
+        training.select_production_epoch(
+            [[{"epoch": 1, "validation_raw_bce": 0.5}, {"epoch": 2}]]
+        )
+    with pytest.raises(ValueError, match="same number"):
+        training.select_production_epoch(
+            [
+                [{"epoch": 1, "validation_raw_bce": 0.5}],
+                [
+                    {"epoch": 1, "validation_raw_bce": 0.4},
+                    {"epoch": 2, "validation_raw_bce": 0.3},
+                ],
+            ]
+        )
+    with pytest.raises(ValueError, match="unique"):
+        training.select_production_epoch(
+            [
+                [{"epoch": 1, "validation_raw_bce": 0.5}],
+                [{"epoch": 1, "validation_raw_bce": 0.4}],
+            ],
+            fold_ids=["A", "A"],
+        )
+
+
 def test_cpu_configuration_and_historical_preset():
     recipe = RallyTrainingRecipe.from_preset(
         "default",
@@ -93,6 +247,8 @@ def test_cpu_configuration_and_historical_preset():
         RallyTrainingRecipe.from_preset("benchmark", device="cpu")
     with pytest.raises(ValueError, match="learning_rate"):
         RallyTrainingRecipe(learning_rate=float("nan"))
+    with pytest.raises(ValueError, match="ema_decay"):
+        RallyTrainingRecipe(ema_decay=1.0)
 
 
 @pytest.mark.parametrize("validation", [True, False])
@@ -133,6 +289,8 @@ def test_epoch_resume_matches_uninterrupted_training(tmp_path, monkeypatch, vali
         )
     saved = torch.load(path, weights_only=True)
     assert saved["completed_epoch"] == saved["sampler_epoch"] == 1
+    assert saved["version"] == 2
+    assert saved["ema"]["updates"] == 2
     assert saved["optimizer_state_dict"]["param_groups"][0]["lr"] == 0.002
     monkeypatch.setattr(training, "_atomic_torch_save", save)
     # A fresh process/model can consume arbitrary RNG before restoring a checkpoint.
@@ -149,7 +307,9 @@ def test_epoch_resume_matches_uninterrupted_training(tmp_path, monkeypatch, vali
     assert actual == expected
     for name, expected_value in uninterrupted.state_dict().items():
         assert torch.equal(resumed.state_dict()[name], expected_value), name
-    assert torch.load(path, weights_only=True)["completed_epoch"] == 3
+    completed = torch.load(path, weights_only=True)
+    assert completed["completed_epoch"] == 3
+    assert completed["ema"]["updates"] == 6
 
 
 def test_resume_rejects_data_split_or_configuration_change(tmp_path):
@@ -240,6 +400,8 @@ def test_cli_resolves_config_and_command_line_overrides(tmp_path, monkeypatch):
                 "1",
                 "--learning-rate",
                 "0.001",
+                "--ema-decay",
+                "0.9",
                 "--resume",
             ]
         )
@@ -248,6 +410,7 @@ def test_cli_resolves_config_and_command_line_overrides(tmp_path, monkeypatch):
     assert called["recipe"].epochs == 1
     assert called["recipe"].batch_size == 3
     assert called["recipe"].learning_rate == 0.001
+    assert called["recipe"].ema_decay == 0.9
     assert called["device"] == torch.device("cpu")
     assert called["resume"]
 

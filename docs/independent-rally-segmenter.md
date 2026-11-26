@@ -41,9 +41,9 @@ and gradient clipping at 1.0. Ordinary training accepts overrides; see
 Each of camera A, camera B, and camera C is held out once. Within a fold, every
 training camera is split independently at 80% chronology. One-second guard
 bands and whole-window containment keep temporal context out of the other
-partition. Validation selects the lowest raw-BCE epoch and searches the fixed
-threshold/gap/minimum-duration decoder grid. Test labels are first materialized
-after both choices are frozen.
+partition. Validation scores the EMA weights and selects the lowest raw-BCE
+epoch, then searches the fixed threshold/gap/minimum-duration decoder grid.
+Test labels are first materialized after both choices are frozen.
 
 Every fold reruns:
 
@@ -62,8 +62,9 @@ manifest, resolved training recipe, chosen epoch, and decoder configuration.
 Legacy joint checkpoint reconstruction remains unchanged.
 
 If all clean-model guardrails pass, the runner trains the production model on
-all five sources for the median fold-selected epoch. Its decoder is calibrated
-from the concatenated out-of-fold predictions. If they do not pass,
+all five sources for the epoch that minimizes the pooled, three-epoch-smoothed
+EMA validation BCE curve across folds. Its decoder is calibrated from the
+concatenated out-of-fold predictions. If they do not pass,
 `stable_shuttle_track_follow_up_allowed` is false and no shuttle fusion should
 be trained.
 
@@ -83,8 +84,9 @@ PYTHONPATH=. .venv/bin/python \
 It contains 126 strict rally intervals and 52,012 owned frame targets. Its
 camera-held-out macro results are raw BCE 0.59745, ROC AUC 0.88974, PR AUC
 0.82313, interval F1 0.41915, and 26.11-frame boundary MAE. The production
-checkpoint uses the median selected epoch and a decoder calibrated from the
-concatenated out-of-fold predictions.
+checkpoint used the median selected epoch, before the EMA and pooled-curve
+selection policy, and a decoder calibrated from the concatenated out-of-fold
+predictions.
 
 The matched candidate-inclusive arm keeps shuttle-selection loss at zero. It
 does not improve interval F1 and reduces macro ROC/PR AUC, so raw shuttle

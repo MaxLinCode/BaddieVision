@@ -286,6 +286,10 @@ def test_clean_training_uses_partition_windows_and_full_held_out_recordings(tmp_
         return (window(source.source_id, block.start, block.stop),), f"artifact-{source.source_id}-{block.start}"
 
     validations = []
+    validation_curves = {
+        "b": (0.70, 0.60, 0.62),
+        "a": (0.50, 0.64, 0.50),
+    }
 
     def fit(model, train, validation, **kwargs):
         assert len(train) == len(validation) == 1
@@ -299,7 +303,12 @@ def test_clean_training_uses_partition_windows_and_full_held_out_recordings(tmp_
         assert torch.isfinite(loss)
         loss.backward()
         validations.append(after.source_id)
-        return [], 1
+        curve = validation_curves[after.source_id]
+        history = [
+            {"epoch": epoch, "validation_raw_bce": value}
+            for epoch, value in enumerate(curve, start=1)
+        ]
+        return history, curve.index(min(curve)) + 1
 
     held_out = []
 
@@ -321,7 +330,7 @@ def test_clean_training_uses_partition_windows_and_full_held_out_recordings(tmp_
     output = tmp_path / "run"
     result = training.run_clean_rally_experiment(
         config, output, camera_sources={"A": ["a"], "B": ["b"]},
-        recipe=RallyTrainingRecipe(epochs=1, device="cpu"),
+        recipe=RallyTrainingRecipe(epochs=3, device="cpu"),
     )
     assert validations == ["b", "a"]
     assert held_out == ["a", "b"]
@@ -333,3 +342,18 @@ def test_clean_training_uses_partition_windows_and_full_held_out_recordings(tmp_
     checkpoint = torch.load(output / "production-rally-segmenter.pt", weights_only=True)
     assert checkpoint["rally_feature_view"] == "full_audio_zscore"
     assert checkpoint["rally_segmenter_config"]["audio_attention"]
+    assert (
+        checkpoint["split_manifest"]["epoch_selection"]
+        == training.POOLED_PRODUCTION_EPOCH_SELECTION
+    )
+    assert checkpoint["split_manifest"]["selected_epoch"] == 3
+    assert checkpoint["chosen_epoch"] == 3
+    assert checkpoint["split_manifest"]["fold_best_epochs"] == [2, 1]
+    assert checkpoint["split_manifest"]["pooled_validation_raw_bce"] == pytest.approx(
+        [0.60, 0.62, 0.56]
+    )
+    assert checkpoint["split_manifest"]["fold_validation_raw_bce"] == {
+        "A": pytest.approx([0.70, 0.60, 0.62]),
+        "B": pytest.approx([0.50, 0.64, 0.50]),
+    }
+    assert result["production"]["chosen_epoch"] == 3
