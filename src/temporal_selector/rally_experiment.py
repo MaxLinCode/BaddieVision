@@ -330,6 +330,7 @@ def train_rally_segmenter(
     seed: int,
     boundary_aux_weight: float = 0.25,
     temporal_smoothing_weight: float = 0.0,
+    inplay_dice_weight: float = 0.0,
     learning_rate: float = 3e-4,
     gradient_clip_norm: float = 1.0,
     sampling: str = "boundary_balanced",
@@ -349,6 +350,7 @@ def train_rally_segmenter(
         batch_size=batch_size,
         boundary_aux_weight=boundary_aux_weight,
         temporal_smoothing_weight=temporal_smoothing_weight,
+        inplay_dice_weight=inplay_dice_weight,
         learning_rate=learning_rate,
         gradient_clip_norm=gradient_clip_norm,
         sampling=sampling,
@@ -435,6 +437,7 @@ def train_rally_segmenter(
                 boundary_end_pos_weight=weights["rally_end_targets"],
                 boundary_aux_weight=boundary_aux_weight,
                 temporal_smoothing_weight=temporal_smoothing_weight,
+                inplay_dice_weight=inplay_dice_weight,
                 return_counts=False,
             )
             if not bool(torch.isfinite(losses.total)):
@@ -1129,6 +1132,7 @@ def run_clean_rally_experiment(
             seed=recipe.seed,
             boundary_aux_weight=recipe.boundary_aux_weight,
             temporal_smoothing_weight=recipe.temporal_smoothing_weight,
+            inplay_dice_weight=recipe.inplay_dice_weight,
             learning_rate=recipe.learning_rate,
             gradient_clip_norm=recipe.gradient_clip_norm,
             sampling=recipe.sampling,
@@ -1188,6 +1192,7 @@ def run_clean_rally_experiment(
         seed=recipe.seed,
         boundary_aux_weight=recipe.boundary_aux_weight,
         temporal_smoothing_weight=recipe.temporal_smoothing_weight,
+        inplay_dice_weight=recipe.inplay_dice_weight,
         learning_rate=recipe.learning_rate,
         gradient_clip_norm=recipe.gradient_clip_norm,
         sampling=recipe.sampling,
@@ -1355,6 +1360,7 @@ def train_rally_segmenter_fixed_epochs(
     seed: int,
     boundary_aux_weight: float,
     temporal_smoothing_weight: float = 0.0,
+    inplay_dice_weight: float = 0.0,
     learning_rate: float = 3e-4,
     gradient_clip_norm: float = 1.0,
     sampling: str = "boundary_balanced",
@@ -1373,6 +1379,7 @@ def train_rally_segmenter_fixed_epochs(
         seed=seed,
         boundary_aux_weight=boundary_aux_weight,
         temporal_smoothing_weight=temporal_smoothing_weight,
+        inplay_dice_weight=inplay_dice_weight,
         learning_rate=learning_rate,
         gradient_clip_norm=gradient_clip_norm,
         sampling=sampling,
@@ -1454,6 +1461,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--gradient-clip-norm", type=float)
     parser.add_argument("--boundary-aux-weight", type=float)
     parser.add_argument("--temporal-smoothing-weight", type=float)
+    parser.add_argument("--inplay-dice-weight", type=float)
     parser.add_argument("--seed", type=int)
     parser.add_argument("--sampling", choices=("boundary_balanced", "uniform"))
     parser.add_argument(
@@ -1502,6 +1510,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     if recipe.temporal_smoothing_weight and not args.clean_only:
         raise ValueError("temporal smoothing requires --clean-only")
+    if recipe.inplay_dice_weight and not args.clean_only:
+        raise ValueError("in-play Dice loss requires --clean-only")
     if args.resume and not args.clean_only:
         raise ValueError(
             "epoch recovery currently requires --clean-only; comparative study arms use their historical trainer"

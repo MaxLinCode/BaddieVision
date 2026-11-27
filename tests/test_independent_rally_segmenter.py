@@ -126,6 +126,26 @@ def test_temporal_smoothing_uses_only_adjacent_owned_same_state_frames() -> None
     assert gradient.count_nonzero() == 2
 
 
+def test_inplay_dice_uses_only_supervised_frames() -> None:
+    batch = _batch()
+    batch.inplay_targets[0, 3] = MASKED_TARGET
+    model = RallySegmenter(_config())
+    output = model(batch)
+    output.inplay_logits = torch.zeros_like(output.inplay_logits, requires_grad=True)
+    baseline = model.losses(batch, output)
+    with_dice = model.losses(batch, output, inplay_dice_weight=0.5)
+
+    # Five supervised frames at probability 0.5, three of which are in play.
+    penalty = with_dice.total - baseline.total
+    torch.testing.assert_close(penalty, torch.tensor(0.5 * (1 - 3 / 5.5)))
+    penalty.backward()
+    gradient = output.inplay_logits.grad
+    assert gradient is not None
+    assert (gradient[batch.inplay_targets == 1] < 0).all()
+    assert (gradient[batch.inplay_targets == 0] > 0).all()
+    assert gradient[batch.inplay_targets == MASKED_TARGET].count_nonzero() == 0
+
+
 def test_attention_masks_missing_audio_without_masking_its_video_frames() -> None:
     audio_dim = len(RALLY_AUDIO_FEATURE_NAMES)
     model = RallySegmenter(replace(
