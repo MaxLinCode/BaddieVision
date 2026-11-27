@@ -158,6 +158,32 @@ threshold on its validation frames.
 The production checkpoint freezes both thresholds using out-of-fold
 predictions, along with the gap and minimum-duration settings.
 
+## Context-window grid
+
+Run the three centered windows sequentially with the same local config and
+training recipe. At 30 fps, the full windows contain 121, 241, and 481 frames.
+They have two, four, and eight seconds of lookahead respectively. Each arm
+uses the same one-second ownership by default and tunes its decoder using
+only its validation frames.
+
+```bash
+for span in 4 8 16; do
+  python -u -m src.temporal_selector.rally_experiment \
+    --config config/rally-experiment.local.json --output-dir "outputs/rally-context/${span}s" \
+    --clean-only --evaluation-only --preset rtmpose-audio --device cuda \
+    --epochs 25 --seed 1729 --batch-size 16 --context-span-seconds "$span" || exit
+done
+python -m experiments.temporal_selector.rally_context_grid \
+  --config config/rally-experiment.local.json --run-root outputs/rally-context
+```
+
+Read `comparison.json` for false starts, interval recall and precision, and
+false splits on each held-out camera. A false start here is a complete decoded
+interval inside reviewed out-of-play footage, with an observed transition
+into and out of the prediction. The report includes source-local timestamps
+for checking shuttle passes. The rally annotations do not identify the
+activity in a break.
+
 ## Joint and court velocity representation
 
 The canonical view adds signed x/y velocity for each pose landmark and each
