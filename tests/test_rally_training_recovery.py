@@ -253,6 +253,9 @@ def test_cli_resolves_config_and_command_line_overrides(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
+    ("cli_span", "evaluation_only"), [(None, False), (16, True)]
+)
+@pytest.mark.parametrize(
     ("dataset_overrides", "expected_seconds"), [({}, 2.0), ({"rally_context_seconds": 3.0}, 3.0)]
 )
 @pytest.mark.parametrize(
@@ -261,6 +264,7 @@ def test_cli_resolves_config_and_command_line_overrides(tmp_path, monkeypatch):
 )
 def test_rtmpose_preset_defaults_to_canonical_motion_and_allows_audio_baseline(
     tmp_path, monkeypatch, dataset_overrides, expected_seconds, cli_view, expected_view,
+    cli_span, evaluation_only,
 ):
     import json
 
@@ -282,6 +286,7 @@ def test_rtmpose_preset_defaults_to_canonical_motion_and_allows_audio_baseline(
         feature_view=config.feature_view,
         smoothing_weight=k["recipe"].temporal_smoothing_weight,
         require_rtmpose=k["require_rtmpose"],
+        evaluation_only=k["evaluation_only"],
     ))
     arguments = [
         "--config", str(config), "--output-dir", str(tmp_path / "output"),
@@ -289,10 +294,13 @@ def test_rtmpose_preset_defaults_to_canonical_motion_and_allows_audio_baseline(
     ]
     if cli_view is not None:
         arguments.extend(("--feature-view", cli_view))
+    if cli_span is not None:
+        arguments.extend(("--context-span-seconds", str(cli_span), "--evaluation-only"))
+        expected_seconds = cli_span / 2
     assert training.main(arguments) == 0
     assert called == {
         "context": expected_seconds, "feature_view": expected_view, "smoothing_weight": 0.1,
-        "require_rtmpose": True,
+        "require_rtmpose": True, "evaluation_only": evaluation_only,
     }
 
 

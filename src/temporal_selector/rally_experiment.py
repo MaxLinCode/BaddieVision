@@ -1012,6 +1012,7 @@ def run_clean_rally_experiment(
     require_rtmpose: bool = False,
     person_model: str | None = None,
     pose_model: Path | None = None,
+    evaluation_only: bool = False,
 ) -> dict[str, Any]:
     """Run candidate-free camera-held-out training without loading shuttle artifacts."""
     recipe = recipe or RallyTrainingRecipe()
@@ -1177,6 +1178,20 @@ def run_clean_rally_experiment(
         }
         _write_json(fold_dir / "metrics.json", fold_result)
         fold_artifacts.append(fold_result)
+    result = {
+        "schema": "clean_cross_camera_rally_segmenter",
+        "schema_version": 1,
+        "dataset_manifest": rally_dataset.manifest,
+        "training_recipe": asdict(recipe),
+        "camera_sources": {key: list(value) for key, value in camera_sources.items()},
+        "folds": fold_artifacts,
+        "by_camera": camera_metrics,
+        "macro": _macro_metrics(camera_metrics),
+        "production": None,
+    }
+    if evaluation_only:
+        _write_json(output_dir / "metrics.json", result)
+        return result
     production_epoch = round(statistics.median(selected_epochs))
     production = RallySegmenter(model_config).to(device)
     production_history = train_rally_segmenter_fixed_epochs(
@@ -1223,15 +1238,10 @@ def run_clean_rally_experiment(
                "experiment_role": "expanded_clean_only_production"},
     )
     torch.save(production_checkpoint, output_dir / "production-rally-segmenter.pt")
-    result = {
-        "schema": "clean_cross_camera_rally_segmenter", "schema_version": 1,
-        "dataset_manifest": rally_dataset.manifest,
-        "training_recipe": asdict(recipe), "camera_sources": {key: list(value) for key, value in camera_sources.items()},
-        "folds": fold_artifacts, "by_camera": camera_metrics,
-        "macro": _macro_metrics(camera_metrics),
-        "production": {"checkpoint": "production-rally-segmenter.pt",
-                       "chosen_epoch": production_epoch,
-                       "decoder_configuration": asdict(oof_decoder)},
+    result["production"] = {
+        "checkpoint": "production-rally-segmenter.pt",
+        "chosen_epoch": production_epoch,
+        "decoder_configuration": asdict(oof_decoder),
     }
     _write_json(output_dir / "metrics.json", result)
     return result
@@ -1462,6 +1472,14 @@ def _parser() -> argparse.ArgumentParser:
         help="Resume the clean-only run from committed epochs",
     )
     parser.add_argument("--clean-only", action="store_true")
+    parser.add_argument(
+        "--context-span-seconds", type=float,
+        help="Full centered context duration, split equally before and after the anchor",
+    )
+    parser.add_argument(
+        "--evaluation-only", action="store_true",
+        help="Evaluate held-out cameras and skip fitting an all-source model",
+    )
     parser.add_argument("--person-model", help="Original detector asset for split recordings")
     parser.add_argument("--pose-model", type=Path, help="Original pose asset for split recordings")
     parser.add_argument(
@@ -1474,7 +1492,10 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
+    parser = _parser()
+    args = parser.parse_args(argv)
+    if not args.clean_only and (args.context_span_seconds is not None or args.evaluation_only):
+        parser.error("--context-span-seconds and --evaluation-only require --clean-only")
     raw_training = json.loads(args.config.expanduser().read_text(encoding="utf-8")).get(
         "training", {}
     )
@@ -1521,6 +1542,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 RALLY_TRANSFORMER_CONTEXT_RADIUS_SECONDS if rtmpose_preset else RallyDataConfig.context_seconds
             ),
         )
+        if args.context_span_seconds is not None:
+            data_config = replace(data_config, context_seconds=args.context_span_seconds / 2)
         feature_view = args.feature_view
         if rtmpose_preset and feature_view is None:
             feature_view = CANONICAL_RALLY_FEATURE_VIEW
@@ -1543,6 +1566,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             require_rtmpose=rtmpose_preset,
             person_model=args.person_model,
             pose_model=args.pose_model,
+            evaluation_only=args.evaluation_only,
         )
         return 0
     if args.candidate_inclusive_only:
