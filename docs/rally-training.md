@@ -191,3 +191,28 @@ training recipe fixed. Report interval F1 and signed start/end errors by
 camera. The motion views change both pose normalization and velocity
 channels, so comparisons against the original views measure their combined
 effect. The filter windows span less time at higher FPS.
+
+## Singles-base ablation
+
+Run the canonical motion baseline and the two singles-base views with the
+same camera folds and training settings.
+
+```bash
+for view in full_audio_zscore_motion full_audio_zscore_motion_base_distance full_audio_zscore_motion_base_radial; do
+  python -m src.temporal_selector.rally_experiment \
+    --config config/rally-experiment.local.json --clean-only --preset rtmpose-audio \
+    --feature-view "$view" --device cuda --output-dir "outputs/singles-base/$view"
+done
+```
+
+The base is the midpoint of each player's singles half-court, halfway from
+the net to the baseline. Distance is Euclidean in court metres, divided by
+the distance from the midpoint to a singles corner. The radial view also
+fits a trailing four-frame slope of that distance per second. Positive values
+indicate movement away from base and negative values indicate recovery toward
+it. The slope is masked across missing court observations and track changes.
+Both features use the raw projected positions before court smoothing.
+
+Compare held-out interval F1, boundary error, and false splits and merges.
+The distance-only arm isolates the effect of adding radial velocity to the
+distance channels.
