@@ -411,6 +411,7 @@ def test_rally_singles_base_features_use_metric_distance_and_mask_discontinuous_
     from src.court_projection import HALF_LENGTH, HALF_SINGLES_WIDTH, HALF_WIDTH
     from src.temporal_selector.rally_features import (
         FULL_RALLY_FEATURE_NAMES,
+        SinglesBaseObservations,
         rally_singles_base_features,
     )
 
@@ -427,7 +428,8 @@ def test_rally_singles_base_features_use_metric_distance_and_mask_discontinuous_
     values[:, far_y] = 0.5 + distance_metres.flip((0,)) / HALF_LENGTH
     tracks[4:, 1] = 2
     observed[4, near_y] = False
-    features, valid = rally_singles_base_features(values, observed, tracks, fps=30)
+    observations = SinglesBaseObservations.from_features(values, observed, tracks)
+    features, valid = rally_singles_base_features(observations, fps=30)
 
     normalization = (HALF_SINGLES_WIDTH**2 + (HALF_LENGTH / 2)**2)**0.5
     assert torch.allclose(features[:4, 0], distance_metres[:4] / normalization)
@@ -439,6 +441,56 @@ def test_rally_singles_base_features_use_metric_distance_and_mask_discontinuous_
     assert not valid[4, 0]
     assert valid[-1, 1] and features[-1, 1] == 0
     assert torch.count_nonzero(features[~valid]) == 0
+
+
+def test_fit_singles_base_uses_owned_inplay_positions_and_mirrors_depth() -> None:
+    from src.court_projection import HALF_LENGTH, HALF_WIDTH
+    from src.temporal_selector.rally_dataset import fit_rally_singles_base, with_rally_singles_base
+    from src.temporal_selector.rally_features import (
+        BASE_FEATURE_NAMES,
+        BASE_RADIAL_RALLY_FEATURE_VIEW,
+        SinglesBaseObservations,
+        rally_feature_view,
+        rally_singles_base_features,
+    )
+
+    view = rally_feature_view(BASE_RADIAL_RALLY_FEATURE_VIEW)
+    metres = torch.tensor([
+        [[2.0, -6.0], [2.0, 6.0]],
+        [[-2.0, -5.0], [-2.0, 5.0]],
+        [[1.0, -4.0], [1.0, 4.0]],
+        [[-1.0, -2.0], [1.0, 4.0]],
+        [[0.4, -3.0], [3.0, 5.0]],
+        [[-2.0, -5.0], [-2.0, 5.0]],
+    ])
+    observations = SinglesBaseObservations(
+        metres / torch.tensor([HALF_WIDTH, HALF_LENGTH]),
+        torch.ones((6, 2), dtype=torch.bool),
+        torch.ones((6, 2), dtype=torch.long),
+    )
+    window = replace(
+        _window("train", 4),
+        frame_indices=(3, 4, 5),
+        owned_frames=frozenset((3, 4)),
+        inplay_targets=torch.ones(3, dtype=torch.long),
+        frame_values=torch.ones(3, view.dimension),
+        frame_validity=torch.ones(3, view.dimension, dtype=torch.bool),
+        metadata={"fps": 30.0, "feature_view": view.name},
+        singles_base_observations=observations,
+    )
+    base = fit_rally_singles_base([window])
+    assert base == pytest.approx((0.4, 3.0))
+    with pytest.raises(ValueError, match="observed in-play"):
+        fit_rally_singles_base([replace(window, inplay_targets=torch.zeros(3))])
+
+    fitted = with_rally_singles_base([window], base)[0]
+    expected_values, expected_validity = rally_singles_base_features(observations, 30, base)
+    columns = [view.names.index(name) for name in BASE_FEATURE_NAMES]
+    assert torch.equal(fitted.frame_values[:, columns], expected_values[3:])
+    assert torch.equal(fitted.frame_validity[:, columns], expected_validity[3:])
+    assert fitted.frame_validity[0, columns[2:]].all()
+    assert torch.all(fitted.frame_values[:, :min(columns)] == 1)
+    assert torch.all(fitted.frame_values[:, max(columns) + 1:] == 1)
 
 
 def test_rally_motion_pose_uses_crop_geometry_and_track_median_torso() -> None:

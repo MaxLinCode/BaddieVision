@@ -40,9 +40,11 @@ from src.temporal_selector.rally import (
 )
 from src.temporal_selector.rally_dataset import RALLY_TRANSFORMER_CONTEXT_RADIUS_SECONDS
 from src.temporal_selector.rally_features import (
+    BASE_RADIAL_RALLY_FEATURE_VIEW,
     RALLY_FEATURE_SCHEMA,
     RALLY_FEATURE_VERSION,
     RALLY_FEATURE_VIEWS,
+    validate_singles_base_metres,
 )
 
 RELEASE_SCHEMA = "baddievision.rally.inference_release"
@@ -187,6 +189,11 @@ def validate_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
     expected_preprocessing = set(defaults)
     if not legacy:
         expected_preprocessing.add("pose_model_sha256")
+    if "singles_base_metres" in preprocessing:
+        if view.name != BASE_RADIAL_RALLY_FEATURE_VIEW:
+            raise ValueError("a fitted singles base requires the distance plus radial velocity view")
+        validate_singles_base_metres(preprocessing["singles_base_metres"])
+        expected_preprocessing.add("singles_base_metres")
     if set(preprocessing) - {"tracking_profile"} != expected_preprocessing:
         raise ValueError("release preprocessing fields are incompatible")
     if release_tracking_profile(value) not in PLAYER_TRACKING_PROFILES:
@@ -426,6 +433,14 @@ def export_release(
         pose_asset = ("pose_model", pose_model, DEFAULT_RTMPOSE_MODEL_NAME)
         runtime = _package_version("onnxruntime-gpu")
         pose_runtime = {"onnxruntime": _package_version("onnxruntime") if runtime == "uninstalled" else runtime}
+    trained_base = research.get("singles_base_metres")
+    if "singles_base_metres" in recipe:
+        if trained_base is None or validate_singles_base_metres(
+            recipe["singles_base_metres"]
+        ) != validate_singles_base_metres(trained_base):
+            raise ValueError("export singles base differs from training")
+    if trained_base is not None:
+        recipe["singles_base_metres"] = list(validate_singles_base_metres(trained_base))
     output = Path(output_dir)
     if output.exists() and any(output.iterdir()):
         raise FileExistsError("release output directory must be empty")

@@ -129,6 +129,7 @@ def predict_source(
     keys = (
         "pose_visibility_threshold", "pose_coordinate_mode", "context_seconds",
         "ownership_seconds", "feature_view", "cached_court_tolerance",
+        "singles_base_metres",
     )
     settings = {key: preprocessing[key] for key in keys if key in preprocessing}
     # Release manifests may use the existing checkpoint's view key.
