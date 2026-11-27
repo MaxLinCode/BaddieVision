@@ -356,12 +356,15 @@ class RallySegmenter(nn.Module):
         boundary_end_pos_weight: Tensor | None = None,
         boundary_aux_weight: float = 0.25,
         temporal_smoothing_weight: float = 0.0,
+        inplay_dice_weight: float = 0.0,
         return_counts: bool = True,
     ) -> RallyLosses:
         if boundary_aux_weight < 0:
             raise ValueError("boundary auxiliary weight cannot be negative")
         if not math.isfinite(temporal_smoothing_weight) or temporal_smoothing_weight < 0:
             raise ValueError("temporal smoothing weight must be finite and nonnegative")
+        if not math.isfinite(inplay_dice_weight) or inplay_dice_weight < 0:
+            raise ValueError("in-play Dice weight must be finite and nonnegative")
         output = output or self(batch)
         inplay_mask = batch.frame_mask & (
             batch.inplay_targets != MASKED_TARGET
@@ -403,11 +406,21 @@ class RallySegmenter(nn.Module):
                 int((start_mask | end_mask).sum()) if return_counts else None
             )
         total = inplay + float(boundary_aux_weight) * (start + end) / 2
+        if inplay_dice_weight or temporal_smoothing_weight:
+            probabilities = output.inplay_logits.masked_fill(~inplay_mask, 0.0).sigmoid()
+        if inplay_dice_weight:
+            foreground = (batch.inplay_targets == 1) & inplay_mask
+            predicted_mass = probabilities.masked_fill(~inplay_mask, 0.0).sum()
+            target_mass = foreground.sum()
+            intersection = probabilities.masked_fill(~foreground, 0.0).sum()
+            dice_loss = (predicted_mass + target_mass - 2 * intersection) / (
+                predicted_mass + target_mass
+            ).clamp_min(1e-6)
+            total = total + inplay_dice_weight * dice_loss
         if temporal_smoothing_weight:
             # Each row is a contiguous source window. Unowned targets are masked.
             same_state = batch.inplay_targets[:, 1:] == batch.inplay_targets[:, :-1]
             pair_mask = inplay_mask[:, 1:] & inplay_mask[:, :-1] & same_state
-            probabilities = output.inplay_logits.masked_fill(~inplay_mask, 0.0).sigmoid()
             differences = (probabilities[:, 1:] - probabilities[:, :-1]).abs()
             smoothing = differences.masked_fill(~pair_mask, 0.0).sum()
             total = total + temporal_smoothing_weight * smoothing / pair_mask.sum().clamp_min(1)
@@ -485,6 +498,7 @@ class RallyTrainingRecipe:
     gradient_clip_norm: float = 1.0
     device: str = "mps"
     temporal_smoothing_weight: float = 0.0
+    inplay_dice_weight: float = 0.0
 
     def __post_init__(self) -> None:
         for name in ("epochs", "batch_size"):
@@ -517,11 +531,16 @@ class RallyTrainingRecipe:
         if not math.isfinite(self.temporal_smoothing_weight) or self.temporal_smoothing_weight < 0:
             raise ValueError("temporal smoothing weight must be finite and nonnegative")
 
+        if not math.isfinite(self.inplay_dice_weight) or self.inplay_dice_weight < 0:
+            raise ValueError("in-play Dice weight must be finite and nonnegative")
+
     def recovery_settings(self) -> dict[str, Any]:
         settings = asdict(self)
         # Older runs have no smoothing setting in their recovery files.
         if not self.temporal_smoothing_weight:
             settings.pop("temporal_smoothing_weight")
+        if not self.inplay_dice_weight:
+            settings.pop("inplay_dice_weight")
         return settings
 
     @classmethod
