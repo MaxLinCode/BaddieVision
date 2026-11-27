@@ -1513,7 +1513,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if rtmpose_preset:
         if not args.clean_only:
             raise ValueError("the RTMPose audio preset requires --clean-only")
-        if args.feature_view not in (None, "full_audio_zscore", CANONICAL_RALLY_FEATURE_VIEW):
+        if args.feature_view is not None and not rally_feature_view(args.feature_view).audio_zscore:
             raise ValueError("the RTMPose audio preset requires a normalized-audio feature view")
         overrides.setdefault("temporal_smoothing_weight", 0.1)
     recipe = RallyTrainingRecipe.from_preset(
