@@ -116,7 +116,8 @@ def test_gaussian_boundary_targets_keep_starts_sharp_and_respect_supervision() -
         frozenset(frames[:-1]),
         [0, 1, 1, 1, 1, 1, 0, 0, MASKED_TARGET, 0],
         fps=30,
-        gaussian=True,
+        gaussian_start=True,
+        gaussian_end=True,
     )
     assert starts[1] == ends[5] == 1
     assert starts[0] == starts[2] == pytest.approx(math.exp(-0.5))
@@ -126,6 +127,20 @@ def test_gaussian_boundary_targets_keep_starts_sharp_and_respect_supervision() -
     assert torch.all(starts[-2:] == MASKED_TARGET)
     assert torch.all(ends[-2:] == MASKED_TARGET)
 
+    intervals = (RallyInterval("source", "rally", 20, 60),)
+    owned = frozenset(frames)
+    labels = [0] * len(frames)
+    triangle_starts, _ = rally_boundary_targets(intervals, frozenset(), frames, owned, labels, fps=30)
+    _, gaussian_ends = rally_boundary_targets(
+        intervals, frozenset(), frames, owned, labels, fps=30,
+        gaussian_start=True, gaussian_end=True,
+    )
+    hybrid_starts, hybrid_ends = rally_boundary_targets(
+        intervals, frozenset(), frames, owned, labels, fps=30, gaussian_end=True,
+    )
+    torch.testing.assert_close(hybrid_starts, triangle_starts, rtol=0, atol=0)
+    torch.testing.assert_close(hybrid_ends, gaussian_ends, rtol=0, atol=0)
+
     starts, cut_ends = rally_boundary_targets(
         (RallyInterval("source", "rally", 20, 60),),
         frozenset({"rally"}),
@@ -133,7 +148,8 @@ def test_gaussian_boundary_targets_keep_starts_sharp_and_respect_supervision() -
         frozenset(frames[:5]),
         [0, 1, 1, 1, 1],
         fps=30,
-        gaussian=True,
+        gaussian_start=True,
+        gaussian_end=True,
         boundary_range=range(60),
     )
     assert starts.count_nonzero() == cut_ends.count_nonzero() == 0
@@ -150,7 +166,16 @@ def test_quality_focal_boundary_loss_uses_soft_targets_and_masks_padding() -> No
         ~batch.frame_mask, -torch.inf
     ).requires_grad_()
     output.rally_end_logits.retain_grad()
-    losses = model.losses(batch, output, quality_focal_boundaries=True)
+    start_weight = torch.tensor(4.0)
+    losses = model.losses(
+        batch, output, quality_focal_start=True, quality_focal_end=True,
+        boundary_start_pos_weight=start_weight,
+    )
+    hybrid = model.losses(batch, output, quality_focal_end=True, boundary_start_pos_weight=start_weight)
+    baseline = model.losses(batch, output, boundary_start_pos_weight=start_weight)
+    torch.testing.assert_close(hybrid.rally_start, baseline.rally_start)
+    torch.testing.assert_close(hybrid.rally_end, losses.rally_end)
+    assert not torch.isclose(hybrid.rally_start, losses.rally_start)
     targets = batch.rally_start_targets[batch.frame_mask]
     expected = math.log(2) * (0.5 - targets).square().mean()
     torch.testing.assert_close(losses.rally_start, expected)

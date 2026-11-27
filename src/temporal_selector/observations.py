@@ -61,7 +61,8 @@ def rally_boundary_targets(
     *,
     fps: float,
     taper_seconds: float = 0.25,
-    gaussian: bool = False,
+    gaussian_start: bool = False,
+    gaussian_end: bool = False,
     boundary_range: range | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Derive owned/reviewed soft boundary targets from strict intervals."""
@@ -83,14 +84,14 @@ def rally_boundary_targets(
                 distance = abs(frame - interval.start_frame)
                 target = (
                     _gaussian_boundary_target(distance / fps, RALLY_START_GAUSSIAN_SIGMA_SECONDS)
-                    if gaussian else max(0.0, 1.0 - distance / (fps * taper_seconds))
+                    if gaussian_start else max(0.0, 1.0 - distance / (fps * taper_seconds))
                 )
                 start = max(start, target)
             if boundary_range is None or interval.end_frame in boundary_range:
                 distance = abs(frame - interval.end_frame)
                 target = (
                     _gaussian_boundary_target(distance / fps, RALLY_END_GAUSSIAN_SIGMA_SECONDS)
-                    if gaussian else max(0.0, 1.0 - distance / (fps * taper_seconds))
+                    if gaussian_end else max(0.0, 1.0 - distance / (fps * taper_seconds))
                 )
                 end = max(end, target)
         starts.append(start)

@@ -388,10 +388,11 @@ def train_rally_segmenter(
         list(train_windows), batch_sampler=sampler, collate_fn=collate_rally_windows
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-    quality_focal_boundaries = recipe.boundary_supervision == "gaussian_qfl"
     weight_fields = ["inplay_targets"]
-    if not quality_focal_boundaries:
-        weight_fields.extend(("rally_start_targets", "rally_end_targets"))
+    if not recipe.gaussian_start:
+        weight_fields.append("rally_start_targets")
+    if not recipe.gaussian_end:
+        weight_fields.append("rally_end_targets")
     weights = {
         field: _positive_weight(
             train_windows,
@@ -442,7 +443,8 @@ def train_rally_segmenter(
                 boundary_end_pos_weight=weights.get("rally_end_targets"),
                 boundary_aux_weight=boundary_aux_weight,
                 temporal_smoothing_weight=temporal_smoothing_weight,
-                quality_focal_boundaries=quality_focal_boundaries,
+                quality_focal_start=recipe.gaussian_start,
+                quality_focal_end=recipe.gaussian_end,
                 return_counts=False,
             )
             if not bool(torch.isfinite(losses.total)):
@@ -1042,7 +1044,7 @@ def run_clean_rally_experiment(
     # Full-source observations are used for held-out scoring and production.
     # A source divided by a fold cut gets independently extracted observations.
     data_config = replace(
-        data_config, gaussian_boundaries=recipe.boundary_supervision == "gaussian_qfl"
+        data_config, gaussian_start=recipe.gaussian_start, gaussian_end=recipe.gaussian_end
     )
     rally_dataset = RallyWindowDataset(data_config)
     if rally_dataset.rally_index != index:

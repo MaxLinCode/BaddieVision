@@ -22,7 +22,7 @@ from .rally_features import (
 RALLY_FEATURE_DIM = RALLY_FEATURE_VIEWS["full"].dimension
 RALLY_CONTEXT_DIRECTION = "offline_centered"
 RALLY_MODEL_TYPE = "RallySegmenter"
-RALLY_BOUNDARY_SUPERVISION = ("triangle_bce", "gaussian_qfl")
+RALLY_BOUNDARY_SUPERVISION = ("triangle_bce", "gaussian_qfl", "end_gaussian_qfl")
 
 
 @dataclass
@@ -361,7 +361,8 @@ class RallySegmenter(nn.Module):
         boundary_end_pos_weight: Tensor | None = None,
         boundary_aux_weight: float = 0.25,
         temporal_smoothing_weight: float = 0.0,
-        quality_focal_boundaries: bool = False,
+        quality_focal_start: bool = False,
+        quality_focal_end: bool = False,
         return_counts: bool = True,
     ) -> RallyLosses:
         if boundary_aux_weight < 0:
@@ -398,14 +399,14 @@ class RallySegmenter(nn.Module):
                 batch.rally_start_targets,
                 start_mask,
                 pos_weight=boundary_start_pos_weight,
-                quality_focal=quality_focal_boundaries,
+                quality_focal=quality_focal_start,
             )
             end = self._masked_bce(
                 output.rally_end_logits,
                 batch.rally_end_targets,
                 end_mask,
                 pos_weight=boundary_end_pos_weight,
-                quality_focal=quality_focal_boundaries,
+                quality_focal=quality_focal_end,
             )
             boundary_frames = (
                 int((start_mask | end_mask).sum()) if return_counts else None
@@ -527,6 +528,14 @@ class RallyTrainingRecipe:
 
         if not math.isfinite(self.temporal_smoothing_weight) or self.temporal_smoothing_weight < 0:
             raise ValueError("temporal smoothing weight must be finite and nonnegative")
+
+    @property
+    def gaussian_start(self) -> bool:
+        return self.boundary_supervision == "gaussian_qfl"
+
+    @property
+    def gaussian_end(self) -> bool:
+        return self.boundary_supervision != "triangle_bce"
 
     def recovery_settings(self) -> dict[str, Any]:
         settings = asdict(self)

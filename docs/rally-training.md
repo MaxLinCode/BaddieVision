@@ -89,20 +89,21 @@ and camera splits.
 
 ## Boundary supervision comparison
 
-The clean trainer accepts `--boundary-supervision triangle_bce` (the default)
-and `--boundary-supervision gaussian_qfl`. The Gaussian experiment uses a
+The clean trainer accepts `--boundary-supervision triangle_bce` (the default),
+`gaussian_qfl` for both heads, and `end_gaussian_qfl` for Gaussian/QFL ends
+with triangle targets and weighted BCE for starts. Gaussian targets use a
 standard deviation of 0.10 seconds for starts and 0.35 seconds for ends, with
 targets cut off beyond three standard deviations. The annotated frame remains
 the peak. Unreviewed or unowned frames remain masked, and boundaries outside
 a split clip do not contribute to its targets.
 
 Quality Focal Loss multiplies unweighted binary cross-entropy by
-`(sigmoid(logit) - target)²` on each supervised frame of the two boundary
-heads. The InPlay loss retains its existing weighting. The selected recipe
+`(sigmoid(logit) - target)²` on each supervised frame of the configured boundary
+head. The InPlay loss retains its existing weighting. The selected recipe
 is stored in the resolved run and checkpoints.
 
 ```bash
-for supervision in triangle_bce gaussian_qfl; do
+for supervision in triangle_bce gaussian_qfl end_gaussian_qfl; do
   python -m src.temporal_selector.rally_experiment \
     --config config/rally-experiment.local.json --clean-only \
     --preset rtmpose-audio --device cuda \
