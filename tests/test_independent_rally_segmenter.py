@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import math
 from dataclasses import fields, replace
 
 import pytest
@@ -20,6 +21,7 @@ from src.temporal_selector import (
     collate_rally_windows,
     rally_checkpoint,
 )
+from src.temporal_selector.rally_audio import RALLY_AUDIO_FEATURE_NAMES
 from src.temporal_selector.rally_evaluation import (
     camera_held_out_folds,
     chronological_camera_train_validation_split,
@@ -28,7 +30,8 @@ from src.temporal_selector.rally_evaluation import (
     rally_metrics,
     stable_track_fusion_acceptance,
 )
-from src.temporal_selector.rally_audio import RALLY_AUDIO_FEATURE_NAMES
+from src.temporal_selector.rally_intervals import RallyInterval
+from src.temporal_selector.observations import rally_boundary_targets
 
 
 def _config() -> RallySegmenterConfig:
@@ -102,6 +105,63 @@ def test_padding_missing_features_and_boundary_masks_produce_finite_cpu_loss() -
     assert torch.isfinite(losses.total)
     losses.total.backward()
     assert model.frame_projection.network[0].weight.grad is not None
+
+
+def test_gaussian_boundary_targets_keep_starts_sharp_and_respect_supervision() -> None:
+    frames = (17, 20, 23, 29, 49, 60, 63, 69, 93, 94)
+    starts, ends = rally_boundary_targets(
+        (RallyInterval("source", "rally", 20, 60),),
+        frozenset(),
+        frames,
+        frozenset(frames[:-1]),
+        [0, 1, 1, 1, 1, 1, 0, 0, MASKED_TARGET, 0],
+        fps=30,
+        gaussian=True,
+    )
+    assert starts[1] == ends[5] == 1
+    assert starts[0] == starts[2] == pytest.approx(math.exp(-0.5))
+    assert ends[6] > starts[2]
+    assert ends[7] == pytest.approx(math.exp(-0.5 * (0.3 / 0.35)**2))
+    assert ends[4] > 0.5
+    assert torch.all(starts[-2:] == MASKED_TARGET)
+    assert torch.all(ends[-2:] == MASKED_TARGET)
+
+    starts, cut_ends = rally_boundary_targets(
+        (RallyInterval("source", "rally", 20, 60),),
+        frozenset({"rally"}),
+        frames[:5],
+        frozenset(frames[:5]),
+        [0, 1, 1, 1, 1],
+        fps=30,
+        gaussian=True,
+        boundary_range=range(60),
+    )
+    assert starts.count_nonzero() == cut_ends.count_nonzero() == 0
+
+
+def test_quality_focal_boundary_loss_uses_soft_targets_and_masks_padding() -> None:
+    batch = _batch()
+    batch.rally_start_targets[0, 0] = 0.5
+    batch.rally_start_targets[0, 1] = 0.75
+    batch.rally_end_targets[0, 0] = MASKED_TARGET
+    model = RallySegmenter(_config())
+    output = model(batch)
+    output.rally_start_logits = torch.zeros_like(output.rally_start_logits).masked_fill(
+        ~batch.frame_mask, -torch.inf
+    ).requires_grad_()
+    output.rally_end_logits.retain_grad()
+    losses = model.losses(batch, output, quality_focal_boundaries=True)
+    targets = batch.rally_start_targets[batch.frame_mask]
+    expected = math.log(2) * (0.5 - targets).square().mean()
+    torch.testing.assert_close(losses.rally_start, expected)
+    torch.testing.assert_close(losses.inplay, model.losses(batch, output).inplay)
+    losses.total.backward()
+    start_gradient = output.rally_start_logits.grad
+    end_gradient = output.rally_end_logits.grad
+    assert torch.isfinite(start_gradient).all() and torch.isfinite(end_gradient).all()
+    assert start_gradient[0, 0] == end_gradient[0, 0] == 0
+    assert start_gradient[0, 1] < 0
+    assert start_gradient[1, 2:].count_nonzero() == end_gradient[1, 2:].count_nonzero() == 0
 
 
 def test_temporal_smoothing_uses_only_adjacent_owned_same_state_frames() -> None:

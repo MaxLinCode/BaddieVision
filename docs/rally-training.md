@@ -11,7 +11,7 @@ python -m src.temporal_selector.rally_experiment \
 
 A config's optional `training` object accepts `seed`, `epochs`, `batch_size`,
 `sampling` (`boundary_balanced` or `uniform`), `boundary_aux_weight`, `optimizer`
-(`AdamW`), `learning_rate`, `gradient_clip_norm`, and `device`. CLI values take
+(`AdamW`), `learning_rate`, `gradient_clip_norm`, `device`, and `boundary_supervision`. CLI values take
 precedence. Every run writes `resolved-config.json` before training, and final
 metrics and inference exports record the resolved recipe. The historical
 25-epoch MPS configuration remains available as `--preset benchmark`; overrides
@@ -86,6 +86,33 @@ channel and emits zero when there is insufficient history or variance.
 `full_audio_zscore` remains available as the audio-only baseline. Use
 `full_audio` to compare against raw audio with the same attention architecture
 and camera splits.
+
+## Boundary supervision comparison
+
+The clean trainer accepts `--boundary-supervision triangle_bce` (the default)
+and `--boundary-supervision gaussian_qfl`. The Gaussian experiment uses a
+standard deviation of 0.10 seconds for starts and 0.35 seconds for ends, with
+targets cut off beyond three standard deviations. The annotated frame remains
+the peak. Unreviewed or unowned frames remain masked, and boundaries outside
+a split clip do not contribute to its targets.
+
+Quality Focal Loss multiplies unweighted binary cross-entropy by
+`(sigmoid(logit) - target)²` on each supervised frame of the two boundary
+heads. The InPlay loss retains its existing weighting. The selected recipe
+is stored in the resolved run and checkpoints.
+
+```bash
+for supervision in triangle_bce gaussian_qfl; do
+  python -m src.temporal_selector.rally_experiment \
+    --config config/rally-experiment.local.json --clean-only \
+    --preset rtmpose-audio --device cuda \
+    --boundary-supervision "$supervision" --output-dir "outputs/rally-$supervision"
+done
+```
+
+The interval decoder uses InPlay scores. Compare decoded start and end errors
+in the held-out `interval_matches` alongside interval F1, and use the saved
+boundary logits in `test-predictions.jsonl` to evaluate the two heads directly.
 
 ## Clean train and validation partitions
 
