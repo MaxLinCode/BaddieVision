@@ -435,11 +435,16 @@ def test_explicit_device_failure_and_auto_fallback(pipeline, monkeypatch):
     assert calls == {"person": 0, "players": 0}
 
 
-@pytest.mark.parametrize("view", [
-    "no_position", "full_audio", "full_motion", "full_audio_zscore_motion",
-    "full_audio_zscore_motion_base_distance", "full_audio_zscore_motion_base_radial",
+@pytest.mark.parametrize(("view", "base"), [
+    ("no_position", None),
+    ("full_audio", None),
+    ("full_motion", None),
+    ("full_audio_zscore_motion", None),
+    ("full_audio_zscore_motion_base_distance", None),
+    ("full_audio_zscore_motion_base_radial", None),
+    ("full_audio_zscore_motion_base_radial", (0.18, 3.6)),
 ])
-def test_pipeline_uses_manifest_feature_view(pipeline, view):
+def test_pipeline_uses_manifest_feature_view(pipeline, view, base):
     kwargs, _ = pipeline
     config = RallySegmenterConfig(
         frame_feature_dim=RALLY_FEATURE_VIEWS[view].dimension,
@@ -461,6 +466,7 @@ def test_pipeline_uses_manifest_feature_view(pipeline, view):
         chosen_epoch=1,
         decoder_configuration=asdict(InPlayDecoderConfig()),
         feature_view=view,
+        singles_base_metres=base,
     )
     torch.save(checkpoint, research)
     original_manifest = json.loads(kwargs["model_manifest"].read_text())
@@ -477,6 +483,8 @@ def test_pipeline_uses_manifest_feature_view(pipeline, view):
         base_url=output.as_uri(),
         model_id="view-v1",
     )
+    if base is not None:
+        assert json.loads(manifest.read_text())["preprocessing"]["singles_base_metres"] == list(base)
     result = run_pipeline(
         **dict(
             kwargs, checkpoint=output / "rally-segmenter.pt", model_manifest=manifest

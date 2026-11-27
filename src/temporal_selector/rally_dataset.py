@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -35,12 +35,17 @@ from .rally import (
 )
 from .rally_audio import read_rally_audio
 from .rally_features import (
+    BASE_FEATURE_NAMES,
+    BASE_RADIAL_RALLY_FEATURE_VIEW,
     FULL_RALLY_FEATURE_NAMES,
+    SINGLES_BASE_VELOCITY_FRAMES,
+    SinglesBaseObservations,
     normalize_rally_motion_pose,
     rally_feature_view,
     rally_motion_features,
     rally_singles_base_features,
     smooth_rally_court_positions,
+    validate_singles_base_metres,
 )
 from .rally_intervals import read_rally_intervals
 
@@ -89,6 +94,8 @@ class RallyDataConfig:
     ownership_seconds: float = 1.0
     feature_view: str = "full"
     cached_court_tolerance: float = 1e-5
+    singles_base_metres: tuple[float, float] | None = None
+    fit_singles_base: bool = False
 
     def __post_init__(self) -> None:
         if len({source.source_id for source in self.sources}) != len(self.sources):
@@ -105,6 +112,15 @@ class RallyDataConfig:
         ):
             raise ValueError("rally context and ownership durations must be finite and positive")
         rally_feature_view(self.feature_view)
+        if self.fit_singles_base or self.singles_base_metres is not None:
+            if self.feature_view != BASE_RADIAL_RALLY_FEATURE_VIEW:
+                raise ValueError("a fitted singles base requires the distance plus radial velocity view")
+        if self.singles_base_metres is not None:
+            if self.fit_singles_base:
+                raise ValueError("a singles base can be fitted or supplied")
+            object.__setattr__(
+                self, "singles_base_metres", validate_singles_base_metres(self.singles_base_metres)
+            )
         if self.cached_court_tolerance < 0:
             raise ValueError("cached court-coordinate tolerance cannot be negative")
         if (self.rally_intervals_path is None) != (self.rally_manifest_path is None):
@@ -129,6 +145,47 @@ class RallyWindow:
     rally_start_targets: torch.Tensor
     rally_end_targets: torch.Tensor
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    singles_base_observations: SinglesBaseObservations | None = field(default=None, repr=False)
+
+
+def fit_rally_singles_base(windows: Sequence[RallyWindow]) -> tuple[float, float]:
+    """Pool one position per observed player per owned, reviewed in-play frame."""
+    samples = []
+    for window in windows:
+        observations = window.singles_base_observations
+        if observations is None:
+            raise ValueError("singles-base fitting requires raw court observations")
+        owned_inplay = (window.inplay_targets == 1) & torch.tensor(
+            [frame in window.owned_frames for frame in window.frame_indices]
+        )
+        frames = owned_inplay.nonzero(as_tuple=True)[0] + len(observations.positions) - len(window.frame_indices)
+        samples.append(observations.mirrored_in_bounds_metres(frames))
+    if not samples or not any(len(sample) for sample in samples):
+        raise ValueError("singles-base fitting requires observed in-play positions within the singles court")
+    x, depth = torch.cat(samples).quantile(0.5, dim=0).tolist()
+    return x, depth
+
+
+def with_rally_singles_base(
+    windows: Sequence[RallyWindow], base_metres: tuple[float, float],
+) -> list[RallyWindow]:
+    """Replace only base channels using a frozen midpoint or fitted base."""
+    view = rally_feature_view(BASE_RADIAL_RALLY_FEATURE_VIEW)
+    columns = tuple(view.names.index(name) for name in BASE_FEATURE_NAMES)
+    result = []
+    for window in windows:
+        observations = window.singles_base_observations
+        if observations is None or window.metadata.get("feature_view") != view.name:
+            raise ValueError("recomputing singles-base channels requires raw observations in the radial view")
+        base_values, base_validity = rally_singles_base_features(
+            observations, float(window.metadata["fps"]), base_metres,
+        )
+        length = len(window.frame_indices)
+        values, validity = window.frame_values.clone(), window.frame_validity.clone()
+        values[:, columns] = base_values[-length:]
+        validity[:, columns] = base_validity[-length:]
+        result.append(replace(window, frame_values=values, frame_validity=validity, singles_base_observations=None))
+    return result
 
 
 def _reliable_court_foot(
@@ -200,6 +257,8 @@ class RallyWindowDataset(Dataset[RallyWindow]):
             "pose_visibility_threshold": config.pose_visibility_threshold,
             "context_seconds": config.context_seconds,
             "ownership_seconds": config.ownership_seconds,
+            **({"singles_base_strategy": "training_inplay_median"} if config.fit_singles_base else {}),
+            **({"singles_base_metres": config.singles_base_metres} if config.singles_base_metres is not None else {}),
             "annotation": annotation_identity,
             "sources": {
                 source.source_id: {
@@ -463,6 +522,7 @@ class RallyWindowDataset(Dataset[RallyWindow]):
                 reliable_feet.append(frame_reliability)
         value_tensor = torch.tensor(source_values, dtype=torch.float32)
         validity_tensor = torch.tensor(source_validity, dtype=torch.bool)
+        base_observations = None
         if self.feature_view.uses_motion:
             track_tensor = torch.tensor(track_ids)
             normalize_rally_motion_pose(value_tensor, validity_tensor, track_tensor, image_size)
@@ -472,9 +532,15 @@ class RallyWindowDataset(Dataset[RallyWindow]):
             values = [value_tensor, velocity]
             validity = [validity_tensor, velocity_valid]
             if self.feature_view.uses_singles_base:
-                base_values, base_validity = rally_singles_base_features(
-                    value_tensor, validity_tensor, track_tensor, fps
+                base_observations = SinglesBaseObservations.from_features(
+                    value_tensor, validity_tensor, track_tensor,
                 )
+                if self.config.singles_base_metres is None:
+                    base_values, base_validity = rally_singles_base_features(base_observations, fps)
+                else:
+                    base_values, base_validity = rally_singles_base_features(
+                        base_observations, fps, self.config.singles_base_metres,
+                    )
                 values.append(base_values)
                 validity.append(base_validity)
             smooth_rally_court_positions(
@@ -529,6 +595,10 @@ class RallyWindowDataset(Dataset[RallyWindow]):
                     inplay_targets=torch.tensor(targets, dtype=torch.long),
                     rally_start_targets=start_targets,
                     rally_end_targets=end_targets,
+                    singles_base_observations=(
+                        base_observations.frame_range(max(0, start - SINGLES_BASE_VELOCITY_FRAMES + 1), end + 1)
+                        if self.config.fit_singles_base and base_observations is not None else None
+                    ),
                     metadata={
                         "fps": fps,
                         "frame_count": frame_count,

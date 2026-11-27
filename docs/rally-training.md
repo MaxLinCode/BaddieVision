@@ -216,3 +216,16 @@ Both features use the raw projected positions before court smoothing.
 Compare held-out interval F1, boundary error, and false splits and merges.
 The distance-only arm isolates the effect of adding radial velocity to the
 distance channels.
+
+For a matched comparison against a data-derived base, run the radial view
+with `--fit-singles-base` and a separate output directory. Each fold takes
+the coordinate-wise median of in-bounds singles positions from observed
+players on reviewed in-play training frames. Each owned frame contributes
+once per observed player. The depth coordinate is mirrored across the net
+and the across-court coordinate keeps its sign. Validation and held-out
+sources use the same frozen training-fold base. Production fits once across
+all training sources.
+
+Fold metrics and checkpoints record the resulting `singles_base_metres`
+in lateral-coordinate, depth order. The inference exporter carries the
+frozen pair into the model's preprocessing contract.

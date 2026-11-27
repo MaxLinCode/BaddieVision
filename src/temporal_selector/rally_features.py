@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from numbers import Real
 from typing import Final
 
 import torch
@@ -66,6 +67,8 @@ MOTION_FEATURE_NAMES: Final = tuple(
 BASE_DISTANCE_FEATURE_NAMES: Final = ("p1_base_distance", "p2_base_distance")
 BASE_RADIAL_FEATURE_NAMES: Final = ("p1_base_radial_velocity", "p2_base_radial_velocity")
 BASE_FEATURE_NAMES: Final = BASE_DISTANCE_FEATURE_NAMES + BASE_RADIAL_FEATURE_NAMES
+DEFAULT_SINGLES_BASE_METRES: Final = (0.0, HALF_LENGTH / 2)
+SINGLES_BASE_VELOCITY_FRAMES: Final = 4
 
 
 # Two court coordinates per player, followed by 66 pose coordinates per player.
@@ -76,25 +79,65 @@ def _four_sample_slope(samples: Tensor) -> Tensor:
     return (3 * (samples[..., 3] - samples[..., 0]) + samples[..., 2] - samples[..., 1]) / 10
 
 
+def validate_singles_base_metres(value: object) -> tuple[float, float]:
+    if (
+        not isinstance(value, (tuple, list))
+        or len(value) != 2
+        or any(not isinstance(item, Real) or isinstance(item, bool) for item in value)
+        or not -HALF_SINGLES_WIDTH <= value[0] <= HALF_SINGLES_WIDTH
+        or not 0 <= value[1] <= HALF_LENGTH
+    ):
+        raise ValueError("singles base must be [lateral metres, depth metres] inside the singles half-court")
+    return float(value[0]), float(value[1])
+
+
+@dataclass(frozen=True)
+class SinglesBaseObservations:
+    positions: Tensor
+    observed: Tensor
+    track_ids: Tensor
+
+    @classmethod
+    def from_features(cls, values: Tensor, validity: Tensor, track_ids: Tensor) -> SinglesBaseObservations:
+        positions = values[:, _COURT_POSITION_INDICES].reshape(-1, 2, 2)
+        observed = validity[:, _COURT_POSITION_INDICES].reshape(-1, 2, 2).all(dim=-1)
+        return cls(positions, observed & (track_ids >= 0), track_ids)
+
+    def frame_range(self, start: int, stop: int) -> SinglesBaseObservations:
+        return SinglesBaseObservations(
+            self.positions[start:stop], self.observed[start:stop], self.track_ids[start:stop],
+        )
+
+    def mirrored_in_bounds_metres(self, frames: Tensor) -> Tensor:
+        positions = self.positions[frames] * self.positions.new_tensor(
+            ((HALF_WIDTH, -HALF_LENGTH), (HALF_WIDTH, HALF_LENGTH))
+        )
+        x, depth = positions.unbind(dim=-1)
+        inside = (x.abs() <= HALF_SINGLES_WIDTH) & (depth >= 0) & (depth <= HALF_LENGTH)
+        return positions[self.observed[frames] & inside]
+
+
 def rally_singles_base_features(
-    values: Tensor, validity: Tensor, track_ids: Tensor, fps: float,
+    observations: SinglesBaseObservations,
+    fps: float,
+    base_metres: tuple[float, float] = DEFAULT_SINGLES_BASE_METRES,
 ) -> tuple[Tensor, Tensor]:
-    """Measure distance and its signed slope about each singles half-court midpoint."""
-    positions = values[:, _COURT_POSITION_INDICES].reshape(-1, 2, 2)
-    observed = validity[:, _COURT_POSITION_INDICES].reshape(-1, 2, 2).all(dim=-1)
-    observed &= track_ids >= 0
-    base = positions.new_tensor(((0.0, -0.5), (0.0, 0.5)))
+    """Measure distance and signed slope about the same mirrored base on each half."""
+    positions, observed = observations.positions, observations.observed
+    x, depth = base_metres
+    base = positions.new_tensor(((x / HALF_WIDTH, -depth / HALF_LENGTH), (x / HALF_WIDTH, depth / HALF_LENGTH)))
     metres = (positions - base) * positions.new_tensor((HALF_WIDTH, HALF_LENGTH))
     distance = metres.norm(dim=-1) / (HALF_SINGLES_WIDTH**2 + (HALF_LENGTH / 2)**2)**0.5
     radial_velocity = torch.zeros_like(distance)
     radial_valid = torch.zeros_like(observed)
-    if len(distance) >= 4:
-        tracks = track_ids.unfold(0, 4, 1)
-        radial_valid[3:] = (
-            observed.unfold(0, 4, 1).all(dim=-1) & (tracks == tracks[..., :1]).all(dim=-1)
+    count = SINGLES_BASE_VELOCITY_FRAMES
+    if len(distance) >= count:
+        tracks = observations.track_ids.unfold(0, count, 1)
+        radial_valid[count - 1:] = (
+            observed.unfold(0, count, 1).all(dim=-1) & (tracks == tracks[..., :1]).all(dim=-1)
         )
-        slope = _four_sample_slope(distance.unfold(0, 4, 1)) * fps
-        radial_velocity[3:] = torch.where(radial_valid[3:], slope, 0.0)
+        slope = _four_sample_slope(distance.unfold(0, count, 1)) * fps
+        radial_velocity[count - 1:] = torch.where(radial_valid[count - 1:], slope, 0.0)
     return (
         torch.cat((torch.where(observed, distance, 0.0), radial_velocity), dim=-1),
         torch.cat((observed, radial_valid), dim=-1),

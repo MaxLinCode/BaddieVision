@@ -13,9 +13,11 @@ from torch.nn import functional as F
 from .batch import MASKED_TARGET
 from .rally_audio import RALLY_AUDIO_FEATURE_NAMES
 from .rally_features import (
+    BASE_RADIAL_RALLY_FEATURE_VIEW,
     RALLY_FEATURE_SCHEMA,
     RALLY_FEATURE_VERSION,
     RALLY_FEATURE_VIEWS,
+    validate_singles_base_metres,
 )
 
 
@@ -466,6 +468,10 @@ class RallySegmenter(nn.Module):
                 raise ValueError("rally checkpoint feature names/dimension are incompatible")
         if checkpoint["context_direction"] != RALLY_CONTEXT_DIRECTION:
             raise ValueError("rally checkpoint is not offline centered")
+        if "singles_base_metres" in checkpoint:
+            if feature_view != BASE_RADIAL_RALLY_FEATURE_VIEW:
+                raise ValueError("a fitted singles base requires the distance plus radial velocity view")
+            validate_singles_base_metres(checkpoint["singles_base_metres"])
         model = cls(
             RallySegmenterConfig(**checkpoint["rally_segmenter_config"])
         )
@@ -555,6 +561,7 @@ def rally_checkpoint(
     feature_view: str | None = None,
     calibration_fingerprints: Mapping[str, str] | None = None,
     pose_training_metadata: Mapping[str, Any] | None = None,
+    singles_base_metres: tuple[float, float] | None = None,
     extra: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a self-describing checkpoint without altering legacy formats."""
@@ -602,6 +609,10 @@ def rally_checkpoint(
     }
     if pose_training_metadata is not None:
         payload["pose_training_metadata"] = dict(pose_training_metadata)
+    if singles_base_metres is not None:
+        if feature_view != BASE_RADIAL_RALLY_FEATURE_VIEW:
+            raise ValueError("a fitted singles base requires the distance plus radial velocity view")
+        payload["singles_base_metres"] = list(validate_singles_base_metres(singles_base_metres))
     if extra:
         overlap = set(payload).intersection(extra)
         if overlap:

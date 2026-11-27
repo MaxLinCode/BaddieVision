@@ -47,7 +47,9 @@ from .rally_dataset import (
     RallyWindow,
     RallyWindowDataset,
     collate_rally_windows,
+    fit_rally_singles_base,
     rally_data_config_from_selector_mapping,
+    with_rally_singles_base,
 )
 from .rally_evaluation import (
     DEFAULT_CAMERA_SOURCES,
@@ -1106,6 +1108,12 @@ def run_clean_rally_experiment(
         test = [window for source in fold.test_source_ids for window in full_windows[source]]
         if not validation or not test:
             raise ValueError("clean rally fold requires validation and held-out windows")
+        singles_base = data_config.singles_base_metres
+        if data_config.fit_singles_base:
+            singles_base = fit_rally_singles_base(train)
+            train = with_rally_singles_base(train, singles_base)
+            validation = with_rally_singles_base(validation, singles_base)
+            test = with_rally_singles_base(test, singles_base)
         split_manifest = {
             "fold_id": fold.fold_id, "held_out_camera": fold.held_out_camera,
             "training_source_ids": list(fold.training_source_ids),
@@ -1117,6 +1125,7 @@ def run_clean_rally_experiment(
             "checkpoint_selection": "validation_raw_bce_only",
             "decoder_selection": "validation_labels_only",
             "test_labels_used_for_selection": False, "test_evaluations": 1,
+            **({"singles_base_metres": list(singles_base)} if singles_base is not None else {}),
         }
         model = RallySegmenter(model_config).to(device)
         history, epoch = train_rally_segmenter(
@@ -1166,6 +1175,7 @@ def run_clean_rally_experiment(
             pose_training_metadata=rally_dataset.manifest.get("pose_training_metadata"),
             feature_view=feature_view.name,
             calibration_fingerprints=calibration_fingerprints,
+            singles_base_metres=singles_base,
             extra={"epoch_history": history, "experiment_role": "expanded_clean_only"},
         )
         torch.save(checkpoint, fold_dir / "rally-segmenter.pt")
@@ -1179,9 +1189,14 @@ def run_clean_rally_experiment(
         fold_artifacts.append(fold_result)
     production_epoch = round(statistics.median(selected_epochs))
     production = RallySegmenter(model_config).to(device)
+    production_windows = rally_dataset.windows
+    production_base = data_config.singles_base_metres
+    if data_config.fit_singles_base:
+        production_base = fit_rally_singles_base(production_windows)
+        production_windows = with_rally_singles_base(production_windows, production_base)
     production_history = train_rally_segmenter_fixed_epochs(
         production,
-        rally_dataset.windows,
+        production_windows,
         device=device,
         epochs=production_epoch,
         batch_size=recipe.batch_size,
@@ -1198,6 +1213,7 @@ def run_clean_rally_experiment(
             "annotation_fingerprint": rally_dataset.annotation_fingerprint,
             "epoch_selection": "median_fold_best_epoch",
             "fold_best_epochs": selected_epochs,
+            **({"singles_base_metres": list(production_base)} if production_base is not None else {}),
         },
     )
     oof_decoder, oof_search = tune_rally_decoder(
@@ -1219,6 +1235,7 @@ def run_clean_rally_experiment(
         pose_training_metadata=rally_dataset.manifest.get("pose_training_metadata"),
         feature_view=feature_view.name,
         calibration_fingerprints=calibration_fingerprints,
+        singles_base_metres=production_base,
         extra={"epoch_history": production_history, "out_of_fold_decoder_search": oof_search,
                "experiment_role": "expanded_clean_only_production"},
     )
@@ -1231,7 +1248,8 @@ def run_clean_rally_experiment(
         "macro": _macro_metrics(camera_metrics),
         "production": {"checkpoint": "production-rally-segmenter.pt",
                        "chosen_epoch": production_epoch,
-                       "decoder_configuration": asdict(oof_decoder)},
+                       "decoder_configuration": asdict(oof_decoder),
+                       **({"singles_base_metres": list(production_base)} if production_base is not None else {})},
     }
     _write_json(output_dir / "metrics.json", result)
     return result
@@ -1462,6 +1480,10 @@ def _parser() -> argparse.ArgumentParser:
         help="Resume the clean-only run from committed epochs",
     )
     parser.add_argument("--clean-only", action="store_true")
+    parser.add_argument(
+        "--fit-singles-base", action="store_true",
+        help="Fit the radial view's base from each camera fold's reviewed in-play training positions",
+    )
     parser.add_argument("--person-model", help="Original detector asset for split recordings")
     parser.add_argument("--pose-model", type=Path, help="Original pose asset for split recordings")
     parser.add_argument(
@@ -1510,6 +1532,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError("choose only one rally experiment arm")
     if args.feature_view is not None and not args.clean_only:
         raise ValueError("--feature-view requires --clean-only")
+    if args.fit_singles_base and not args.clean_only:
+        raise ValueError("--fit-singles-base requires --clean-only")
     if not args.clean_only and (args.person_model is not None or args.pose_model is not None):
         raise ValueError("partition extraction model options require --clean-only")
     if args.clean_only:
@@ -1526,6 +1550,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             feature_view = CANONICAL_RALLY_FEATURE_VIEW
         if feature_view is not None:
             data_config = replace(data_config, feature_view=feature_view)
+        if args.fit_singles_base:
+            data_config = replace(data_config, fit_singles_base=True)
         camera_sources = _load_camera_sources(raw.get("camera_sources"))
         configured = {source.source_id for source in data_config.sources}
         grouped = [source for sources in camera_sources.values() for source in sources]
