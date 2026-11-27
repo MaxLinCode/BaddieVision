@@ -407,6 +407,40 @@ def test_rally_motion_uses_elapsed_time_and_masks_gaps_and_track_changes(fps) ->
     assert torch.equal(values[:, :positions.shape[1]], positions)
 
 
+def test_rally_singles_base_features_use_metric_distance_and_mask_discontinuous_motion() -> None:
+    from src.court_projection import HALF_LENGTH, HALF_SINGLES_WIDTH, HALF_WIDTH
+    from src.temporal_selector.rally_features import (
+        FULL_RALLY_FEATURE_NAMES,
+        rally_singles_base_features,
+    )
+
+    values = torch.zeros(8, len(FULL_RALLY_FEATURE_NAMES))
+    observed = torch.ones_like(values, dtype=torch.bool)
+    tracks = torch.ones(8, 2, dtype=torch.long)
+    near_x, near_y, far_y = (
+        FULL_RALLY_FEATURE_NAMES.index(name)
+        for name in ("p1_court_x", "p1_court_y", "p2_court_y")
+    )
+    distance_metres = torch.arange(8) * 0.25
+    values[:, near_x] = distance_metres / HALF_WIDTH
+    values[:, near_y] = -0.5
+    values[:, far_y] = 0.5 + distance_metres.flip((0,)) / HALF_LENGTH
+    tracks[4:, 1] = 2
+    observed[4, near_y] = False
+    features, valid = rally_singles_base_features(values, observed, tracks, fps=30)
+
+    normalization = (HALF_SINGLES_WIDTH**2 + (HALF_LENGTH / 2)**2)**0.5
+    assert torch.allclose(features[:4, 0], distance_metres[:4] / normalization)
+    assert torch.allclose(features[:, 1], distance_metres.flip((0,)) / normalization)
+    assert torch.isclose(features[3, 2], torch.tensor(7.5 / normalization))
+    assert torch.isclose(features[3, 3], torch.tensor(-7.5 / normalization))
+    assert valid[:, 2].tolist() == [False, False, False, True, False, False, False, False]
+    assert valid[:, 3].tolist() == [False, False, False, True, False, False, False, True]
+    assert not valid[4, 0]
+    assert valid[-1, 1] and features[-1, 1] == 0
+    assert torch.count_nonzero(features[~valid]) == 0
+
+
 def test_rally_motion_pose_uses_crop_geometry_and_track_median_torso() -> None:
     from src.temporal_selector.observations import frame_context
     from src.temporal_selector.rally_features import (

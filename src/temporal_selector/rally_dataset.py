@@ -39,6 +39,7 @@ from .rally_features import (
     normalize_rally_motion_pose,
     rally_feature_view,
     rally_motion_features,
+    rally_singles_base_features,
     smooth_rally_court_positions,
 )
 from .rally_intervals import read_rally_intervals
@@ -468,11 +469,19 @@ class RallyWindowDataset(Dataset[RallyWindow]):
             velocity, velocity_valid = rally_motion_features(
                 value_tensor, validity_tensor, track_tensor, fps
             )
+            values = [value_tensor, velocity]
+            validity = [validity_tensor, velocity_valid]
+            if self.feature_view.uses_singles_base:
+                base_values, base_validity = rally_singles_base_features(
+                    value_tensor, validity_tensor, track_tensor, fps
+                )
+                values.append(base_values)
+                validity.append(base_validity)
             smooth_rally_court_positions(
                 value_tensor, validity_tensor, track_tensor, torch.tensor(reliable_feet)
             )
-            value_tensor = torch.cat((value_tensor, velocity), dim=-1)
-            validity_tensor = torch.cat((validity_tensor, velocity_valid), dim=-1)
+            value_tensor = torch.cat(values, dim=-1)
+            validity_tensor = torch.cat(validity, dim=-1)
         if audio is not None:
             value_tensor = torch.cat((value_tensor, torch.as_tensor(audio_values)), dim=-1)
             validity_tensor = torch.cat((validity_tensor, torch.as_tensor(audio.validity)), dim=-1)
