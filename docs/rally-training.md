@@ -191,3 +191,31 @@ training recipe fixed. Report interval F1 and signed start/end errors by
 camera. The motion views change both pose normalization and velocity
 channels, so comparisons against the original views measure their combined
 effect. The filter windows span less time at higher FPS.
+
+## Singles service-box ablation
+
+The `serve_boxes` view adds four scores to the canonical motion-and-audio
+features. The order is near-left, near-right, far-left, far-right, using the
+same court x-axis for both players. On each frame, project both visible
+ankles to the court floor and average their positions. Measure Euclidean
+distance `d` in metres from that midpoint to each singles service rectangle.
+Each rectangle runs from its short service line to its baseline. The score
+is `exp(-0.5 * (d / 0.75)^2)`, with a score of 1 anywhere inside or on the
+rectangle. These are independent scores in [0, 1].
+
+The `serve_boxes_diagonal` view also adds
+`max(near_right * far_left, near_left * far_right)`. A player's scores are
+masked if either ankle is unavailable. The diagonal score needs both players.
+
+```bash
+for view in full_audio_zscore_motion serve_boxes serve_boxes_diagonal; do
+  python -m src.temporal_selector.rally_experiment \
+    --config config/rally-experiment.local.json --clean-only --preset rtmpose-audio \
+    --feature-view "$view" --output-dir "outputs/serve-box-ablation/$view"
+done
+python -m experiments.temporal_selector.serve_box_ablation outputs/serve-box-ablation
+```
+
+The comparison verifies the source artifacts, training recipe, and camera
+splits. It reports matched rally-start error in frames alongside interval F1,
+recall, and the number of matched starts for each held-out camera.
