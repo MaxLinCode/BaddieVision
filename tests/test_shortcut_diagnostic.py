@@ -49,6 +49,8 @@ def test_registered_feature_views_have_exact_names_dimensions_and_masks() -> Non
         "full": 154,
         "full_motion": 290,
         "full_audio_zscore_motion": 297,
+        "serve_boxes": 301,
+        "serve_boxes_diagonal": 302,
         "full_audio": 161,
         "full_audio_zscore": 161,
         "calibrated_canonical": 142,
