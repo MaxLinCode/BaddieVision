@@ -717,14 +717,32 @@ def test_decoder_rebuild_uses_saved_probabilities(pipeline, monkeypatch):
     import src.temporal_selector.rally_inference as inference
 
     kwargs, calls = pipeline
-    run_pipeline(**kwargs)
+    predict = inference.predict_source
+
+    def predict_with_dip(*args, **options):
+        rows = predict(*args, **options)
+        for row in rows:
+            row["inplay_probability"] = 0.1 if row["frame"] in (2, 3) else 0.9
+        return rows
+
+    def states(path):
+        return [json.loads(line)["decoded_inplay"] for line in path.read_text().splitlines()[1:]]
+
+    monkeypatch.setattr(inference, "predict_source", predict_with_dip)
+    original = run_pipeline(**kwargs)
+    assert states(original["predictions"]) == [True, True, False, False] + [True] * 5
+    probabilities = original["predictions"].with_name("probabilities.jsonl")
+    fingerprint = sha256_file(probabilities)
     monkeypatch.setattr(
         inference,
         "predict_source",
         lambda *args, **kw: pytest.fail("inference repeated"),
     )
-    result = run_pipeline(**kwargs, rebuild=["decode"])
+    result = run_pipeline(**kwargs, rebuild=["decode"], bridge_short_dips=True)
+    assert states(result["predictions"]) == [True] * 9
+    assert sha256_file(probabilities) == fingerprint
     assert result["overlay"].is_file()
+    assert run_pipeline(**kwargs, bridge_short_dips=True) == result
     assert calls == {"person": 1, "players": 1}
 
 

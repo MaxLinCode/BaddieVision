@@ -40,6 +40,7 @@ def run_pipeline(
     device: str = "auto",
     batch_size: int = 16,
     overlay: bool = True,
+    bridge_short_dips: bool = False,
     force: bool = False,
     rebuild: Sequence[str] = (),
     person_backend_identity: str | None = None,
@@ -195,9 +196,20 @@ def run_pipeline(
         "rallies": rally_root / "rallies.csv",
     }
     receipt = rally_root / "run.manifest.json"
+    decoder = manifest["decoder_configuration"]
+    if bridge_short_dips:
+        from src.temporal_selector.rally_evaluation import RALLY_SHORT_GAP_SECONDS
+
+        decoder = {
+            **decoder,
+            "max_gap_seconds": max(
+                decoder.get("max_gap_seconds", RALLY_SHORT_GAP_SECONDS),
+                RALLY_SHORT_GAP_SECONDS,
+            ),
+        }
     decode_inputs = {
         "probabilities_sha256": sha256_file(raw_path),
-        "decoder": manifest["decoder_configuration"],
+        "decoder": decoder,
         "implementation": implementation_identity("decode"),
     }
 
@@ -205,9 +217,7 @@ def run_pipeline(
         from src.temporal_selector.rally_inference import decode_prediction_rows
 
         rows = [json.loads(line) for line in raw_path.read_text().splitlines()]
-        decode_prediction_rows(
-            rows, source.source_id, identity, manifest["decoder_configuration"]
-        )
+        decode_prediction_rows(rows, source.source_id, identity, decoder)
         write_prediction_artifacts(
             rally_source,
             rows,

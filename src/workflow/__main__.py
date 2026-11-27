@@ -172,6 +172,10 @@ def _parser() -> argparse.ArgumentParser:
     )
     predict.add_argument("--batch-size", type=int, default=16)
     predict.add_argument("--no-overlay", action="store_true")
+    predict.add_argument(
+        "--bridge-short-dips", action="store_true",
+        help="raise the decoder's interior InPlay gap allowance to at least 0.5 seconds",
+    )
     predict.add_argument("--force", action="store_true")
     predict.add_argument(
         "--rebuild",
@@ -284,6 +288,7 @@ def main(argv: list[str] | None = None) -> int:
                 device=args.device,
                 batch_size=args.batch_size,
                 overlay=not args.no_overlay,
+                bridge_short_dips=args.bridge_short_dips,
                 force=args.force,
                 rebuild=args.rebuild,
             )

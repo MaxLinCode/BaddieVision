@@ -201,6 +201,11 @@ decoder. Decoding produces `predictions.jsonl` and `rallies.csv`; rendering read
 those saved predictions. Decoder or overlay changes can reuse observations and
 probabilities. Rendering failure preserves the prediction receipt.
 
+Use `--bridge-short-dips` to give an existing decoder a gap allowance of at
+least 0.5 seconds. The bridge applies to dips between two InPlay runs. When
+switching the option on or off for an existing run, add `--rebuild decode` to
+regenerate the rally intervals and overlay from the saved probabilities.
+
 Person tracking and TrackNet currently recover at **stage boundaries**. An
 interrupted tracking stage restarts from frame zero. Arbitrary frame seeking is
 not supported: BoT-SORT state/track identities and TrackNet temporal overlap

@@ -9,7 +9,7 @@ import pytest
 from src.temporal_selector import rally_partitions as partitions
 from src.temporal_selector.rally_audio import RALLY_AUDIO_FEATURE_NAMES, read_rally_audio
 from src.temporal_selector.rally_dataset import RallyDataConfig, RallySourceConfig
-from src.temporal_selector.rally_evaluation import rally_metrics
+from src.temporal_selector.rally_evaluation import rally_metrics, tune_rally_decoder
 from src.temporal_selector.rally_intervals import (
     RallyCoverageSpan,
     RallyInterval,
@@ -215,6 +215,27 @@ def test_partition_preserves_audio_gap_frame_alignment(tmp_path):
     assert not expected.all()
     assert expected.any()
     np.testing.assert_array_equal(partition.validity[5:-5], expected)
+
+
+def test_short_dip_policy_fixes_bridge_duration_during_calibration():
+    rows = [
+        {
+            "source_id": "source",
+            "frame": frame,
+            "inplay_target": int(frame in (1, 2, 6, 7)),
+            "inplay_probability": 0.99 if frame in (1, 2, 6, 7) else 0.01,
+        }
+        for frame in range(9)
+    ]
+    fps = {"source": 10}
+    ordinary, _ = tune_rally_decoder(rows, fps_by_source=fps, hysteresis=True)
+    bridged, search = tune_rally_decoder(
+        rows, fps_by_source=fps, hysteresis=True, bridge_short_dips=True,
+    )
+
+    assert ordinary.max_gap_seconds == 0.0
+    assert bridged.max_gap_seconds == 0.5
+    assert {candidate["configuration"]["max_gap_seconds"] for candidate in search} == {0.5}
 
 
 def test_complete_interval_metrics_skip_cut_rally_but_keep_its_frames():
