@@ -22,6 +22,7 @@ from .rally_features import (
 RALLY_FEATURE_DIM = RALLY_FEATURE_VIEWS["full"].dimension
 RALLY_CONTEXT_DIRECTION = "offline_centered"
 RALLY_MODEL_TYPE = "RallySegmenter"
+RALLY_BOUNDARY_SUPERVISION = ("triangle_bce", "gaussian_qfl", "end_gaussian_qfl")
 
 
 @dataclass
@@ -335,15 +336,19 @@ class RallySegmenter(nn.Module):
         mask: Tensor,
         *,
         pos_weight: Tensor | None,
+        quality_focal: bool = False,
     ) -> Tensor:
         safe_logits = torch.where(mask, logits, torch.zeros_like(logits))
         safe_targets = targets.masked_fill(~mask, 0).to(logits.dtype)
         values = F.binary_cross_entropy_with_logits(
             safe_logits,
             safe_targets,
-            pos_weight=pos_weight,
+            pos_weight=None if quality_focal else pos_weight,
             reduction="none",
         )
+        if quality_focal:
+            # Quality Focal Loss with beta=2 for continuous targets.
+            values = values * (safe_logits.sigmoid() - safe_targets).square()
         return torch.where(mask, values, 0.0).sum() / mask.sum().clamp_min(1)
 
     def losses(
@@ -356,6 +361,8 @@ class RallySegmenter(nn.Module):
         boundary_end_pos_weight: Tensor | None = None,
         boundary_aux_weight: float = 0.25,
         temporal_smoothing_weight: float = 0.0,
+        quality_focal_start: bool = False,
+        quality_focal_end: bool = False,
         return_counts: bool = True,
     ) -> RallyLosses:
         if boundary_aux_weight < 0:
@@ -392,12 +399,14 @@ class RallySegmenter(nn.Module):
                 batch.rally_start_targets,
                 start_mask,
                 pos_weight=boundary_start_pos_weight,
+                quality_focal=quality_focal_start,
             )
             end = self._masked_bce(
                 output.rally_end_logits,
                 batch.rally_end_targets,
                 end_mask,
                 pos_weight=boundary_end_pos_weight,
+                quality_focal=quality_focal_end,
             )
             boundary_frames = (
                 int((start_mask | end_mask).sum()) if return_counts else None
@@ -485,6 +494,7 @@ class RallyTrainingRecipe:
     gradient_clip_norm: float = 1.0
     device: str = "mps"
     temporal_smoothing_weight: float = 0.0
+    boundary_supervision: str = "triangle_bce"
 
     def __post_init__(self) -> None:
         for name in ("epochs", "batch_size"):
@@ -497,6 +507,8 @@ class RallyTrainingRecipe:
             or self.seed < 0
         ):
             raise ValueError("seed must be a nonnegative integer")
+        if self.boundary_supervision not in RALLY_BOUNDARY_SUPERVISION:
+            raise ValueError("unsupported rally boundary supervision")
         if self.optimizer != "AdamW":
             raise ValueError("supported rally optimizer is AdamW")
         if self.sampling not in ("boundary_balanced", "uniform"):
@@ -517,11 +529,21 @@ class RallyTrainingRecipe:
         if not math.isfinite(self.temporal_smoothing_weight) or self.temporal_smoothing_weight < 0:
             raise ValueError("temporal smoothing weight must be finite and nonnegative")
 
+    @property
+    def gaussian_start(self) -> bool:
+        return self.boundary_supervision == "gaussian_qfl"
+
+    @property
+    def gaussian_end(self) -> bool:
+        return self.boundary_supervision != "triangle_bce"
+
     def recovery_settings(self) -> dict[str, Any]:
         settings = asdict(self)
         # Older runs have no smoothing setting in their recovery files.
         if not self.temporal_smoothing_weight:
             settings.pop("temporal_smoothing_weight")
+        if self.boundary_supervision == "triangle_bce":
+            settings.pop("boundary_supervision")
         return settings
 
     @classmethod

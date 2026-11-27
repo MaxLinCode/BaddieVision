@@ -88,6 +88,8 @@ class RallyDataConfig:
     ownership_seconds: float = 1.0
     feature_view: str = "full"
     cached_court_tolerance: float = 1e-5
+    gaussian_start: bool = False
+    gaussian_end: bool = False
 
     def __post_init__(self) -> None:
         if len({source.source_id for source in self.sources}) != len(self.sources):
@@ -210,6 +212,13 @@ class RallyWindowDataset(Dataset[RallyWindow]):
                 for source in config.sources
             },
         }
+        if self.rally_index is not None:
+            if config.gaussian_start and config.gaussian_end:
+                identity["boundary_targets"] = "gaussian"
+            elif config.gaussian_start:
+                identity["boundary_targets"] = "gaussian_start"
+            elif config.gaussian_end:
+                identity["boundary_targets"] = "gaussian_end"
         pose_sources = list(self._pose_sources.values())
         if any(item.get("pose_backend") == RTMPOSE_BACKEND_TYPE for item in pose_sources):
             pose = pose_sources[0]
@@ -500,6 +509,8 @@ class RallyWindowDataset(Dataset[RallyWindow]):
                     owned,
                     targets,
                     fps=fps,
+                    gaussian_start=self.config.gaussian_start,
+                    gaussian_end=self.config.gaussian_end,
                 )
             else:
                 start_targets = torch.full((len(frames),), float(MASKED_TARGET))

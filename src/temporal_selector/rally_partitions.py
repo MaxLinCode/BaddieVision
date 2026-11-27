@@ -202,12 +202,19 @@ def prepare_rally_partition(
     dataset = RallyWindowDataset(replace(
         config, sources=(child,), rally_intervals_path=None, rally_manifest_path=None,
     ))
-    windows = tuple(_label_partition(window, block, index, parent.frame_count) for window in dataset)
+    windows = tuple(
+        _label_partition(
+            window, block, index, parent.frame_count,
+            gaussian_start=config.gaussian_start, gaussian_end=config.gaussian_end,
+        )
+        for window in dataset
+    )
     return windows, dataset.manifest["dataset_fingerprint"]
 
 
 def _label_partition(
     window: RallyWindow, block: RallySourceRange, index: RallyIntervalIndex, source_count: int,
+    *, gaussian_start: bool = False, gaussian_end: bool = False,
 ) -> RallyWindow:
     """Restore original frame keys and supervise only boundaries inside the partition."""
     intervals = index.for_source(block.source_id)
@@ -219,6 +226,7 @@ def _label_partition(
     bounds = range(block.start, block.stop)
     starts, ends = rally_boundary_targets(
         intervals, index.partial_start_rally_ids, frames, owned, targets, fps=fps, boundary_range=bounds,
+        gaussian_start=gaussian_start, gaussian_end=gaussian_end,
     )
     partial = tuple(
         (

@@ -36,6 +36,7 @@ from .training import (
 )
 from .model import JointRallyShuttleModel
 from .rally import (
+    RALLY_BOUNDARY_SUPERVISION,
     RallySegmenter,
     RallySegmenterConfig,
     RallyTrainingRecipe,
@@ -330,6 +331,7 @@ def train_rally_segmenter(
     seed: int,
     boundary_aux_weight: float = 0.25,
     temporal_smoothing_weight: float = 0.0,
+    boundary_supervision: str = "triangle_bce",
     learning_rate: float = 3e-4,
     gradient_clip_norm: float = 1.0,
     sampling: str = "boundary_balanced",
@@ -349,6 +351,7 @@ def train_rally_segmenter(
         batch_size=batch_size,
         boundary_aux_weight=boundary_aux_weight,
         temporal_smoothing_weight=temporal_smoothing_weight,
+        boundary_supervision=boundary_supervision,
         learning_rate=learning_rate,
         gradient_clip_norm=gradient_clip_norm,
         sampling=sampling,
@@ -385,6 +388,11 @@ def train_rally_segmenter(
         list(train_windows), batch_sampler=sampler, collate_fn=collate_rally_windows
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    weight_fields = ["inplay_targets"]
+    if not recipe.gaussian_start:
+        weight_fields.append("rally_start_targets")
+    if not recipe.gaussian_end:
+        weight_fields.append("rally_end_targets")
     weights = {
         field: _positive_weight(
             train_windows,
@@ -392,7 +400,7 @@ def train_rally_segmenter(
             device=device,
             cap=10.0 if field != "inplay_targets" else None,
         )
-        for field in ("inplay_targets", "rally_start_targets", "rally_end_targets")
+        for field in weight_fields
     }
     history: list[dict[str, Any]] = []
     best: tuple[float, int, dict[str, torch.Tensor]] | None = None
@@ -431,10 +439,12 @@ def train_rally_segmenter(
             losses = model.losses(
                 batch,
                 inplay_pos_weight=weights["inplay_targets"],
-                boundary_start_pos_weight=weights["rally_start_targets"],
-                boundary_end_pos_weight=weights["rally_end_targets"],
+                boundary_start_pos_weight=weights.get("rally_start_targets"),
+                boundary_end_pos_weight=weights.get("rally_end_targets"),
                 boundary_aux_weight=boundary_aux_weight,
                 temporal_smoothing_weight=temporal_smoothing_weight,
+                quality_focal_start=recipe.gaussian_start,
+                quality_focal_end=recipe.gaussian_end,
                 return_counts=False,
             )
             if not bool(torch.isfinite(losses.total)):
@@ -664,6 +674,7 @@ def _prepare_rally_run(
             )
         if isinstance(previous.get("training_recipe"), dict):
             previous["training_recipe"].setdefault("temporal_smoothing_weight", 0.0)
+            previous["training_recipe"].setdefault("boundary_supervision", "triangle_bce")
         if previous != configuration:
             raise ValueError("resume configuration or dataset identity has changed")
     else:
@@ -1032,6 +1043,9 @@ def run_clean_rally_experiment(
     output_dir = Path(output_dir).expanduser().resolve()
     # Full-source observations are used for held-out scoring and production.
     # A source divided by a fold cut gets independently extracted observations.
+    data_config = replace(
+        data_config, gaussian_start=recipe.gaussian_start, gaussian_end=recipe.gaussian_end
+    )
     rally_dataset = RallyWindowDataset(data_config)
     if rally_dataset.rally_index != index:
         raise ValueError("rally annotations changed while preparing the train/validation split")
@@ -1129,6 +1143,7 @@ def run_clean_rally_experiment(
             seed=recipe.seed,
             boundary_aux_weight=recipe.boundary_aux_weight,
             temporal_smoothing_weight=recipe.temporal_smoothing_weight,
+            boundary_supervision=recipe.boundary_supervision,
             learning_rate=recipe.learning_rate,
             gradient_clip_norm=recipe.gradient_clip_norm,
             sampling=recipe.sampling,
@@ -1188,6 +1203,7 @@ def run_clean_rally_experiment(
         seed=recipe.seed,
         boundary_aux_weight=recipe.boundary_aux_weight,
         temporal_smoothing_weight=recipe.temporal_smoothing_weight,
+        boundary_supervision=recipe.boundary_supervision,
         learning_rate=recipe.learning_rate,
         gradient_clip_norm=recipe.gradient_clip_norm,
         sampling=recipe.sampling,
@@ -1355,6 +1371,7 @@ def train_rally_segmenter_fixed_epochs(
     seed: int,
     boundary_aux_weight: float,
     temporal_smoothing_weight: float = 0.0,
+    boundary_supervision: str = "triangle_bce",
     learning_rate: float = 3e-4,
     gradient_clip_norm: float = 1.0,
     sampling: str = "boundary_balanced",
@@ -1373,6 +1390,7 @@ def train_rally_segmenter_fixed_epochs(
         seed=seed,
         boundary_aux_weight=boundary_aux_weight,
         temporal_smoothing_weight=temporal_smoothing_weight,
+        boundary_supervision=boundary_supervision,
         learning_rate=learning_rate,
         gradient_clip_norm=gradient_clip_norm,
         sampling=sampling,
@@ -1453,6 +1471,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--learning-rate", type=float)
     parser.add_argument("--gradient-clip-norm", type=float)
     parser.add_argument("--boundary-aux-weight", type=float)
+    parser.add_argument("--boundary-supervision", choices=RALLY_BOUNDARY_SUPERVISION)
     parser.add_argument("--temporal-smoothing-weight", type=float)
     parser.add_argument("--seed", type=int)
     parser.add_argument("--sampling", choices=("boundary_balanced", "uniform"))
@@ -1502,6 +1521,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     if recipe.temporal_smoothing_weight and not args.clean_only:
         raise ValueError("temporal smoothing requires --clean-only")
+    if recipe.boundary_supervision != "triangle_bce" and not args.clean_only:
+        raise ValueError("Gaussian boundary supervision requires --clean-only")
     if args.resume and not args.clean_only:
         raise ValueError(
             "epoch recovery currently requires --clean-only; comparative study arms use their historical trainer"
