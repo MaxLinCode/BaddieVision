@@ -17,7 +17,8 @@ from .rally_dataset import RallyWindow
 # Real recording identities are provided by the local experiment config.
 DEFAULT_CAMERA_SOURCES: Mapping[str, tuple[str, ...]] = {}
 DECODER_THRESHOLDS = tuple(value / 100 for value in range(5, 96, 5))
-DECODER_GAPS_SECONDS = (0.0, 0.1, 0.2, 0.3, 0.5)
+RALLY_SHORT_GAP_SECONDS = 0.5
+DECODER_GAPS_SECONDS = (0.0, 0.1, 0.2, 0.3, RALLY_SHORT_GAP_SECONDS)
 DECODER_MINIMUM_SECONDS = (0.0, 0.1, 0.2, 0.3)
 
 
@@ -567,21 +568,23 @@ def tune_rally_decoder(
     *,
     fps_by_source: Mapping[str, float],
     hysteresis: bool = False,
+    bridge_short_dips: bool = False,
 ) -> tuple[InPlayDecoderConfig, list[dict[str, Any]]]:
-    """Tune entry/continuation thresholds, gap and minimum duration using validation labels only."""
+    """Tune on validation labels, optionally fixing the bridge duration."""
     if not validation_rows:
         raise ValueError("decoder tuning requires validation predictions")
     candidates: list[
         tuple[tuple[float, ...], InPlayDecoderConfig, dict[str, Any]]
     ] = []
     drops = (0.05, 0.10) if hysteresis else (0.0,)
+    gaps = (RALLY_SHORT_GAP_SECONDS,) if bridge_short_dips else DECODER_GAPS_SECONDS
     use_decoded_f1 = hysteresis or any(row.get("partial_rally") for row in validation_rows)
     for threshold in DECODER_THRESHOLDS:
         for drop in drops:
             if drop >= threshold:
                 continue
             continuation = round(threshold - drop, 2) if drop else None
-            for gap in DECODER_GAPS_SECONDS:
+            for gap in gaps:
                 for minimum in DECODER_MINIMUM_SECONDS:
                     config = InPlayDecoderConfig(
                         threshold=threshold,

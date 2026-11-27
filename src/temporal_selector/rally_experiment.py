@@ -1149,7 +1149,8 @@ def run_clean_rally_experiment(
                          for window in validation}
         test_fps_by_source = {window.source_id: float(window.metadata["fps"]) for window in test}
         decoder, decoder_search = tune_rally_decoder(
-            validation_rows, fps_by_source=fps_by_source, hysteresis=uses_rtmpose
+            validation_rows, fps_by_source=fps_by_source, hysteresis=uses_rtmpose,
+            bridge_short_dips=uses_rtmpose,
         )
         raw_test = predict_rally_windows(
             model, test, device=device, batch_size=recipe.batch_size, partition="test", include_unlabeled=True,
@@ -1204,6 +1205,7 @@ def run_clean_rally_experiment(
         test_rows, fps_by_source={window.source_id: float(window.metadata["fps"])
                                   for window in rally_dataset.windows},
         hysteresis=uses_rtmpose,
+        bridge_short_dips=uses_rtmpose,
     )
     production_split = {
         "strategy": "all-sources", "source_ids": list(sources),

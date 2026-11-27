@@ -128,3 +128,29 @@ The runs used the same labels, camera groups, window counts, and training
 recipe. The production checkpoint was fit for six epochs with its decoder
 calibrated on held-out predictions. The comparison uses a small private
 dataset and does not establish generalization to new camera setups.
+
+## Short dips in InPlay
+
+Clean RTMPose training fixes the decoder bridge at 0.5 seconds for both fold
+and production calibration. Calibration still selects the entry threshold,
+continuation threshold, and minimum rally duration using its existing splits.
+The bridge fills only gaps between InPlay runs.
+
+The comparison held model scores and other decoder settings fixed. On four
+previously inspected EMA folds, the existing bridge scored 0.7349 macro
+interval F1 with 37 false splits. A 0.3-second minimum bridge allowance scored
+0.8024 with 17 splits, and a 0.5-second minimum scored 0.8374 with five splits.
+A 0.5-second allowance with a veto for ordered end and start scores of at
+least 0.5, within 0.15 seconds of their respective edges, scored 0.8042 with
+13 splits. Each policy had zero false merges.
+
+The 0.5-second policy was fixed before scoring a separate reviewed segment
+outside the EMA run. On the checkpoint that also held out that camera, interval
+F1 rose from 0.5714 to 0.7826 and false splits fell from seven to two. The
+0.3-second and boundary-aware variants scored 0.7660 and 0.7500, with three and
+four splits. The production EMA checkpoint already used 0.5 seconds and scored
+0.9545 with zero splits. Each comparison on the new segment had zero false merges.
+Replaying the saved validation search with the bridge fixed at 0.5 seconds
+selected fresh thresholds and minimum durations. This replay scored 0.8343
+macro interval F1 with eight splits on the four previously inspected folds
+and 0.8000 with two splits on the separate segment, with zero false merges.
