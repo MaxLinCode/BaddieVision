@@ -57,7 +57,7 @@ reverses by −0.035, and its false-start increase is resolved.
 
 ## Decoder factorial
 
-The zero-shot review of the probabilities showed that the 0.5 s production gap
+An exploratory re-decode of the saved probabilities showed that the 0.5 s production gap
 was leaving interval F1 on the table. A preregistered grid varied only the gap
 and minimum duration, holding threshold, continuation threshold, and edge
 preservation fixed:
