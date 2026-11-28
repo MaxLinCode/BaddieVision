@@ -39,6 +39,7 @@ from .rally_features import (
     normalize_rally_motion_pose,
     rally_feature_view,
     rally_motion_features,
+    rally_serve_box_features,
     smooth_rally_court_positions,
 )
 from .rally_intervals import read_rally_intervals
@@ -471,6 +472,11 @@ class RallyWindowDataset(Dataset[RallyWindow]):
                 reliable_feet.append(frame_reliability)
         value_tensor = torch.tensor(source_values, dtype=torch.float32)
         validity_tensor = torch.tensor(source_validity, dtype=torch.bool)
+        serve_box_count = self.feature_view.serve_box_count
+        if serve_box_count:
+            box_scores, box_valid = rally_serve_box_features(
+                value_tensor, validity_tensor, homography, image_size
+            )
         if self.feature_view.uses_motion:
             track_tensor = torch.tensor(track_ids)
             normalize_rally_motion_pose(value_tensor, validity_tensor, track_tensor, image_size)
@@ -482,6 +488,9 @@ class RallyWindowDataset(Dataset[RallyWindow]):
             )
             value_tensor = torch.cat((value_tensor, velocity), dim=-1)
             validity_tensor = torch.cat((validity_tensor, velocity_valid), dim=-1)
+        if serve_box_count:
+            value_tensor = torch.cat((value_tensor, box_scores[:, :serve_box_count]), dim=-1)
+            validity_tensor = torch.cat((validity_tensor, box_valid[:, :serve_box_count]), dim=-1)
         if audio is not None:
             value_tensor = torch.cat((value_tensor, torch.as_tensor(audio_values)), dim=-1)
             validity_tensor = torch.cat((validity_tensor, torch.as_tensor(audio.validity)), dim=-1)

@@ -35,6 +35,7 @@ from .training import (
     prepare_output_directory,
 )
 from .model import JointRallyShuttleModel
+from .joint_inference import InPlayDecoderConfig
 from .rally import (
     RALLY_BOUNDARY_SUPERVISION,
     RallySegmenter,
@@ -1023,8 +1024,9 @@ def run_clean_rally_experiment(
     require_rtmpose: bool = False,
     person_model: str | None = None,
     pose_model: Path | None = None,
+    evaluation_decoder: InPlayDecoderConfig | None = None,
 ) -> dict[str, Any]:
-    """Run candidate-free camera-held-out training without loading shuttle artifacts."""
+    """Run camera-held-out training, or stop after fixed-decoder fold evaluation."""
     recipe = recipe or RallyTrainingRecipe()
     device = device or torch.device(recipe.device)
     recipe = replace(recipe, device=device.type)
@@ -1129,7 +1131,9 @@ def run_clean_rally_experiment(
             "validation_window_ids": [window.window_id for window in validation],
             "test_window_ids": [window.window_id for window in test],
             "checkpoint_selection": "validation_raw_bce_only",
-            "decoder_selection": "validation_labels_only",
+            "decoder_selection": (
+                "frozen_production_decoder" if evaluation_decoder is not None else "validation_labels_only"
+            ),
             "test_labels_used_for_selection": False, "test_evaluations": 1,
         }
         model = RallySegmenter(model_config).to(device)
@@ -1156,16 +1160,20 @@ def run_clean_rally_experiment(
             },
         )
         selected_epochs.append(epoch)
-        validation_rows = predict_rally_windows(
-            model, validation, device=device, batch_size=recipe.batch_size,
-            partition="validation", include_unlabeled=True,
-        )
-        fps_by_source = {window.source_id: float(window.metadata["fps"])
-                         for window in validation}
         test_fps_by_source = {window.source_id: float(window.metadata["fps"]) for window in test}
-        decoder, decoder_search = tune_rally_decoder(
-            validation_rows, fps_by_source=fps_by_source, hysteresis=uses_rtmpose
-        )
+        if evaluation_decoder is None:
+            validation_rows = predict_rally_windows(
+                model, validation, device=device, batch_size=recipe.batch_size,
+                partition="validation", include_unlabeled=True,
+            )
+            fps_by_source = {window.source_id: float(window.metadata["fps"])
+                             for window in validation}
+            decoder, decoder_search = tune_rally_decoder(
+                validation_rows, fps_by_source=fps_by_source, hysteresis=uses_rtmpose
+            )
+        else:
+            decoder = evaluation_decoder
+            decoder_search = []
         raw_test = predict_rally_windows(
             model, test, device=device, batch_size=recipe.batch_size, partition="test", include_unlabeled=True,
         )
@@ -1187,11 +1195,22 @@ def run_clean_rally_experiment(
         _write_jsonl(fold_dir / "test-predictions.jsonl", decoded)
         fold_result = {
             "split_manifest": split_manifest, "chosen_epoch": epoch,
-            "validation_decoder": asdict(decoder), "decoder_search": decoder_search,
+            "validation_decoder": asdict(decoder) if evaluation_decoder is None else None,
+            "test_decoder": asdict(decoder), "decoder_search": decoder_search,
             "test": metrics, "test_by_source": metrics_by_source(decoded),
         }
         _write_json(fold_dir / "metrics.json", fold_result)
         fold_artifacts.append(fold_result)
+    result = {
+        "schema": "clean_cross_camera_rally_segmenter", "schema_version": 1,
+        "dataset_manifest": rally_dataset.manifest,
+        "training_recipe": asdict(recipe), "camera_sources": {key: list(value) for key, value in camera_sources.items()},
+        "folds": fold_artifacts, "by_camera": camera_metrics,
+        "macro": _macro_metrics(camera_metrics), "production": None,
+    }
+    if evaluation_decoder is not None:
+        _write_json(output_dir / "metrics.json", result)
+        return result
     production_epoch = round(statistics.median(selected_epochs))
     production = RallySegmenter(model_config).to(device)
     production_history = train_rally_segmenter_fixed_epochs(
@@ -1239,15 +1258,10 @@ def run_clean_rally_experiment(
                "experiment_role": "expanded_clean_only_production"},
     )
     torch.save(production_checkpoint, output_dir / "production-rally-segmenter.pt")
-    result = {
-        "schema": "clean_cross_camera_rally_segmenter", "schema_version": 1,
-        "dataset_manifest": rally_dataset.manifest,
-        "training_recipe": asdict(recipe), "camera_sources": {key: list(value) for key, value in camera_sources.items()},
-        "folds": fold_artifacts, "by_camera": camera_metrics,
-        "macro": _macro_metrics(camera_metrics),
-        "production": {"checkpoint": "production-rally-segmenter.pt",
-                       "chosen_epoch": production_epoch,
-                       "decoder_configuration": asdict(oof_decoder)},
+    result["production"] = {
+        "checkpoint": "production-rally-segmenter.pt",
+        "chosen_epoch": production_epoch,
+        "decoder_configuration": asdict(oof_decoder),
     }
     _write_json(output_dir / "metrics.json", result)
     return result
@@ -1513,7 +1527,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if rtmpose_preset:
         if not args.clean_only:
             raise ValueError("the RTMPose audio preset requires --clean-only")
-        if args.feature_view not in (None, "full_audio_zscore", CANONICAL_RALLY_FEATURE_VIEW):
+        if args.feature_view is not None and not rally_feature_view(args.feature_view).audio_zscore:
             raise ValueError("the RTMPose audio preset requires a normalized-audio feature view")
         overrides.setdefault("temporal_smoothing_weight", 0.1)
     recipe = RallyTrainingRecipe.from_preset(

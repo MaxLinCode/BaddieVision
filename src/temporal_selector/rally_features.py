@@ -6,8 +6,11 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Final
 
+import numpy as np
 import torch
 from torch import Tensor
+
+from src.court_projection import HALF_LENGTH, HALF_SINGLES_WIDTH, SHORT_SERVICE_DISTANCE, CourtHomography
 
 from .rally_audio import RALLY_AUDIO_FEATURE_NAMES
 
@@ -45,6 +48,47 @@ MOTION_BASE_FEATURE_NAMES: Final = tuple(
     for name in FULL_RALLY_FEATURE_NAMES
 )
 _POSE_START: Final = len(PLAYER_CONTEXT_FIELDS) * 2
+SERVE_BOX_NAMES: Final = (
+    "near_left_service_box", "near_right_service_box",
+    "far_left_service_box", "far_right_service_box", "diagonal_service_boxes",
+)
+_SERVICE_BOX_MIN: Final = (
+    ((-HALF_SINGLES_WIDTH, -HALF_LENGTH), (0, -HALF_LENGTH)),
+    ((-HALF_SINGLES_WIDTH, SHORT_SERVICE_DISTANCE), (0, SHORT_SERVICE_DISTANCE)),
+)
+_SERVICE_BOX_MAX: Final = (
+    ((0, -SHORT_SERVICE_DISTANCE), (HALF_SINGLES_WIDTH, -SHORT_SERVICE_DISTANCE)),
+    ((0, HALF_LENGTH), (HALF_SINGLES_WIDTH, HALF_LENGTH)),
+)
+_SERVE_DISTANCE_SCALE_METRES: Final = 0.75
+
+
+def rally_serve_box_features(
+    values: Tensor, validity: Tensor, homography: CourtHomography, image_size: tuple[int, int],
+) -> tuple[Tensor, Tensor]:
+    """Score singles boxes from both visible ankles of each assigned player."""
+    ankles = values[:, _POSE_START:].reshape(-1, 2, 33, 2)[:, :, 27:29].numpy()
+    visible = (
+        validity[:, _POSE_START:].reshape(-1, 2, 33, 2)[:, :, 27:29]
+        .all(dim=-1).all(dim=-1).numpy()
+    )
+    frame, player = np.nonzero(visible)
+    points = homography.project_normalized_to_court(
+        ankles[frame, player].reshape(-1, 2), image_size,
+    )
+    midpoint = points.reshape(-1, 2, 2).mean(axis=1)[:, None, :]
+    lower = np.asarray(_SERVICE_BOX_MIN)[player]
+    upper = np.asarray(_SERVICE_BOX_MAX)[player]
+    outside = np.maximum(np.maximum(lower - midpoint, midpoint - upper), 0.0)
+    distance_squared = np.square(outside).sum(axis=-1)
+    scores = np.zeros((len(values), 2, 2), dtype=np.float32)
+    scores[frame, player] = np.exp(-0.5 * distance_squared / _SERVE_DISTANCE_SCALE_METRES**2)
+    near_left, near_right, far_left, far_right = scores.reshape(-1, 4).T
+    diagonal = np.maximum(near_right * far_left, near_left * far_right)
+    return (
+        torch.from_numpy(np.column_stack((near_left, near_right, far_left, far_right, diagonal))),
+        torch.from_numpy(np.column_stack((np.repeat(visible, 2, axis=1), visible.all(axis=1)))),
+    )
 
 _COURT_POSITION_INDICES: Final = tuple(
     index for index, name in enumerate(FULL_RALLY_FEATURE_NAMES)
@@ -146,6 +190,7 @@ class RallyFeatureView:
     uses_audio: bool = False
     audio_zscore: bool = False
     uses_motion: bool = False
+    serve_box_count: int = 0
 
     @property
     def dimension(self) -> int:
@@ -154,7 +199,7 @@ class RallyFeatureView:
     def select(self, values: Tensor, validity: Tensor) -> tuple[Tensor, Tensor]:
         if values.shape != validity.shape:
             raise ValueError("rally values and validity must have identical shapes")
-        input_dimension = len(FULL_RALLY_FEATURE_NAMES)
+        input_dimension = len(FULL_RALLY_FEATURE_NAMES) + self.serve_box_count
         if self.uses_motion:
             input_dimension += len(MOTION_FEATURE_NAMES)
         if self.uses_audio:
@@ -178,13 +223,14 @@ def _names_for_fields(fields: Sequence[str], *, include_pose: bool = True) -> tu
 
 def _view(
     name: str, names: Sequence[str], *, uses_audio: bool = False, audio_zscore: bool = False,
-    uses_motion: bool = False,
+    uses_motion: bool = False, serve_box_count: int = 0,
 ) -> RallyFeatureView:
     requested = tuple(names)
     if len(requested) != len(set(requested)):
         raise AssertionError(f"duplicate feature in rally view {name}")
     input_names = (
         (MOTION_BASE_FEATURE_NAMES + MOTION_FEATURE_NAMES if uses_motion else FULL_RALLY_FEATURE_NAMES)
+        + SERVE_BOX_NAMES[:serve_box_count]
         + (RALLY_AUDIO_FEATURE_NAMES if uses_audio else ())
     )
     positions = {feature: index for index, feature in enumerate(input_names)}
@@ -192,7 +238,8 @@ def _view(
     if missing:
         raise AssertionError(f"unknown feature in rally view {name}: {missing}")
     return RallyFeatureView(
-        name, requested, tuple(positions[item] for item in requested), uses_audio, audio_zscore, uses_motion
+        name, requested, tuple(positions[item] for item in requested),
+        uses_audio, audio_zscore, uses_motion, serve_box_count,
     )
 
 
@@ -206,6 +253,14 @@ RALLY_FEATURE_VIEWS: Final[Mapping[str, RallyFeatureView]] = {
         MOTION_BASE_FEATURE_NAMES + MOTION_FEATURE_NAMES + RALLY_AUDIO_FEATURE_NAMES,
         uses_audio=True, audio_zscore=True, uses_motion=True,
     ),
+    **{
+        name: _view(
+            name, MOTION_BASE_FEATURE_NAMES + MOTION_FEATURE_NAMES + SERVE_BOX_NAMES[:count]
+            + RALLY_AUDIO_FEATURE_NAMES,
+            uses_audio=True, audio_zscore=True, uses_motion=True, serve_box_count=count,
+        )
+        for name, count in (("serve_boxes", 4), ("serve_boxes_diagonal", 5))
+    },
     "full_audio": _view(
         "full_audio", FULL_RALLY_FEATURE_NAMES + RALLY_AUDIO_FEATURE_NAMES, uses_audio=True
     ),
@@ -288,6 +343,8 @@ assert {name: view.dimension for name, view in RALLY_FEATURE_VIEWS.items()} == {
     "full": 154,
     "full_motion": 290,
     "full_audio_zscore_motion": 297,
+    "serve_boxes": 301,
+    "serve_boxes_diagonal": 302,
     "full_audio": 161,
     "full_audio_zscore": 161,
     "calibrated_canonical": 142,
