@@ -133,5 +133,5 @@ because of the false-start regression.
 Caveats: the holdout had already been used for model-arm comparisons, so this is
 a single frozen-decoder confirmation rather than a pristine second holdout. The
 decoder grid was informed by an earlier exploratory sweep, but the selection
-rule, deployment rule, and confirmation procedure were frozen in
-`outputs/decoder-factorial/protocol.json` before the factorial run.
+rule, deployment rule, and confirmation procedure were frozen before the
+factorial run.
