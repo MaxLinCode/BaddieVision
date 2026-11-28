@@ -1,8 +1,9 @@
 # QFL and diagonal serve-box factorial, with decoder follow-up
 
 This note records the matched five-seed comparison of two proposed InPlay model
-changes and the decoder retune that followed it. Development data only; the
-November 27 holdout is used once for the final decoder confirmation.
+changes, the initial decoder retune, and a wider development-only search. The
+November 27 holdout confirmed the initial decoder setting. The wider search
+excluded that holdout.
 
 ## Summary
 
@@ -15,9 +16,10 @@ November 27 holdout is used once for the final decoder confirmation.
   best end MAE and false-start rate, 14/20 fold wins), but its CI includes zero.
 - The decoder is the largest resolved lever. A leave-one-camera-out gap sweep
   selects 2.0 s / 0.5 s and gives +0.045 F1 on development and +0.027 F1 on the
-  holdout, with false starts roughly halved and rally ends ~2.7 frames later.
-- Recommendation: keep the model recipe; adopt the decoder configuration as a
-  post-processing-only change.
+  holdout, with false starts roughly halved and about 2.7 frames more absolute
+  end error on shared matches.
+- The wider search finds a development F1 plateau. Freeze a 2.0 s maximum gap
+  and 1.0 s minimum duration for fresh confirmation. Keep the model recipe.
 
 ## Model factorial
 
@@ -106,20 +108,53 @@ Holdout, one shot with the frozen config (saved production probabilities):
 | False merges | 0 | 0 |
 | End MAE (157 shared matches) | **25.45** | 28.11 |
 
-The holdout reproduces the development direction. The tradeoff is later rally
-ends (~2.7 frames, ~90 ms).
+The holdout reproduces the development direction. End MAE increases by 2.66
+frames across the 157 shared matches. The signed mean end error across each
+decoder's own matched rallies rises from +14.6 to +23.3 frames.
+
+## Wider decoder search
+
+The broad pass evaluated 308 settings, with maximum gaps from 0 to 10 s and
+minimum durations from 0.1 to 4 s. A finer pass brought the total to 496 distinct
+settings. Both passes re-decoded the same saved predictions for the production
+model arm across five seeds and four held-out camera folds. The model
+checkpoints and score thresholds stayed fixed.
+
+For each fold, the corresponding model fit excluded that fold's camera. The
+decoder search used the predictions and labels from those development folds to
+compare settings. These estimates are therefore development results for the
+selected decoder. The wider search excluded the separate November 27 holdout.
+
+![Wider development decoder grid showing interior peaks for gap and duration](figures/decoder-wide-grid.png)
+
+| Gap / minimum (s) | Interval F1 | Recall | False starts/min | Missed rallies/fold | False merges/fold | Frame F1 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0.5 / 0.3 (production control) | 0.8098 | 0.8408 | 0.7735 | 5.90 | 0.00 | 0.8938 |
+| 2.0 / 0.5 (initial candidate) | 0.8598 | 0.8448 | 0.3265 | 5.70 | 0.05 | 0.8903 |
+| **2.0 / 1.0 (frozen for fresh confirmation)** | **0.8709** | **0.8448** | **0.2372** | **5.70** | **0.05** | **0.8906** |
+| 1.9 / 1.0 | 0.8715 | 0.8457 | 0.2348 | 5.65 | 0.05 | 0.8920 |
+| 1.4 / 1.3 | 0.8786 | 0.8452 | 0.2052 | 5.70 | 0.00 | 0.8920 |
+| 1.4 / 1.5 (tied with 1.5 / 1.5) | 0.8804 | 0.8337 | 0.1301 | 6.20 | 0.00 | 0.8907 |
+
+The peak gains 0.0206 interval F1 over the initial candidate and misses more
+rallies. It wins 12 cells, ties two, and loses six. Its mean F1 drops on one of
+the four cameras. The 2.0 / 1.0 setting wins 11 cells and ties nine, reduces false
+starts per minute by 27%, and preserves recall and end timing relative to
+2.0 / 0.5. The 1.9 / 1.0 neighbor also wins 11 and ties nine. Its mean F1 is
+0.0007 higher.
+
+The broad leave-one-camera-out selection scores 0.8707, with 1.25 / 1.5 the
+modal choice (6/20). The refined selection scores 0.8678, with 2.0 / 1.0 the
+modal choice (4/20). The finer grid used the same four development cameras.
 
 ## Decision
 
-Adopt the decoder change: maximum gap 2.0 s, minimum duration 0.5 s, with the
-existing threshold, continuation threshold, and edge preservation. It requires no
-retraining or checkpoint change. If end latency is a hard constraint, 1.5 / 0.5
-is the development compromise (+0.046 F1, +1.2 frames predicted) but was not
-holdout-confirmed.
-
-Do not change the model recipe on this evidence. The diagonal serve-box features
-remain the only model change worth a larger follow-up; QFL should not be adopted
-because of the false-start regression.
+Keep the model recipe. For fresh confirmation, freeze a 2.0 s maximum gap and a
+1.0 s minimum duration, with threshold 0.40, continuation threshold 0.35, and
+edge preservation enabled. The choice favors the settings that preserved recall
+and avoided observed fold-level F1 losses while retaining the previously
+confirmed gap. The November 27 holdout scores in this report apply to the
+initial 2.0 / 0.5 candidate.
 
 ## Reproduction
 
@@ -127,6 +162,9 @@ because of the false-start regression.
   `tools/score_qfl_diagonal_followup.py`.
 - Decoder development selection: `tools/run_decoder_factorial.py` over the saved
   fold predictions.
+- Wider search: `PYTHONPATH=. python tools/run_decoder_wide_grid.py INPUT OUTPUT`
+  over the saved baseline fold predictions. The refinement takes optional
+  `--gaps` and `--minimums` values.
 - Holdout confirmation: `tools/confirm_decoder_holdout.py` over the saved
   production probabilities and the frozen development JSON.
 
