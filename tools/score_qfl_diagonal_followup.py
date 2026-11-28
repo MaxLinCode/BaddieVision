@@ -41,7 +41,8 @@ def mean_or_none(values):
 def false_starts(rows):
     """Count complete predicted runs wholly inside reviewed break frames."""
     ordered = sorted(rows, key=lambda row: (row["source_id"], row["frame"]))
-    key = lambda row: (row["source_id"], row["decoded_inplay"])
+    def key(row):
+        return (row["source_id"], row["decoded_inplay"])
     count = 0
     for (_, active), group in groupby(ordered, key):
         if not active:
