@@ -333,3 +333,34 @@ def test_clean_training_uses_partition_windows_and_full_held_out_recordings(tmp_
     checkpoint = torch.load(output / "production-rally-segmenter.pt", weights_only=True)
     assert checkpoint["rally_feature_view"] == "full_audio_zscore"
     assert checkpoint["rally_segmenter_config"]["audio_attention"]
+
+    # The fixed-decoder path must skip validation decoder tuning and stop after
+    # the four held-out folds instead of fitting the all-source production model.
+    from src.temporal_selector.joint_inference import InPlayDecoderConfig
+
+    fixed = InPlayDecoderConfig(
+        threshold=0.4, continuation_threshold=0.35, max_gap_seconds=0.5,
+        minimum_duration_seconds=0.3, preserve_edge_runs=True,
+    )
+
+    def fail_tuning(*_args, **_kwargs):
+        raise AssertionError("fixed-decoder evaluation must not tune on validation")
+
+    monkeypatch.setattr(training, "tune_rally_decoder", fail_tuning)
+    fixed_output = tmp_path / "fixed-decoder"
+    fixed_result = training.run_clean_rally_experiment(
+        config, fixed_output, camera_sources={"A": ["a"], "B": ["b"]},
+        recipe=RallyTrainingRecipe(epochs=1, device="cpu"),
+        evaluation_decoder=fixed,
+    )
+    assert fixed_result["production"] is None
+    assert json.loads((fixed_output / "metrics.json").read_text())["production"] is None
+    assert not (fixed_output / "production-rally-segmenter.pt").exists()
+    for fold in fixed_result["folds"]:
+        assert fold["split_manifest"]["decoder_selection"] == "frozen_production_decoder"
+        assert fold["validation_decoder"] is None
+        assert fold["test_decoder"] == {
+            "threshold": 0.4, "continuation_threshold": 0.35,
+            "max_gap_seconds": 0.5, "minimum_duration_seconds": 0.3,
+            "preserve_edge_runs": True,
+        }
